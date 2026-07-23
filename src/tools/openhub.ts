@@ -1,4 +1,4 @@
-import { BwClient, MEDIA_TYPES } from '../bw-client.js';
+import { BwClient, MEDIA_TYPES, bwSeg } from '../bw-client.js';
 
 interface OpenHubField {
   name: string;
@@ -167,7 +167,7 @@ function parseOpenHubXml(xml: string, status: string): OpenHubInfo {
 }
 
 export async function bwGetOpenHub(client: BwClient, openHubName: string): Promise<string> {
-  const path = `/sap/bw/modeling/dest/${openHubName.toLowerCase()}/m`;
+  const path = `/sap/bw/modeling/dest/${bwSeg(openHubName)}/m`;
   const result = await client.get(path, MEDIA_TYPES['dest']);
   const status = result.headers['object_status'] ?? result.headers['OBJECT_STATUS'] ?? 'unknown';
 

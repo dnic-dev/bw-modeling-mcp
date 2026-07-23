@@ -36,6 +36,26 @@ function resolveMediaType(type: string): string {
   return mt;
 }
 
+/**
+ * Apply SAP namespace encoding to a BW object name: a namespaced name `/NS/OBJ` is addressed
+ * internally as `$NS$OBJ` (the two delimiting slashes become dollar signs; case is preserved).
+ * Non-namespaced names (e.g. `ZOBJ01`) are returned unchanged. This is the raw (un-percent-encoded)
+ * form used both in modeling URL path segments (via `bwSeg`) and in the object-name QUERY parameters
+ * of the xref / dataflow services.
+ */
+export function bwNsName(name: string): string {
+  return name.startsWith('/') ? name.replace(/^\/([^/]+)\//, '$$$1$$') : name;
+}
+
+/**
+ * Encode a BW object name as a `/sap/bw/modeling/...` URL path segment: namespace-escaped (`bwNsName`),
+ * lowercased, then percent-encoded (e.g. `/ABC/OBJ01` -> `%24abc%24obj01`). For a non-namespaced ASCII
+ * name this is byte-identical to the previous `name.toLowerCase()` (encodeURIComponent is a no-op).
+ */
+export function bwSeg(name: string): string {
+  return encodeURIComponent(bwNsName(name).toLowerCase());
+}
+
 export interface GetResult {
   body: string;
   headers: Record<string, string>;
@@ -269,7 +289,7 @@ export class BwClient {
           ...extraHeaders,
         };
     const response = await this.http.post(
-      `/sap/bw/modeling/${type.toLowerCase()}/${name.toLowerCase()}?action=lock`,
+      `/sap/bw/modeling/${type.toLowerCase()}/${bwSeg(name)}?action=lock`,
       '',
       {
         headers,
@@ -306,7 +326,7 @@ export class BwClient {
   ): Promise<string> {
     await this.ensureCsrf();
     const mediaType = resolveMediaType(type);
-    const path = `/sap/bw/modeling/${type.toLowerCase()}/${name.toLowerCase()}?lockHandle=${lockHandle}`;
+    const path = `/sap/bw/modeling/${type.toLowerCase()}/${bwSeg(name)}?lockHandle=${lockHandle}`;
     const response = await this.http.post(path, body, {
       headers: {
         'Content-Type': `application/xml, ${mediaType}`,
@@ -342,7 +362,7 @@ export class BwClient {
     await this.ensureCsrf();
     const mediaType = resolveMediaType(type);
     const corrNrPrefix = corrNr ? `corrNr=${corrNr}&` : '';
-    const path = `/sap/bw/modeling/${type.toLowerCase()}/${name.toLowerCase()}/m?${corrNrPrefix}lockHandle=${lockHandle}`;
+    const path = `/sap/bw/modeling/${type.toLowerCase()}/${bwSeg(name)}/m?${corrNrPrefix}lockHandle=${lockHandle}`;
     const response = await this.http.put(path, body, {
       headers: {
         'Content-Type': `application/xml, ${mediaType}`,
@@ -370,7 +390,7 @@ export class BwClient {
   async lockForDelete(type: string, name: string, mediaType: string): Promise<string> {
     await this.ensureCsrf();
     const response = await this.http.post(
-      `/sap/bw/modeling/${type.toLowerCase()}/${name.toLowerCase()}/m?action=lock`,
+      `/sap/bw/modeling/${type.toLowerCase()}/${bwSeg(name)}/m?action=lock`,
       '',
       {
         headers: {
@@ -406,7 +426,7 @@ export class BwClient {
     mediaType: string
   ): Promise<string> {
     await this.ensureCsrf();
-    const path = `/sap/bw/modeling/${type.toLowerCase()}/${name.toLowerCase()}/m?lockHandle=${lockHandle}`;
+    const path = `/sap/bw/modeling/${type.toLowerCase()}/${bwSeg(name)}/m?lockHandle=${lockHandle}`;
     const response = await this.http.delete(path, {
       headers: {
         'Content-Type': mediaType,
@@ -436,8 +456,8 @@ export class BwClient {
     // RSDS (DataSource) has a compound key (DataSource + source system) and uses an
     // uppercase two-segment URI. All other types use the single-segment lowercase URI.
     const href = typeLower === 'rsds'
-      ? `/sap/bw/modeling/rsds/${name.toUpperCase()}/${(sourceSystem ?? '').toUpperCase()}/m`
-      : `/sap/bw/modeling/${typeLower}/${name.toLowerCase()}/m`;
+      ? `/sap/bw/modeling/rsds/${encodeURIComponent(bwNsName(name).toUpperCase())}/${(sourceSystem ?? '').toUpperCase()}/m`
+      : `/sap/bw/modeling/${typeLower}/${bwSeg(name)}/m`;
     const body = `<?xml version="1.0" encoding="UTF-8"?>
 <atom:feed xmlns:atom="http://www.w3.org/2005/Atom" xmlns:bwModel="http://www.sap.com/bw/modeling">
   <atom:entry>
@@ -867,7 +887,7 @@ export class BwClient {
     await this.ensureCsrf();
     const mediaType = resolveMediaType(type);
     const response = await this.http.post(
-      `/sap/bw/modeling/${type.toLowerCase()}/${name.toLowerCase()}?action=unlock`,
+      `/sap/bw/modeling/${type.toLowerCase()}/${bwSeg(name)}?action=unlock`,
       '',
       {
         headers: {

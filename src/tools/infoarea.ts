@@ -1,4 +1,4 @@
-import { BwClient, MEDIA_TYPES } from '../bw-client.js';
+import { BwClient, MEDIA_TYPES, bwSeg } from '../bw-client.js';
 
 // ── bwMoveObject ──────────────────────────────────────────────────────────────
 
@@ -34,7 +34,7 @@ export async function bwMoveObject(
       </bwModel:moveProperties>
     </atom:content>
     <atom:link
-      href="/sap/bw/modeling/${typeLower}/${nameLower}/m"
+      href="/sap/bw/modeling/${typeLower}/${bwSeg(args.objectName)}/m"
       type="application/*"
       rel="self">
     </atom:link>
@@ -128,7 +128,7 @@ export async function bwCreateInfoArea(
  * GET /sap/bw/modeling/area/{name}
  */
 export async function bwGetInfoarea(client: BwClient, name: string): Promise<string> {
-  const nameLower = name.toLowerCase();
+  const nameLower = bwSeg(name);
   const result = await client.get(`/sap/bw/modeling/area/${nameLower}`, MEDIA_TYPES['area']);
   const body = result.body;
 

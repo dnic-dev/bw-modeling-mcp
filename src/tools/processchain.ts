@@ -1,4 +1,4 @@
-import { BwClient } from '../bw-client.js';
+import { BwClient, bwSeg } from '../bw-client.js';
 
 const ACCEPT = 'application/vnd.sap.bw4.modeling.processchain-v1_0_0+json';
 
@@ -102,7 +102,7 @@ async function fetchVariantDetail(
   const NO_DETAIL_TYPES = new Set(['OR', 'AND', 'EXOR', 'CHAIN', 'DTP_LOAD', 'DTP_ADSO']);
   if (NO_DETAIL_TYPES.has(processType.toUpperCase())) return null;
   try {
-    const url = `/sap/bw4/v1/modeling/processtypes/${processType.toLowerCase()}/variants/${variantName.toLowerCase()}/m`;
+    const url = `/sap/bw4/v1/modeling/processtypes/${processType.toLowerCase()}/variants/${bwSeg(variantName)}/m`;
     const result = await client.rawGet(url, { Accept: '*/*' });
     if (result.body.trim().startsWith('<')) return null;
     const parsed = JSON.parse(result.body);
@@ -120,7 +120,7 @@ export async function bwGetProcessChain(
   format: 'text' | 'raw' = 'text',
   includeVariantDetails: boolean = true,
 ): Promise<string> {
-  const url = `/sap/bw/modeling/rspc/${encodeURIComponent(chainName.toLowerCase())}/m`;
+  const url = `/sap/bw/modeling/rspc/${bwSeg(chainName)}/m`;
   const result = await client.rawGet(url, { Accept: ACCEPT });
   const parsed = JSON.parse(result.body) as ProcessChain;
 

@@ -1,4 +1,4 @@
-import { BwClient } from '../bw-client.js';
+import { BwClient, bwNsName } from '../bw-client.js';
 
 const DMOD_ACCEPT = 'application/vnd.sap.bw.modeling.dmod-v1_0_0+xml';
 const BASE = '/sap/bw/modeling/dmod/8TRANSIENT';
@@ -163,7 +163,7 @@ export async function bwGetDataflow(
     const padded = objectName.toUpperCase().padEnd(30) + sourceSystem!.toUpperCase();
     encodedName = padded.replace(/ /g, '+');
   } else {
-    encodedName = encodeURIComponent(objectName.toUpperCase());
+    encodedName = encodeURIComponent(bwNsName(objectName.toUpperCase()));
   }
 
   // Build query string

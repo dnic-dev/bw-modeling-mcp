@@ -1,4 +1,4 @@
-import { BwClient } from '../bw-client.js';
+import { BwClient, bwSeg } from '../bw-client.js';
 
 const HCPR_ACCEPT = [
   'application/vnd.sap.bw.modeling.hcpr-v1_0_0+xml',
@@ -23,7 +23,7 @@ export async function bwGetCompositeProvider(
   client: BwClient,
   compositeProviderName: string
 ): Promise<string> {
-  const path = `/sap/bw/modeling/hcpr/${compositeProviderName.toLowerCase()}/m`;
+  const path = `/sap/bw/modeling/hcpr/${bwSeg(compositeProviderName)}/m`;
   const result = await client.get(path, HCPR_ACCEPT);
 
   const xml = result.body;

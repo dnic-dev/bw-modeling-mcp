@@ -1,4 +1,4 @@
-import { BwClient, MEDIA_TYPES, createClientFromEnv, freshRead } from '../bw-client.js';
+import { BwClient, MEDIA_TYPES, createClientFromEnv, freshRead, bwNsName, bwSeg } from '../bw-client.js';
 import { parseInfoObjectProps } from './infoobject.js';
 import { parseActivationMessages, parseDtpsDeactivated, bwActivate } from './activation.js';
 
@@ -19,7 +19,7 @@ const TRFN_ACCEPT = MEDIA_TYPES['trfn'];
 async function freshReadInactive(
   trfnLower: string
 ): Promise<{ body: string; headers: Record<string, string> }> {
-  return freshRead(`/sap/bw/modeling/trfn/${trfnLower}/m`, TRFN_ACCEPT);
+  return freshRead(`/sap/bw/modeling/trfn/${bwSeg(trfnLower)}/m`, TRFN_ACCEPT);
 }
 
 // ── bwCreateTransformation ────────────────────────────────────────────────────
@@ -62,7 +62,7 @@ export async function bwCreateTransformation(
   // with spaces URL-encoded as '+' for the 8TRANSIENT query parameter.
   const srcNameForUrl = srcType === 'RSDS'
     ? encodeURIComponent(srcName.padEnd(30) + (args.source_system ?? '').toUpperCase().padEnd(10)).replace(/%20/g, '+')
-    : srcName;
+    : encodeURIComponent(bwNsName(srcName));
 
   // Step 1: GET 8TRANSIENT → generated Transformation name
   const transientPath =
@@ -72,7 +72,7 @@ export async function bwCreateTransformation(
     (args.source_object_subtype ? `&sourceobjectsubtype=${args.source_object_subtype.toUpperCase()}` : '') +
     (args.target_object_subtype ? `&targetobjectsubtype=${args.target_object_subtype.toUpperCase()}` : '') +
     `&sourceobjectname=${srcNameForUrl}` +
-    `&targetobjectname=${tgtName}`;
+    `&targetobjectname=${encodeURIComponent(bwNsName(tgtName))}`;
 
   const { body: transientXml } = await client.get(transientPath, TRFN_ACCEPT);
 
@@ -89,7 +89,7 @@ export async function bwCreateTransformation(
 
   // Step 2: Lock with CREA — exact Eclipse header set, no SAP session headers
   const csrfToken = await client.getCsrfToken();
-  const lockPath = `/sap/bw/modeling/trfn/${trfnLower}?action=lock`;
+  const lockPath = `/sap/bw/modeling/trfn/${bwSeg(trfnLower)}?action=lock`;
   const lockResponse = await client.rawPost(lockPath, '', {
     'activity_context': 'CREA',
     'Accept': TRFN_ACCEPT,
@@ -135,7 +135,7 @@ export async function bwCreateTransformation(
   const copyParams = args.copy_from_transformation
     ? `&copyFromObjectName=${args.copy_from_transformation.toUpperCase()}&copyFromObjectType=TRFN`
     : '';
-  const createPath = `/sap/bw/modeling/trfn/${trfnLower}?lockHandle=${lockHandle}${copyParams}`;
+  const createPath = `/sap/bw/modeling/trfn/${bwSeg(trfnLower)}?lockHandle=${lockHandle}${copyParams}`;
 
   // Session B: eigene Session + CSRF-Token, POST mit lockHandle aus Session A
   const client2 = createClientFromEnv();
@@ -1530,7 +1530,7 @@ export async function bwUpdateTransformation(
     });
   } else {
     // Read InfoObject to get label and type info
-    const iObjPath = `/sap/bw/modeling/iobj/${targetInfoObject.toLowerCase()}/m`;
+    const iObjPath = `/sap/bw/modeling/iobj/${bwSeg(targetInfoObject)}/m`;
     const iObjResult = await client.get(iObjPath, MEDIA_TYPES['iobj']);
     const iObjProps = parseInfoObjectProps(iObjResult.body);
     const tgtProps = extractTargetElemProps(originalXml, tgtUpper);
@@ -1990,7 +1990,7 @@ export async function bwSetTransformationExpertRoutine(
 
     // Step 5: Priming GET (mirrors Eclipse), then TLOGO-activate with the same lockHandle.
     await client
-      .get(`/sap/bw/modeling/trfn/${trfnLower}/m?forceCacheUpdate=true`, TRFN_ACCEPT)
+      .get(`/sap/bw/modeling/trfn/${bwSeg(trfnLower)}/m?forceCacheUpdate=true`, TRFN_ACCEPT)
       .catch(() => {/* priming only */});
     activationXml = await client.activate('trfn', trfnLower, lockHandle);
   } catch (err) {
@@ -2272,7 +2272,7 @@ async function readActiveHanaRuntime(trfnLower: string): Promise<'true' | 'false
   try {
     const freshReader = createClientFromEnv();
     const { body } = await freshReader.get(
-      `/sap/bw/modeling/trfn/${trfnLower}/a?forceCacheUpdate=true`,
+      `/sap/bw/modeling/trfn/${bwSeg(trfnLower)}/a?forceCacheUpdate=true`,
       TRFN_ACCEPT
     );
     const m = body.match(/\bHANARuntime="(true|false)"/);
@@ -2305,7 +2305,7 @@ async function attemptRuntimeSwitch(
 
   try {
     const { body: xml, headers } = await client.get(
-      `/sap/bw/modeling/trfn/${trfnLower}/m?forceCacheUpdate=true`,
+      `/sap/bw/modeling/trfn/${bwSeg(trfnLower)}/m?forceCacheUpdate=true`,
       TRFN_ACCEPT
     );
     const timestamp = headers['timestamp'] ?? '';

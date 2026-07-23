@@ -1,5 +1,5 @@
 import { XMLParser } from 'fast-xml-parser';
-import { BwClient } from '../bw-client.js';
+import { BwClient, bwSeg } from '../bw-client.js';
 import { ckfAccept, rkfAccept, structureAccept } from './query.js';
 
 // ── XML Parser ───────────────────────────────────────────────────────────────
@@ -167,7 +167,7 @@ function buildDependencies(
 // ── bw_get_ckf ───────────────────────────────────────────────────────────────
 
 export async function bwGetCkf(client: BwClient, componentName: string): Promise<string> {
-  const path = `/sap/bw/modeling/ckf/${componentName.toLowerCase()}/a`;
+  const path = `/sap/bw/modeling/ckf/${bwSeg(componentName)}/a`;
   const { body } = await client.get(path, ckfAccept());
 
   const parser = makeParser();
@@ -210,7 +210,7 @@ export async function bwGetCkf(client: BwClient, componentName: string): Promise
 // ── bw_get_rkf ───────────────────────────────────────────────────────────────
 
 export async function bwGetRkf(client: BwClient, componentName: string): Promise<string> {
-  const path = `/sap/bw/modeling/rkf/${componentName.toLowerCase()}/a`;
+  const path = `/sap/bw/modeling/rkf/${bwSeg(componentName)}/a`;
   const { body } = await client.get(path, rkfAccept());
 
   const parser = makeParser();
@@ -383,7 +383,7 @@ function parseMember(
 }
 
 export async function bwGetStructure(client: BwClient, componentName: string): Promise<string> {
-  const path = `/sap/bw/modeling/structure/${componentName.toLowerCase()}/a`;
+  const path = `/sap/bw/modeling/structure/${bwSeg(componentName)}/a`;
   const { body } = await client.get(path, structureAccept());
 
   const parser = makeParser();

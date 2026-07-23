@@ -1,4 +1,4 @@
-import { BwClient, MEDIA_TYPES, createClientFromEnv, freshRead } from '../bw-client.js';
+import { BwClient, MEDIA_TYPES, createClientFromEnv, freshRead, bwNsName, bwSeg } from '../bw-client.js';
 import { bwActivate } from './activation.js';
 
 interface XrefEntry {
@@ -53,7 +53,7 @@ export async function bwGetDtps(
   objectType: string,
   objectName: string
 ): Promise<string> {
-  const path = `/sap/bw/modeling/repo/is/xref?objectType=${encodeURIComponent(objectType.toUpperCase())}&objectName=${encodeURIComponent(objectName.toUpperCase())}`;
+  const path = `/sap/bw/modeling/repo/is/xref?objectType=${encodeURIComponent(objectType.toUpperCase())}&objectName=${encodeURIComponent(bwNsName(objectName).toUpperCase())}`;
   const result = await client.get(path, 'application/atom+xml;type=feed');
 
   const allEntries = parseAtomEntries(result.body);
@@ -83,7 +83,7 @@ export async function bwGetDtps(
  * (Used internally; exposed via bw_get_dtps in index.ts if needed.)
  */
 export async function bwGetDtpDetails(client: BwClient, dtpName: string): Promise<string> {
-  const path = `/sap/bw/modeling/dtpa/${dtpName.toLowerCase()}/m`;
+  const path = `/sap/bw/modeling/dtpa/${bwSeg(dtpName)}/m`;
   const result = await freshRead(path, MEDIA_TYPES['dtpa']);
   const status = result.headers['object_status'] ?? result.headers['OBJECT_STATUS'] ?? 'unknown';
   return `DTP: ${dtpName.toUpperCase()}\nStatus: ${status}\n\n${result.body}`;
@@ -231,7 +231,7 @@ function parseDtpXml(xml: string, status: string): DtpInfo {
 export async function bwGetDtp(client: BwClient, dtpName: string): Promise<string> {
   // Fresh session: the shared client's buffer serves the stale inactive shadow
   // after this session touched the DTP (forceCacheUpdate alone does not help there).
-  const path = `/sap/bw/modeling/dtpa/${dtpName.toLowerCase()}/m`;
+  const path = `/sap/bw/modeling/dtpa/${bwSeg(dtpName)}/m`;
   const result = await freshRead(path, MEDIA_TYPES['dtpa']);
   const status = result.headers['object_status'] ?? result.headers['OBJECT_STATUS'] ?? 'unknown';
 
@@ -306,10 +306,9 @@ export async function bwGetDtp(client: BwClient, dtpName: string): Promise<strin
  * .catch() to keep it best-effort.
  */
 export async function bwUnlockDtp(client: BwClient, dtpName: string): Promise<void> {
-  const dtpLower = dtpName.toLowerCase();
   const csrf = await client.getCsrfToken();
   await client.rawPost(
-    `/sap/bw/modeling/dtpa/${dtpLower}?action=unlock`,
+    `/sap/bw/modeling/dtpa/${bwSeg(dtpName)}?action=unlock`,
     '',
     {
       'Content-Type': MEDIA_TYPES['dtpa'],
@@ -434,7 +433,7 @@ export async function bwCreateDtp(
     throw new Error(`generateDtpId returned no Location header. Response: ${JSON.stringify(genResponse.headers)}`);
   }
   const dtpName  = location.split('/').pop()!.toUpperCase();
-  const dtpLower = dtpName.toLowerCase();
+  const dtpLower = bwSeg(dtpName);
 
   // Step 2: Lock with CREA
   const csrfToken2 = await client.getCsrfToken();
@@ -576,7 +575,7 @@ export async function bwCreateDtp(
   } finally {
     // Best-effort release of the DTP enqueue lock — the happy path already unlocks,
     // so this typically no-ops; on an error path it frees a leaked lock.
-    await bwUnlockDtp(client, dtpLower).catch(() => {/* lock may already be released */});
+    await bwUnlockDtp(client, dtpName).catch(() => {/* lock may already be released */});
   }
 }
 
@@ -667,7 +666,7 @@ export async function bwUpdateDtp(
   try {
     // GET current DTP XML (fresh client) — read timestamp
     const getClient = createClientFromEnv();
-    const getResponse = await getClient.get(`/sap/bw/modeling/dtpa/${dtpLower}/m`, MEDIA_TYPES['dtpa']);
+    const getResponse = await getClient.get(`/sap/bw/modeling/dtpa/${bwSeg(args.dtp_name)}/m`, MEDIA_TYPES['dtpa']);
     const timestamp = getResponse.headers['timestamp'] ?? '';
 
     // Apply modifications
@@ -818,13 +817,15 @@ export async function bwSetDtpFilterRoutine(
 ): Promise<string> {
   const dtpUpper = args.dtp_name.toUpperCase();
   const dtpLower = args.dtp_name.toLowerCase();
+  const dtpSeg = bwSeg(args.dtp_name);
+  const dtpSegUpper = encodeURIComponent(bwNsName(args.dtp_name).toUpperCase());
   const fieldName = args.field_name;
   const fieldNameEncoded = encodeURIComponent(fieldName);
 
   // Step 1: Lock (no CREA)
   const lockCsrf = await client.getCsrfToken();
   const lockResponse = await client.rawPost(
-    `/sap/bw/modeling/dtpa/${dtpLower}?action=lock`,
+    `/sap/bw/modeling/dtpa/${dtpSeg}?action=lock`,
     '',
     {
       'Accept': MEDIA_TYPES['dtpa'],
@@ -845,7 +846,7 @@ export async function bwSetDtpFilterRoutine(
 
     const genCsrf = await client.getCsrfToken();
     const genResponse = await client.rawPost(
-      `/sap/bw/modeling/dtpa/${dtpUpper}/${fieldNameEncoded}/generateRoutineProgram`,
+      `/sap/bw/modeling/dtpa/${dtpSegUpper}/${fieldNameEncoded}/generateRoutineProgram`,
       routineBody,
       {
         'Content-Type': 'application/vnd.sap.bw.modeling.dtpa.routine.code-v1_0_0+xml',
@@ -923,14 +924,14 @@ export async function bwSetDtpFilterRoutine(
     // Step 4: GET routineReports (read back routine code as XML)
     const routineGetClient = createClientFromEnv();
     const routineGetResponse = await routineGetClient.get(
-      `/sap/bw/modeling/dtpa/${dtpUpper}/${fieldNameEncoded}/routineReports/${encodedProgram}`,
+      `/sap/bw/modeling/dtpa/${dtpSegUpper}/${fieldNameEncoded}/routineReports/${encodedProgram}`,
       MEDIA_TYPES['dtpa']
     );
     const routineXml = routineGetResponse.body;
 
     // Step 5: DELETE routineReports (mandatory cleanup)
     await client.rawDelete(
-      `/sap/bw/modeling/dtpa/${dtpUpper}/${fieldNameEncoded}/routineReports/${encodedProgram}`,
+      `/sap/bw/modeling/dtpa/${dtpSegUpper}/${fieldNameEncoded}/routineReports/${encodedProgram}`,
       {
         'Content-Type': MEDIA_TYPES['dtpa'],
         'Accept': MEDIA_TYPES['dtpa'],
@@ -940,7 +941,7 @@ export async function bwSetDtpFilterRoutine(
     // Step 6: GET current DTP XML (fresh client, read timestamp)
     const dtpGetClient = createClientFromEnv();
     const dtpGetResponse = await dtpGetClient.get(
-      `/sap/bw/modeling/dtpa/${dtpLower}/m`,
+      `/sap/bw/modeling/dtpa/${dtpSeg}/m`,
       MEDIA_TYPES['dtpa']
     );
     const timestamp = dtpGetResponse.headers['timestamp'] ?? '';

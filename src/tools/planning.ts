@@ -1,4 +1,4 @@
-import { BwClient, MEDIA_TYPES } from '../bw-client.js';
+import { BwClient, MEDIA_TYPES, bwSeg } from '../bw-client.js';
 
 function attr(tag: string, attrName: string): string {
   const m = tag.match(new RegExp(`\\b${attrName}="([^"]*)"`));
@@ -203,7 +203,7 @@ function parseAggLevelXml(xml: string, status: string): AggLevelInfo {
 }
 
 export async function bwGetAggregationLevel(client: BwClient, alvlName: string): Promise<string> {
-  const path = `/sap/bw/modeling/alvl/${alvlName.toLowerCase()}/m`;
+  const path = `/sap/bw/modeling/alvl/${bwSeg(alvlName)}/m`;
   const result = await client.get(path, MEDIA_TYPES['alvl']);
   const status = result.headers['object_status'] ?? result.headers['OBJECT_STATUS'] ?? 'unknown';
 
@@ -346,7 +346,7 @@ function parsePlcrXml(xml: string, status: string): PlanningPropertiesInfo {
 }
 
 export async function bwGetPlanningProperties(client: BwClient, providerName: string): Promise<string> {
-  const path = `/sap/bw/modeling/plcr/${providerName.toLowerCase()}/a`;
+  const path = `/sap/bw/modeling/plcr/${bwSeg(providerName)}/a`;
   const result = await client.get(path, MEDIA_TYPES['plcr']);
   const status = result.headers['object_status'] ?? result.headers['OBJECT_STATUS'] ?? 'unknown';
 
@@ -435,7 +435,7 @@ function parsePlsqXml(xml: string, status: string): PlsqInfo {
 }
 
 export async function bwGetPlanningSequence(client: BwClient, seqName: string): Promise<string> {
-  const path = `/sap/bw/modeling/plsq/${seqName.toLowerCase()}/a`;
+  const path = `/sap/bw/modeling/plsq/${bwSeg(seqName)}/a`;
   const result = await client.get(path, MEDIA_TYPES['plsq']);
   const status = result.headers['object_status'] ?? result.headers['OBJECT_STATUS'] ?? 'unknown';
 

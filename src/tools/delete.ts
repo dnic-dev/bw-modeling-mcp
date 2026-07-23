@@ -1,4 +1,4 @@
-import { BwClient, MEDIA_TYPES } from '../bw-client.js';
+import { BwClient, MEDIA_TYPES, bwNsName, bwSeg } from '../bw-client.js';
 import { queryAccept, queryWriteMediaType } from './query.js';
 
 function parseAtomTitles(xml: string): string[] {
@@ -21,11 +21,13 @@ async function bwDeleteQuery(
 ): Promise<string> {
   const nameUpper = objectName.toUpperCase();
   const nameLower = objectName.toLowerCase();
+  const nameSeg = bwSeg(objectName);
+  const nameSegUpper = encodeURIComponent(bwNsName(objectName).toUpperCase());
 
   // 1. Lock via the enqueue endpoint (name UPPERCASE, no compuid, DELE context).
   const csrf = await client.getCsrfToken();
   const lockResponse = await client.rawPost(
-    `/sap/bw/modeling/comp/enq/${nameUpper}?action=lock`,
+    `/sap/bw/modeling/comp/enq/${nameSegUpper}?action=lock`,
     '',
     {
       'activity_context': 'DELE',
@@ -41,7 +43,7 @@ async function bwDeleteQuery(
   // Unlock through the lowercase query URL (asymmetric to the lock — replicate as traced).
   const unlock = async () => {
     await client.rawPost(
-      `/sap/bw/modeling/query/${nameLower}/a?action=unlock`,
+      `/sap/bw/modeling/query/${nameSeg}/a?action=unlock`,
       '',
       { 'Accept': queryAccept(), 'x-csrf-token': await client.getCsrfToken() });
   };
@@ -50,7 +52,7 @@ async function bwDeleteQuery(
     // 2. DELETE — uppercase /A path. Use the safe negotiation form for Content-Type
     //    (the traced single v1_11 fails with HTTP 415 on lower-version backends).
     const deleteResponse = await client.rawDelete(
-      `/sap/bw/modeling/query/${nameUpper}/A?lockHandle=${lockHandle}`,
+      `/sap/bw/modeling/query/${nameSegUpper}/A?lockHandle=${lockHandle}`,
       {
         'Accept': queryAccept(),
         'Content-Type': `application/xml, ${queryWriteMediaType()}`,

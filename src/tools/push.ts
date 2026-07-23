@@ -17,7 +17,7 @@ function buildAuth(): string {
 
 function pushBase(adsoName: string): string {
   const baseUrl = getEnv('BW_URL').replace(/\/$/, '');
-  return `${baseUrl}/sap/bw4/v1/push/dataStores/${adsoName.toLowerCase()}`;
+  return `${baseUrl}/sap/bw4/v1/push/dataStores/${encodeURIComponent(adsoName.toLowerCase())}`;
 }
 
 /**

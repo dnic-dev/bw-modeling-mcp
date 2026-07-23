@@ -1,4 +1,4 @@
-import { BwClient } from '../bw-client.js';
+import { BwClient, bwNsName } from '../bw-client.js';
 
 interface SearchEntry {
   objectName: string;
@@ -123,7 +123,7 @@ export async function bwXref(
     if (!sourceSystem) throw new Error('bw_xref with object_type RSDS requires source_system parameter.');
     resolvedName = objectName.toUpperCase().padEnd(30) + sourceSystem.toUpperCase();
   } else {
-    resolvedName = objectName.toUpperCase();
+    resolvedName = bwNsName(objectName.toUpperCase());
   }
 
   const path =

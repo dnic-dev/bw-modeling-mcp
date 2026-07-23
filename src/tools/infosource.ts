@@ -1,4 +1,4 @@
-import { BwClient, MEDIA_TYPES, freshRead } from '../bw-client.js';
+import { BwClient, MEDIA_TYPES, freshRead, bwNsName, bwSeg } from '../bw-client.js';
 
 const TRCS_MEDIA = 'application/vnd.sap.bw.modeling.trcs-v1_0_0+xml';
 
@@ -11,7 +11,7 @@ const TRCS_MEDIA = 'application/vnd.sap.bw.modeling.trcs-v1_0_0+xml';
  */
 export async function bwGetInfosource(client: BwClient, name: string): Promise<string> {
   const nameLower = name.toLowerCase();
-  const result = await freshRead(`/sap/bw/modeling/trcs/${nameLower}/m`, TRCS_MEDIA);
+  const result = await freshRead(`/sap/bw/modeling/trcs/${bwSeg(nameLower)}/m`, TRCS_MEDIA);
   const xml = result.body;
 
   // Root attributes
@@ -155,10 +155,10 @@ export async function bwCreateInfosource(
   const lockHandle = await client.lock('trcs', name, { 'activity_context': 'CREA' });
 
   // Build URL — add copyFrom params before lockHandle when provided
-  let url = `/sap/bw/modeling/trcs/${name.toLowerCase()}`;
+  let url = `/sap/bw/modeling/trcs/${bwSeg(name)}`;
   const qs: string[] = [];
   if (copyFromObjectType && copyFromObjectName) {
-    let encodedName = copyFromObjectName;
+    let encodedName = bwNsName(copyFromObjectName);
     if (copyFromObjectType === 'RSDS' && copyFromSourceSystem) {
       encodedName = copyFromObjectName.padEnd(30) + copyFromSourceSystem.padEnd(10);
     }
