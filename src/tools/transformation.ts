@@ -186,7 +186,26 @@ export async function bwGetTransformation(
   transformationName: string,
   format: 'text' | 'raw' = 'text',
 ): Promise<string> {
-  const result = await freshReadInactive(transformationName.toLowerCase());
+  let result: { body: string; headers: Record<string, string> };
+  try {
+    result = await freshReadInactive(transformationName.toLowerCase());
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e);
+    // SAP raises HTTP 500 "BW Model serialization failed" (CL_RSO_RES_TRFN → get_xml_from_db)
+    // for transformations the modeling serializer cannot represent — typically ones with
+    // start/end/expert ABAP routines or legacy rule types. It is a permanent SAP modeling-
+    // serializer limitation (Eclipse BWMT shows the same), not a transient error, so surface it
+    // clearly and point to SAP GUI (RSTRAN) instead of leaking the raw 500 + XML body.
+    if (/serialization failed/i.test(msg)) {
+      throw new Error(
+        `Transformation ${transformationName.toUpperCase()} cannot be read via the BW modeling API: ` +
+          'SAP returned "BW Model serialization failed" (HTTP 500). This is a permanent limitation for ' +
+          'transformations whose model the serializer cannot represent (usually start/end/expert ABAP ' +
+          'routines or legacy rule types), not a transient error — inspect it in SAP GUI (RSTRAN) instead.',
+      );
+    }
+    throw e;
+  }
   const status = result.headers['object_status'] ?? result.headers['OBJECT_STATUS'] ?? 'unknown';
   const ts = result.headers['timestamp'] ?? '';
   const xml = result.body;
