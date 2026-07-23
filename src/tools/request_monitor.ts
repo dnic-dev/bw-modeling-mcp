@@ -194,9 +194,15 @@ export async function bwGetRequest(
     }, null, 2);
   }
 
-  // The message log is the mandatory section. If even it failed, there is nothing useful to
-  // return — surface the error like before.
-  if (logsRes.status === 'rejected') {
+  // Only give up if EVERY section failed — a request with no process log (e.g. an
+  // activation-table request, storage=AT) still has a usable header, DTP info and process
+  // steps, so a 404 of the log endpoint must not kill the whole read.
+  if (
+    headerRes.status === 'rejected' &&
+    dtpInfoRes.status === 'rejected' &&
+    processesRes.status === 'rejected' &&
+    logsRes.status === 'rejected'
+  ) {
     throw new Error(errMsg(logsRes));
   }
 
@@ -260,12 +266,19 @@ export async function bwGetRequest(
 
   // Section 4 — message log. longText is SAPscript-to-HTML; its only added value over
   // message is the "Meldungsnr. {MSGID}" — extract that and append it, drop the raw HTML.
-  const logs = JSON.parse(logsRes.value.body) as LogMessage[];
+  // Optional: some requests (e.g. storage=AT activation-table requests) have no process log
+  // and 404 here, but the sections above are still valid.
   lines.push('');
-  lines.push(`── Message Log (${logs.length}) ──`);
-  for (const log of logs) {
-    const msgNo = log.longText?.match(/Meldungsnr\.\s*([A-Z0-9_\/]+)/)?.[1];
-    lines.push(`  [${log.severity ?? ''}] ${log.message ?? ''}${msgNo ? ` (${msgNo})` : ''}`);
+  if (logsRes.status === 'fulfilled') {
+    const logs = JSON.parse(logsRes.value.body) as LogMessage[];
+    lines.push(`── Message Log (${logs.length}) ──`);
+    for (const log of logs) {
+      const msgNo = log.longText?.match(/Meldungsnr\.\s*([A-Z0-9_\/]+)/)?.[1];
+      lines.push(`  [${log.severity ?? ''}] ${log.message ?? ''}${msgNo ? ` (${msgNo})` : ''}`);
+    }
+  } else {
+    lines.push('── Message Log ──');
+    lines.push(`  ${unavailable(logsRes)}`);
   }
 
   return lines.join('\n');
