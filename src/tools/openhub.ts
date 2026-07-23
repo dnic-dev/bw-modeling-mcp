@@ -1,4 +1,5 @@
 import { BwClient, MEDIA_TYPES } from '../bw-client.js';
+import { stripInfoAreaSentinel } from '../xml.js';
 
 interface OpenHubField {
   name: string;
@@ -66,7 +67,7 @@ function parseOpenHubXml(xml: string, status: string): OpenHubInfo {
   const tlMatch = xml.match(/<tlogoProperties([^>]*)>/);
   const tlAttrs = tlMatch?.[1] ?? '';
   const tlogoPkg = xml.match(/<adtcore:packageRef\b[^>]*\bname="([^"]*)"/)?.[1] ?? '';
-  const infoArea = xml.match(/<infoArea[^>]*>([^<]+)<\/infoArea>/)?.[1]?.trim() ?? '';
+  const infoArea = stripInfoAreaSentinel(xml.match(/<infoArea[^>]*>([^<]+)<\/infoArea>/)?.[1]?.trim() ?? '');
 
   // Key elements — collect the name tokens from #///<name>
   const keyNames = new Set<string>();

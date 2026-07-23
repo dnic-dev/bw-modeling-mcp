@@ -1,4 +1,5 @@
 import { BwClient, MEDIA_TYPES, freshRead } from '../bw-client.js';
+import { stripInfoAreaSentinel } from '../xml.js';
 
 const TRCS_MEDIA = 'application/vnd.sap.bw.modeling.trcs-v1_0_0+xml';
 
@@ -29,7 +30,7 @@ export async function bwGetInfosource(client: BwClient, name: string): Promise<s
   const objectStatus = (tlogoPart.match(/adtcore:version="([^"]*)"/) ?? [])[1] ?? '';
 
   // <infoArea>
-  const infoArea = (xml.match(/<infoArea>([^<]*)<\/infoArea>/) ?? [])[1] ?? '';
+  const infoArea = stripInfoAreaSentinel((xml.match(/<infoArea>([^<]*)<\/infoArea>/) ?? [])[1] ?? '');
 
   // Collect keyElement names: #///NAME → NAME
   const keyElements = new Set<string>();

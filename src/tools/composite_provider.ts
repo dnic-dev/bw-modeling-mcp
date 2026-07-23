@@ -1,4 +1,5 @@
 import { BwClient } from '../bw-client.js';
+import { stripInfoAreaSentinel } from '../xml.js';
 
 const HCPR_ACCEPT = [
   'application/vnd.sap.bw.modeling.hcpr-v1_0_0+xml',
@@ -46,7 +47,7 @@ export async function bwGetCompositeProvider(
   const responsible = attr(tlogoAttrs, 'adtcore:responsible');
   const changedAt = attr(tlogoAttrs, 'adtcore:changedAt');
   const changedBy = attr(tlogoAttrs, 'adtcore:changedBy');
-  const infoArea = xml.match(/<infoArea>([^<]+)<\/infoArea>/)?.[1] ?? '';
+  const infoArea = stripInfoAreaSentinel(xml.match(/<infoArea>([^<]+)<\/infoArea>/)?.[1] ?? '');
   const packageName = xml.match(/adtcore:packageRef[^>]*adtcore:name="([^"]+)"/)?.[1] ?? '';
 
   // viewNode

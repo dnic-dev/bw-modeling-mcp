@@ -1,6 +1,7 @@
 import { XMLParser } from 'fast-xml-parser';
 import { BwClient } from '../bw-client.js';
 import { ckfAccept, rkfAccept, structureAccept } from './query.js';
+import { stripInfoAreaSentinel } from '../xml.js';
 
 // ── XML Parser ───────────────────────────────────────────────────────────────
 
@@ -132,7 +133,7 @@ function extractMetadata(
   const entityProps = (mainComp['Qry:entityProperties'] ?? {}) as Record<string, unknown>;
   const packageRef = entityProps['adtCore:packageRef'] as Record<string, unknown> | undefined;
   const rawInfoArea = entityProps['infoArea'];
-  const infoArea = typeof rawInfoArea === 'string' ? rawInfoArea : '';
+  const infoArea = stripInfoAreaSentinel(typeof rawInfoArea === 'string' ? rawInfoArea : '');
 
   return {
     timestamp: (mainComp['@_timestamp'] as string) ?? '',

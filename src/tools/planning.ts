@@ -1,4 +1,5 @@
 import { BwClient, MEDIA_TYPES } from '../bw-client.js';
+import { stripInfoAreaSentinel } from '../xml.js';
 
 function attr(tag: string, attrName: string): string {
   const m = tag.match(new RegExp(`\\b${attrName}="([^"]*)"`));
@@ -88,7 +89,7 @@ function parseAggLevelXml(xml: string, status: string): AggLevelInfo {
   const infoProvider = attr(compositeInputMatch[0], 'name');
 
   const tlogoPkg = xml.match(/<adtcore:packageRef\b[^>]*\bname="([^"]*)"/)?.[1] ?? '';
-  const infoArea = xml.match(/<infoArea[^>]*>([^<]+)<\/infoArea>/)?.[1]?.trim() ?? '';
+  const infoArea = stripInfoAreaSentinel(xml.match(/<infoArea[^>]*>([^<]+)<\/infoArea>/)?.[1]?.trim() ?? '');
 
   // Build dimension name → label map
   const dimensionMap = new Map<string, string>();
@@ -310,7 +311,7 @@ function parsePlcrXml(xml: string, status: string): PlanningPropertiesInfo {
   const tlMatch = xml.match(/<tlogoProperties([^>]*)>/);
   const name = tlMatch ? (attr(tlMatch[1], 'adtcore:name') || providerName) : providerName;
   const tlogoPkg = xml.match(/<adtcore:packageRef\b[^>]*\bname="([^"]*)"/)?.[1] ?? '';
-  const infoArea = xml.match(/<infoArea[^>]*>([^<]+)<\/infoArea>/)?.[1]?.trim() ?? '';
+  const infoArea = stripInfoAreaSentinel(xml.match(/<infoArea[^>]*>([^<]+)<\/infoArea>/)?.[1]?.trim() ?? '');
 
   // atom:link rel="up" — underlying provider's resource URL and media type
   const upLinkMatch = xml.match(/<atom:link\b[^>]*\brel="up"[^>]*>/);
@@ -410,7 +411,7 @@ function parsePlsqXml(xml: string, status: string): PlsqInfo {
 
   const description = xml.match(/<description\b[^>]*\blabel="([^"]*)"/)?.[1] ?? '';
   const tlogoPkg = xml.match(/<adtcore:packageRef\b[^>]*\bname="([^"]*)"/)?.[1] ?? '';
-  const infoArea = xml.match(/<infoArea[^>]*>([^<]+)<\/infoArea>/)?.[1]?.trim() ?? '';
+  const infoArea = stripInfoAreaSentinel(xml.match(/<infoArea[^>]*>([^<]+)<\/infoArea>/)?.[1]?.trim() ?? '');
 
   // Steps are self-closing <step .../> elements; preserve document order
   const steps: PlsqStep[] = [];
@@ -665,7 +666,7 @@ function parsePlseXml(xml: string, status: string): PlseInfo {
 
   const description = xml.match(/<description\b[^>]*\blabel="([^"]*)"/)?.[1] ?? '';
   const tlogoPkg = xml.match(/<adtcore:packageRef\b[^>]*\bname="([^"]*)"/)?.[1] ?? '';
-  const infoArea = xml.match(/<infoArea[^>]*>([^<]+)<\/infoArea>/)?.[1]?.trim() ?? '';
+  const infoArea = stripInfoAreaSentinel(xml.match(/<infoArea[^>]*>([^<]+)<\/infoArea>/)?.[1]?.trim() ?? '');
 
   const charUsages: PlseCharUsage[] = [];
   const cuRe = /<charUsage\b([^>]*)(?:\/>|>[\s\S]*?<\/charUsage>)/g;

@@ -1,4 +1,5 @@
 import { BwClient, MEDIA_TYPES } from '../bw-client.js';
+import { stripInfoAreaSentinel } from '../xml.js';
 
 // ── bwMoveObject ──────────────────────────────────────────────────────────────
 
@@ -154,7 +155,7 @@ export async function bwGetInfoarea(client: BwClient, name: string): Promise<str
       parsed['objectStatus'] ??
       '';
 
-    return JSON.stringify({ name: infoAreaName, label, parent_area: parentArea || null, object_status: objectStatus }, null, 2);
+    return JSON.stringify({ name: infoAreaName, label, parent_area: stripInfoAreaSentinel(parentArea ?? '') || null, object_status: objectStatus }, null, 2);
   } catch {
     return JSON.stringify({ raw: body });
   }

@@ -1,5 +1,6 @@
 import { BwClient, MEDIA_TYPES, createClientFromEnv, freshRead } from '../bw-client.js';
 import { parseInfoObjectProps } from './infoobject.js';
+import { stripInfoAreaSentinel } from '../xml.js';
 
 // ── aDSO type presets ────────────────────────────────────────────────────────
 
@@ -188,7 +189,7 @@ function summarizeAdso(adsoName: string, status: string, xml: string): string {
   const desc = rawDesc
     .replace(/&quot;/g, '"').replace(/&amp;/g, '&')
     .replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&apos;/g, "'");
-  const infoArea = xml.match(/<infoArea>([^<]*)<\/infoArea>/)?.[1] ?? '';
+  const infoArea = stripInfoAreaSentinel(xml.match(/<infoArea>([^<]*)<\/infoArea>/)?.[1] ?? '');
   const pkg = xml.match(/<adtcore:packageRef\b[^>]*\badtcore:name="([^"]*)"/)?.[1] ?? '';
   const objectVersion = xml.match(/<objectVersion>([^<]*)<\/objectVersion>/)?.[1] ?? '';
   const versionMap: Record<string, string> = { M: 'Inactive', A: 'Active' };
