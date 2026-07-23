@@ -15,7 +15,10 @@ function buildODataUrl(service: string, entitySet: string, opts: {
 
 function odataDateToIso(v: string | undefined): string | undefined {
   if (!v) return undefined;
-  const m = /\/Date\((-?\d+)\)\//.exec(v);
+  // SAP OData V2 emits epoch-ms dates, optionally with a display timezone offset:
+  // `/Date(1784700050000)/` or `/Date(1784700050000+0000)/`. The ms are UTC, so the
+  // offset is ignored for the ISO conversion.
+  const m = /\/Date\((-?\d+)(?:[+-]\d{4})?\)\//.exec(v);
   return m ? new Date(Number(m[1])).toISOString() : v;
 }
 
