@@ -523,6 +523,19 @@ Publish or remove a BW Query from a role or folder. Parameters: `query_name`, `a
 ### `bw_get_composite_provider` _(Read only)_
 Read a CompositeProvider (HCPR) — view node type (Union/Join), source providers with input mapping counts, all fields with dimension classification, join conditions, and temporal join details.
 
+### `bw_create_composite_provider` ⚠️ _(unverified)_
+Create a new CompositeProvider shell — `empty` (minimal Join/Union view node) or `from_template` (propose structure from an existing HCPR). Written from the read-side schema only, without a captured wire trace like the aDSO write tools — verify against a real system before relying on it.
+
+### `bw_update_composite_provider` ⚠️ _(unverified)_
+Modify an existing CompositeProvider. Actions:
+- `add_input` — add a source InfoProvider with its field mappings; mapping targets not yet present are auto-created as elements
+- `remove_input` — remove an input by alias (does not clean up join/union references)
+- `update_mapping` — replace the complete mapping list of one existing input
+- `update_join` — replace the join condition (type, cardinality, key field pairs) wholesale
+- `update_settings` — change label, stackable, default node, or aggregation behaviour
+
+Same caveat as `bw_create_composite_provider`: built from the read-side schema, not a captured PUT trace.
+
 ### `bw_get_ckf` _(Read only)_
 Read a global Calculated Key Figure — formula recursively resolved to a human-readable string, metadata (package, InfoArea, author), and full dependency graph of all referenced sub-components.
 
@@ -658,7 +671,7 @@ See [ARCHITECTURE.md](ARCHITECTURE.md) for the full technical architecture and c
 
 ## Roadmap
 
-- **CompositeProvider** — Read: `bw_get_composite_provider` ✅, global components (`bw_get_ckf` / `bw_get_rkf` / `bw_get_structure`) ✅ — Create and modify: planned
+- **CompositeProvider** — Read: `bw_get_composite_provider` ✅, global components (`bw_get_ckf` / `bw_get_rkf` / `bw_get_structure`) ✅ — Create and modify: `bw_create_composite_provider` / `bw_update_composite_provider` ⚠️ unverified (built from the read-side schema, not yet trace-verified against a real system)
 - **BW Queries** — Read: `bw_get_query` ✅ — Create and modify: `bw_create_query` / `bw_update_query_*` ✅
 - **Process Chains** — build and manage Process Chains ✅ (`bw_create_process_chain`, `bw_update_process_chain`, `bw_activate_process_chain`, `bw_append_process_chain_dtp`, `bw_swap_process_chain_dtp`, `bw_add_process_chain_error_links`, `bw_create_decision_variant`)
 - **Open ODS View** — create Open ODS Views

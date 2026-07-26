@@ -22,7 +22,18 @@ import { bwCreateInfosource, bwUpdateInfosource, bwGetInfosource, InfosourceFiel
 import { bwPushData, bwGetPushSchema } from './tools/push.js';
 import { bwGetQuery, bwCreateQuery } from './tools/query.js';
 import { bwUpdateQueryLayout, bwUpdateQueryFilter, bwUpdateQueryKeyFigures, bwUpdateQuerySettings, LayoutOperation, FilterOperation, KeyFigureOperation, UpdateQuerySettingsArgs } from './tools/query_update.js';
-import { bwGetCompositeProvider } from './tools/composite_provider.js';
+import {
+  bwGetCompositeProvider,
+  bwCreateCompositeProvider,
+  bwUpdateCompositeProviderSettings,
+  CompositeProviderSettings,
+  bwUpdateCompositeProviderInput,
+  InputProviderDef,
+  bwUpdateCompositeProviderMapping,
+  FieldMapping,
+  bwUpdateCompositeProviderJoin,
+  JoinKeyPair,
+} from './tools/composite_provider.js';
 import { bwGetCkf, bwGetRkf, bwGetStructure } from './tools/cp_components.js';
 import { bwCreateRkf, CreateRkfArgs } from './tools/rkf_create.js';
 import { bwListContents } from './tools/repository.js';
@@ -2017,6 +2028,138 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
           },
         },
         required: ['composite_provider_name'],
+      },
+    },
+    {
+      name: 'bw_create_composite_provider',
+      description:
+        '⚠️ UNVERIFIED write path (built from the read-side schema, no captured wire trace — see composite_provider.ts header comment). ' +
+        'Create a new CompositeProvider (HCPR) shell. ' +
+        'action "empty" (default): minimal shell with an empty Join or Union view node (no inputs/fields yet). ' +
+        'action "from_template": proposes structure from an existing HCPR — pass template_name. ' +
+        'After creation, add inputs with bw_update_composite_provider (action "add_input"), then call bw_activate.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          composite_provider_name: { type: 'string', description: 'Name for the new CompositeProvider (e.g. "HCPR_NAME").' },
+          label: { type: 'string', description: 'Description / label for the new CompositeProvider.' },
+          info_area: { type: 'string', description: 'InfoArea to create the CompositeProvider in (e.g. "NEXTJUICE").' },
+          action: {
+            type: 'string',
+            enum: ['empty', 'from_template'],
+            description: '"empty" (default) or "from_template".',
+          },
+          view_type: {
+            type: 'string',
+            enum: ['Join', 'Union'],
+            description: 'Type of the view node (default "Join").',
+          },
+          template_name: {
+            type: 'string',
+            description: 'Existing HCPR to propose structure from (action "from_template" only).',
+          },
+          package: { type: 'string', description: 'Development package (default "$TMP").' },
+          stackable: { type: 'boolean', description: 'Whether the CompositeProvider can itself be used as an input to another CompositeProvider. Default false.' },
+        },
+        required: ['composite_provider_name', 'label', 'info_area'],
+      },
+    },
+    {
+      name: 'bw_update_composite_provider',
+      description:
+        '⚠️ UNVERIFIED write path (built from the read-side schema, no captured wire trace — see composite_provider.ts header comment). ' +
+        'Add/remove source InfoProviders, manage their field mappings, update the join condition, or edit root-level settings. ' +
+        'action "add_input": add a source InfoProvider — pass input {provider_name, provider_type, alias?, mappings}. Mapping targets not yet present as CompositeProvider elements are auto-created (pass info_object_name/dimension on the mapping to control that). ' +
+        'action "remove_input": removes the input by its alias (the <input> "name" attribute) — pass input_alias. Does not clean up join/union references to it; use "update_join" afterwards if needed. ' +
+        'action "update_mapping": replace the complete mapping list of one existing input — pass input_alias and mappings. ' +
+        'action "update_join": replace the join condition (type, cardinality, key field pairs) on a Join view node wholesale — pass left_alias, right_alias, key_pairs, join_type, cardinality. ' +
+        'action "update_settings": edit root attributes (label, stackable, default_node, aggregation_behaviour) — pass settings. ' +
+        'Returns a lock_handle that must be passed to bw_activate to complete the operation.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          composite_provider_name: { type: 'string', description: 'CompositeProvider name (e.g. "HCPR_NAME").' },
+          action: {
+            type: 'string',
+            enum: ['add_input', 'remove_input', 'update_mapping', 'update_join', 'update_settings'],
+            description: 'Which change to apply.',
+          },
+          input: {
+            type: 'object',
+            description: 'Input definition for action "add_input".',
+            properties: {
+              provider_name: { type: 'string', description: 'Technical name of the source InfoProvider.' },
+              provider_type: { type: 'string', description: 'TLOGO-style suffix appended to the alias, e.g. "ADSO", "CUBE", "HCPR".' },
+              alias: { type: 'string', description: 'Local reference name used by mappings/join. Defaults to provider_name.' },
+              mappings: {
+                type: 'array',
+                description: 'Field mappings for this input.',
+                items: {
+                  type: 'object',
+                  properties: {
+                    target: { type: 'string', description: 'CompositeProvider element name (existing, or newly created).' },
+                    source: { type: 'string', description: 'Source field name in the input provider (regular mapping). Defaults to target.' },
+                    constant_value: { type: 'string', description: 'Constant value — mutually exclusive with source.' },
+                    info_object_name: { type: 'string', description: 'InfoObject backing a newly created target element. Defaults to target.' },
+                    dimension: { type: 'string', description: 'Dimension name for a newly created target element (default "GROUP1"; use a name containing "__KEYFIGURES" for measures).' },
+                  },
+                  required: ['target'],
+                },
+              },
+            },
+            required: ['provider_name', 'provider_type', 'mappings'],
+          },
+          input_alias: {
+            type: 'string',
+            description: 'Input alias to operate on (action "remove_input" or "update_mapping").',
+          },
+          mappings: {
+            type: 'array',
+            description: 'Complete replacement mapping list for action "update_mapping" (same shape as input.mappings).',
+            items: {
+              type: 'object',
+              properties: {
+                target: { type: 'string' },
+                source: { type: 'string' },
+                constant_value: { type: 'string' },
+                info_object_name: { type: 'string' },
+                dimension: { type: 'string' },
+              },
+              required: ['target'],
+            },
+          },
+          left_alias: { type: 'string', description: 'Left input alias for action "update_join".' },
+          right_alias: { type: 'string', description: 'Right input alias for action "update_join".' },
+          key_pairs: {
+            type: 'array',
+            description: 'Join key field pairs for action "update_join".',
+            items: {
+              type: 'object',
+              properties: {
+                left: { type: 'string', description: 'Field name on the left input.' },
+                right: { type: 'string', description: 'Field name on the right input.' },
+              },
+              required: ['left', 'right'],
+            },
+          },
+          join_type: { type: 'string', description: 'Join type for action "update_join" (default "INNER").' },
+          cardinality: { type: 'string', description: 'Join cardinality for action "update_join" (default "M_N").' },
+          settings: {
+            type: 'object',
+            description: 'Settings to apply for action "update_settings".',
+            properties: {
+              label: { type: 'string', description: 'CompositeProvider description text.' },
+              stackable: { type: 'boolean' },
+              default_node: { type: 'string' },
+              aggregation_behaviour: { type: 'string' },
+            },
+          },
+          transport: {
+            type: 'string',
+            description: 'Transport request number (e.g. DEVK900123). Only required if the BW system requires transport assignment.',
+          },
+        },
+        required: ['composite_provider_name', 'action'],
       },
     },
     {
@@ -4152,6 +4295,89 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       case 'bw_get_composite_provider':
         text = await bwGetCompositeProvider(client, args?.composite_provider_name as string);
         break;
+
+      case 'bw_create_composite_provider':
+        text = await bwCreateCompositeProvider(
+          client,
+          args?.composite_provider_name as string,
+          args?.label as string,
+          args?.info_area as string,
+          (args?.action as 'empty' | 'from_template') ?? 'empty',
+          (args?.view_type as 'Join' | 'Union') ?? 'Join',
+          args?.template_name as string | undefined,
+          (args?.package as string) ?? '$TMP',
+          (args?.stackable as boolean) ?? false
+        );
+        break;
+
+      case 'bw_update_composite_provider': {
+        const cpName = args?.composite_provider_name as string;
+        const transport = args?.transport as string | undefined;
+        const toMapping = (m: Record<string, unknown>): FieldMapping => ({
+          target: m['target'] as string,
+          source: m['source'] as string | undefined,
+          constantValue: m['constant_value'] as string | undefined,
+          infoObjectName: m['info_object_name'] as string | undefined,
+          dimension: m['dimension'] as string | undefined,
+        });
+
+        if (args?.action === 'update_settings') {
+          const s = (args?.settings ?? {}) as Record<string, unknown>;
+          const settings: CompositeProviderSettings = {
+            label: s['label'] as string | undefined,
+            stackable: s['stackable'] as boolean | undefined,
+            defaultNode: s['default_node'] as string | undefined,
+            aggregationBehaviour: s['aggregation_behaviour'] as string | undefined,
+          };
+          (Object.keys(settings) as Array<keyof CompositeProviderSettings>).forEach(
+            (k) => settings[k] === undefined && delete settings[k]
+          );
+          settings.transport = transport;
+          text = await bwUpdateCompositeProviderSettings(client, cpName, settings);
+        } else if (args?.action === 'update_mapping') {
+          const rawMappings = (args?.mappings as Array<Record<string, unknown>>) ?? [];
+          text = await bwUpdateCompositeProviderMapping(
+            client,
+            cpName,
+            args?.input_alias as string,
+            rawMappings.map(toMapping),
+            transport
+          );
+        } else if (args?.action === 'update_join') {
+          const rawPairs = (args?.key_pairs as Array<Record<string, string>>) ?? [];
+          const keyPairs: JoinKeyPair[] = rawPairs.map((p) => ({ left: p['left'], right: p['right'] }));
+          text = await bwUpdateCompositeProviderJoin(
+            client,
+            cpName,
+            args?.left_alias as string,
+            args?.right_alias as string,
+            keyPairs,
+            (args?.join_type as string) ?? 'INNER',
+            (args?.cardinality as string) ?? 'M_N',
+            transport
+          );
+        } else if (args?.action === 'remove_input') {
+          text = await bwUpdateCompositeProviderInput(
+            client,
+            cpName,
+            'remove_input',
+            undefined,
+            args?.input_alias as string,
+            transport
+          );
+        } else {
+          const i = (args?.input ?? {}) as Record<string, unknown>;
+          const rawMappings = (i['mappings'] as Array<Record<string, unknown>>) ?? [];
+          const input: InputProviderDef = {
+            providerName: i['provider_name'] as string,
+            providerType: i['provider_type'] as string,
+            alias: i['alias'] as string | undefined,
+            mappings: rawMappings.map(toMapping),
+          };
+          text = await bwUpdateCompositeProviderInput(client, cpName, 'add_input', input, undefined, transport);
+        }
+        break;
+      }
 
       case 'bw_get_ckf':
         text = await bwGetCkf(client, args?.component_name as string);
