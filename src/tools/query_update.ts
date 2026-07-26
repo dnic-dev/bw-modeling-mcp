@@ -281,6 +281,15 @@ function mainComponentHasFirstCustomDimension(doc: string): boolean {
  * Locate the key figure structure (CustomDimension on 1KYFNM) in rows or columns,
  * scoped to the mainComponent region. These containers never nest, so a lazy
  * match to the matching close tag captures exactly one element.
+ *
+ * Confirmed against a real captured save/reread (BW/4HANA A4H, 2026-07-26): the
+ * infoObjectName we submit at creation time ("1KYFNM") is rewritten by the backend
+ * to "1STRUC" once the document is actually saved and reread — "1KYFNM" only ever
+ * appears in a document that was never round-tripped through a save. Since every
+ * lookup here starts from a fresh GET of an already-saved document, matching only
+ * "1KYFNM" meant this could never find a structure created by a prior call — every
+ * follow-up edit (add a second key figure, set_member_properties, remove_member)
+ * failed with "query has no key figure structure" even though one clearly existed.
  */
 function findKeyFigureStructure(
   doc: string
@@ -292,7 +301,10 @@ function findKeyFigureStructure(
   while ((m = re.exec(sub)) !== null) {
     const full = m[0];
     const openTag = full.match(/^<Qry:(?:rows|columns)\b[^>]*?(?:\/?>)/)?.[0] ?? full;
-    if (openTag.includes('xsi:type="Qry:CustomDimension"') && openTag.includes('infoObjectName="1KYFNM"')) {
+    if (
+      openTag.includes('xsi:type="Qry:CustomDimension"') &&
+      (openTag.includes('infoObjectName="1KYFNM"') || openTag.includes('infoObjectName="1STRUC"'))
+    ) {
       const id = openTag.match(/\bid="([^"]+)"/)?.[1];
       return {
         container: m[1],
@@ -424,6 +436,14 @@ async function withQueryDocument(
     throw new Error(`No timestamp header on GET ${path} — cannot do optimistic locking.`);
   }
 
+  // A prior save that reported check messages (e.g. "Missing InfoObject" warnings) persists
+  // those as <Qry:messages .../> elements inside the document itself, not just in the PUT
+  // response. Left in place, the *next* save echoes them back verbatim and the backend's
+  // PARSE_MODEL rejects the document outright ("cannot process XML element messages") —
+  // confirmed against a real captured 500 (BW/4HANA A4H, 2026-07-26). These are response-only
+  // annotations, never legitimate input, so strip them before mutating/re-submitting.
+  const cleanedBody = getResult.body.replace(/<Qry:messages\b[^>]*\/>/g, '');
+
   const csrf = await client.getCsrfToken();
   const lockResponse = await client.rawPost(`${path}?action=lock`, '', {
     'Accept': QUERY_ACCEPT_LIST,
@@ -437,7 +457,7 @@ async function withQueryDocument(
   const lockHandle = lockMatch[1];
 
   try {
-    const mutated = mutate(getResult.body);
+    const mutated = mutate(cleanedBody);
 
     const client2 = createClientFromEnv();
     const csrf2 = await client2.getCsrfToken();
@@ -1102,7 +1122,17 @@ function buildRestrictionGroups(restrictions: KeyFigureRestriction[] | undefined
     .join('');
 }
 
-/** Build a basic key figure member (MemberSelection with a keyFigure SelectionRange). */
+/**
+ * Build a basic key figure member (MemberSelection with a keyFigure SelectionRange).
+ *
+ * The decimals/hidden/signInversion/exceptionAggregation placeholders (bare, no
+ * attributes — "use system default", same pattern as sorting/valuePresentation/etc.
+ * on a regular Dimension row) are required here: omitting them let the backend's
+ * own component-verification step dereference something it expects every member to
+ * carry, crashing with "System error in program CL_RSR_RRI2_LRECH ...
+ * SET_CELL_FLAGS_FROM_COB_PRO" on save — confirmed 100% reproducible on a minimal
+ * add-key-figure-to-an-empty-query repro before this fix (BW/4HANA A4H, 2026-07-26).
+ */
 function buildKeyFigureMember(vid: string, kyf: string, descEsc: string, descCustom: boolean, restrictionGroups: string): string {
   return `<Qry:members xsi:type="Qry:MemberSelection" id="${vid}">
   ${descriptionEl(descEsc, descCustom)}
@@ -1110,6 +1140,10 @@ function buildKeyFigureMember(vid: string, kyf: string, descEsc: string, descCus
     <Qry:type>InfoObject</Qry:type>
     <Qry:value>${kyf}</Qry:value>
   </Qry:defaultHint>
+  <Qry:decimals/>
+  <Qry:hidden/>
+  <Qry:signInversion/>
+  <Qry:exceptionAggregation/>
   <Qry:groups description="Key Figures" infoObject="1KYFNM">
     <Qry:tokens xsi:type="Qry:SelectionRange" usageType="asFilter" selectionType="keyFigure" fromValueDesc="${descEsc}" operator="Equal">
       <Qry:fromValue>

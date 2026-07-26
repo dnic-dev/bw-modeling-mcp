@@ -32,6 +32,7 @@ import {
   bwUpdateCompositeProviderMapping,
   FieldMapping,
   bwUpdateCompositeProviderJoin,
+  bwRemoveCompositeProviderJoin,
   JoinKeyPair,
 } from './tools/composite_provider.js';
 import { bwGetCkf, bwGetRkf, bwGetStructure } from './tools/cp_components.js';
@@ -993,8 +994,8 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
         properties: {
           object_type: {
             type: 'string',
-            enum: ['adso', 'trfn', 'trcs', 'iobj', 'area', 'dtpa'],
-            description: 'Object type: adso, trfn, trcs, iobj, area (InfoArea), or dtpa (DTP).',
+            enum: ['adso', 'trfn', 'trcs', 'iobj', 'area', 'dtpa', 'hcpr'],
+            description: 'Object type: adso, trfn, trcs, iobj, area (InfoArea), dtpa (DTP), or hcpr (CompositeProvider).',
           },
           object_name: {
             type: 'string',
@@ -2033,11 +2034,18 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
     {
       name: 'bw_create_composite_provider',
       description:
-        '⚠️ UNVERIFIED write path (built from the read-side schema, no captured wire trace — see composite_provider.ts header comment). ' +
-        'Create a new CompositeProvider (HCPR) shell. ' +
-        'action "empty" (default): minimal shell with an empty Join or Union view node (no inputs/fields yet). ' +
+        'Create a new CompositeProvider (HCPR) shell. Create call confirmed against real captured traces for both ' +
+        'view types: Union with 1 input, and Join with exactly 2 inputs (which also gets a bare <join> stub wired up ' +
+        'automatically between those two — set its keys/cardinality afterwards with bw_update_composite_provider action "update_join"). ' +
+        'action "empty" (default): view node with the given inputs attached (entity reference only, no fields yet — ' +
+        'fields/mappings are added afterwards via bw_update_composite_provider action "add_input"). ' +
+        'A Union accepts any number of inputs (1+, all just unioned together — the N-input case beyond 1 is a straightforward ' +
+        'extrapolation, not separately captured). A Join is inherently pairwise: pass exactly 2 inputs here to get the auto-wired ' +
+        'stub between them; for a 3+-way (star/chain) join, pass those same first 2 here, then add each additional InfoProvider via ' +
+        'bw_update_composite_provider action "add_input" and wire each new pairwise relationship with action "update_join" (once per pair). ' +
+        'Combining Join and Union view nodes in one CompositeProvider is NOT supported by this tool. ' +
         'action "from_template": proposes structure from an existing HCPR — pass template_name. ' +
-        'After creation, add inputs with bw_update_composite_provider (action "add_input"), then call bw_activate.',
+        'After creation, add field mappings with bw_update_composite_provider (action "add_input"), then call bw_activate.',
       inputSchema: {
         type: 'object',
         properties: {
@@ -2052,7 +2060,19 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
           view_type: {
             type: 'string',
             enum: ['Join', 'Union'],
-            description: 'Type of the view node (default "Join").',
+            description: 'Type of the view node (default "Join"). Use "Union" for any number of sources with no join keys; Join takes exactly 2 here (add more via add_input + update_join for a star/chain join).',
+          },
+          inputs: {
+            type: 'array',
+            description: 'Source InfoProvider(s) to attach at creation time (entity reference only). Union: 1 or more. Join: exactly 2, to get the auto-wired join stub — additional inputs for a 3+-way join are added afterwards via add_input.',
+            items: {
+              type: 'object',
+              properties: {
+                provider_name: { type: 'string', description: 'Technical name of the source InfoProvider (e.g. "ZBF_DM").' },
+                provider_type: { type: 'string', description: 'TLOGO-style suffix, e.g. "ADSO", "CUBE", "HCPR".' },
+              },
+              required: ['provider_name', 'provider_type'],
+            },
           },
           template_name: {
             type: 'string',
@@ -2067,12 +2087,35 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
     {
       name: 'bw_update_composite_provider',
       description:
-        '⚠️ UNVERIFIED write path (built from the read-side schema, no captured wire trace — see composite_provider.ts header comment). ' +
-        'Add/remove source InfoProviders, manage their field mappings, update the join condition, or edit root-level settings. ' +
-        'action "add_input": add a source InfoProvider — pass input {provider_name, provider_type, alias?, mappings}. Mapping targets not yet present as CompositeProvider elements are auto-created (pass info_object_name/dimension on the mapping to control that). ' +
-        'action "remove_input": removes the input by its alias (the <input> "name" attribute) — pass input_alias. Does not clean up join/union references to it; use "update_join" afterwards if needed. ' +
+        'Add/remove source InfoProviders, manage their field mappings, add/update/remove join conditions, or edit root-level settings. ' +
+        'add_input, update_mapping, and update_join/remove_join are all confirmed against real captured traces (one Union with 1 input, ' +
+        'one Join with 2 inputs) — see composite_provider.ts header comment for what remains an educated guess. Both view types support ' +
+        'more inputs than were captured: Union accepts any number of inputs (just union more of them together, no join keys needed); a ' +
+        'Join is modeled as N inputs plus one <join> element per PAIRWISE relationship (e.g. a fact + 2 dimensions needs 2 update_join ' +
+        'calls: fact-dim1 and fact-dim2) — call update_join once per pair to build a star/chain join. Combining Join and Union view nodes ' +
+        'within the same CompositeProvider (one feeding into another) is NOT supported by this tool — no captured evidence for that shape yet. ' +
+        'action "add_input": add a source InfoProvider — pass input {provider_name, provider_type, mappings?}. ' +
+        'Fetches the source\'s field metadata automatically; if mappings is omitted (or empty), every field on the source is ' +
+        'auto-mapped 1:1 (matching the real "generate mapping" behavior in BW Modeling Tools). On a JOIN node, a target name colliding ' +
+        'with a field already mapped from a different input (e.g. two sources both having "MEINS") is auto-suffixed ("MEINS_0") rather ' +
+        'than merged — confirmed real behavior, since a join sits inputs side by side as distinct columns. On a UNION node, a colliding ' +
+        'name instead MERGES into the existing shared target (inferred, not separately captured, but that\'s the point of a union — ' +
+        'stacking rows into the same columns) — e.g. auto-mapping two aDSOs that both have MATNR/WERKS/etc. lands them in one shared ' +
+        'column per field, which is what you want. To override either default (e.g. force a merge on a Join, or force separate columns ' +
+        'on a Union), pass mappings explicitly with your chosen target names. ' +
+        'source is the BARE source field name (e.g. "WAERS"), not the internally-prefixed one. Targets not yet present as ' +
+        'CompositeProvider elements are auto-created from the source field\'s own type/label. Returns the auto-generated ' +
+        'alias (e.g. "U1.ADSO.1" or "J1.ADSO.2") — use it for later remove_input/update_mapping/update_join calls. ' +
+        'action "remove_input": removes the input by its alias — pass input_alias. Does not clean up join/union references to it; use "remove_join" first if needed. ' +
         'action "update_mapping": replace the complete mapping list of one existing input — pass input_alias and mappings. ' +
-        'action "update_join": replace the join condition (type, cardinality, key field pairs) on a Join view node wholesale — pass left_alias, right_alias, key_pairs, join_type, cardinality. ' +
+        'action "update_join": set or replace the join condition (type, cardinality, key field pairs) between one specific pair of inputs — pass ' +
+        'left_alias, right_alias, key_pairs, join_type, cardinality. Replaces the existing join for that exact pair if one exists, otherwise adds a ' +
+        'new one alongside any other pairs\' joins (so an N-way join is built with one update_join call per pair). key_pairs left/right are each ' +
+        'side\'s own BARE source field name (e.g. "MATNR"), resolved against that input\'s source InfoProvider automatically — NOT the ' +
+        'CompositeProvider\'s target element name. A bw_create_composite_provider Join call with exactly 2 inputs already wires up a bare join ' +
+        'stub between them, so update_join is typically used to set/replace that pair\'s keys and cardinality; additional pairs beyond the first ' +
+        'two must be added explicitly with their own update_join call. ' +
+        'action "remove_join": removes the join between one specific pair of inputs (leaves other pairs and the inputs themselves intact) — pass left_alias, right_alias. ' +
         'action "update_settings": edit root attributes (label, stackable, default_node, aggregation_behaviour) — pass settings. ' +
         'Returns a lock_handle that must be passed to bw_activate to complete the operation.',
       inputSchema: {
@@ -2081,7 +2124,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
           composite_provider_name: { type: 'string', description: 'CompositeProvider name (e.g. "HCPR_NAME").' },
           action: {
             type: 'string',
-            enum: ['add_input', 'remove_input', 'update_mapping', 'update_join', 'update_settings'],
+            enum: ['add_input', 'remove_input', 'update_mapping', 'update_join', 'remove_join', 'update_settings'],
             description: 'Which change to apply.',
           },
           input: {
@@ -2089,61 +2132,56 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
             description: 'Input definition for action "add_input".',
             properties: {
               provider_name: { type: 'string', description: 'Technical name of the source InfoProvider.' },
-              provider_type: { type: 'string', description: 'TLOGO-style suffix appended to the alias, e.g. "ADSO", "CUBE", "HCPR".' },
-              alias: { type: 'string', description: 'Local reference name used by mappings/join. Defaults to provider_name.' },
+              provider_type: { type: 'string', description: 'TLOGO-style suffix used in the generated alias, e.g. "ADSO", "CUBE", "HCPR".' },
               mappings: {
                 type: 'array',
-                description: 'Field mappings for this input.',
+                description: 'Field mappings for this input. Omit (or pass []) to auto-map every source field 1:1.',
                 items: {
                   type: 'object',
                   properties: {
                     target: { type: 'string', description: 'CompositeProvider element name (existing, or newly created).' },
-                    source: { type: 'string', description: 'Source field name in the input provider (regular mapping). Defaults to target.' },
+                    source: { type: 'string', description: 'BARE source field name (e.g. "WAERS", not the internally-prefixed "4ZBF_DM-WAERS"). Defaults to target.' },
                     constant_value: { type: 'string', description: 'Constant value — mutually exclusive with source.' },
-                    info_object_name: { type: 'string', description: 'InfoObject backing a newly created target element. Defaults to target.' },
-                    dimension: { type: 'string', description: 'Dimension name for a newly created target element (default "GROUP1"; use a name containing "__KEYFIGURES" for measures).' },
                   },
                   required: ['target'],
                 },
               },
             },
-            required: ['provider_name', 'provider_type', 'mappings'],
+            required: ['provider_name', 'provider_type'],
           },
           input_alias: {
             type: 'string',
-            description: 'Input alias to operate on (action "remove_input" or "update_mapping").',
+            description: 'Input alias to operate on (action "remove_input" or "update_mapping") — the auto-generated alias returned by add_input, e.g. "U1.ADSO.1".',
           },
           mappings: {
             type: 'array',
-            description: 'Complete replacement mapping list for action "update_mapping" (same shape as input.mappings).',
+            description: 'Complete replacement mapping list for action "update_mapping" (same shape as input.mappings; source fields are resolved against the existing input\'s own source InfoProvider). Omit (or pass []) to auto-map every field on that input\'s source 1:1 — useful for populating an entity-only input attached at creation time.',
             items: {
               type: 'object',
               properties: {
                 target: { type: 'string' },
                 source: { type: 'string' },
                 constant_value: { type: 'string' },
-                info_object_name: { type: 'string' },
-                dimension: { type: 'string' },
               },
               required: ['target'],
             },
           },
-          left_alias: { type: 'string', description: 'Left input alias for action "update_join".' },
-          right_alias: { type: 'string', description: 'Right input alias for action "update_join".' },
+          left_alias: { type: 'string', description: 'Left input alias for action "update_join"/"remove_join" — the auto-generated alias returned by add_input, e.g. "J1.ADSO.1".' },
+          right_alias: { type: 'string', description: 'Right input alias for action "update_join"/"remove_join" — the auto-generated alias returned by add_input, e.g. "J1.ADSO.2".' },
           key_pairs: {
             type: 'array',
-            description: 'Join key field pairs for action "update_join".',
+            description: 'Join key field pairs for action "update_join". left/right are each side\'s own BARE source field name (not the CompositeProvider target name) — resolved automatically against that input\'s source InfoProvider.',
             items: {
               type: 'object',
               properties: {
-                left: { type: 'string', description: 'Field name on the left input.' },
-                right: { type: 'string', description: 'Field name on the right input.' },
+                left: { type: 'string', description: 'Bare field name on the left input\'s own source InfoProvider (e.g. "MATNR").' },
+                right: { type: 'string', description: 'Bare field name on the right input\'s own source InfoProvider (e.g. "MATNR").' },
               },
               required: ['left', 'right'],
             },
           },
-          join_type: { type: 'string', description: 'Join type for action "update_join" (default "INNER").' },
-          cardinality: { type: 'string', description: 'Join cardinality for action "update_join" (default "M_N").' },
+          join_type: { type: 'string', description: 'Join type for action "update_join" (default "inner", lowercase).' },
+          cardinality: { type: 'string', description: 'Join cardinality for action "update_join" (default "CN_N").' },
           settings: {
             type: 'object',
             description: 'Settings to apply for action "update_settings".',
@@ -4296,7 +4334,12 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         text = await bwGetCompositeProvider(client, args?.composite_provider_name as string);
         break;
 
-      case 'bw_create_composite_provider':
+      case 'bw_create_composite_provider': {
+        const rawInputs = (args?.inputs as Array<Record<string, unknown>> | undefined) ?? [];
+        const inputs = rawInputs.map((i) => ({
+          providerName: i['provider_name'] as string,
+          providerType: i['provider_type'] as string,
+        }));
         text = await bwCreateCompositeProvider(
           client,
           args?.composite_provider_name as string,
@@ -4306,9 +4349,11 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           (args?.view_type as 'Join' | 'Union') ?? 'Join',
           args?.template_name as string | undefined,
           (args?.package as string) ?? '$TMP',
-          (args?.stackable as boolean) ?? false
+          (args?.stackable as boolean) ?? false,
+          inputs
         );
         break;
+      }
 
       case 'bw_update_composite_provider': {
         const cpName = args?.composite_provider_name as string;
@@ -4317,8 +4362,6 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           target: m['target'] as string,
           source: m['source'] as string | undefined,
           constantValue: m['constant_value'] as string | undefined,
-          infoObjectName: m['info_object_name'] as string | undefined,
-          dimension: m['dimension'] as string | undefined,
         });
 
         if (args?.action === 'update_settings') {
@@ -4352,8 +4395,16 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
             args?.left_alias as string,
             args?.right_alias as string,
             keyPairs,
-            (args?.join_type as string) ?? 'INNER',
-            (args?.cardinality as string) ?? 'M_N',
+            (args?.join_type as string) ?? 'inner',
+            (args?.cardinality as string) ?? 'CN_N',
+            transport
+          );
+        } else if (args?.action === 'remove_join') {
+          text = await bwRemoveCompositeProviderJoin(
+            client,
+            cpName,
+            args?.left_alias as string,
+            args?.right_alias as string,
             transport
           );
         } else if (args?.action === 'remove_input') {
@@ -4371,7 +4422,6 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           const input: InputProviderDef = {
             providerName: i['provider_name'] as string,
             providerType: i['provider_type'] as string,
-            alias: i['alias'] as string | undefined,
             mappings: rawMappings.map(toMapping),
           };
           text = await bwUpdateCompositeProviderInput(client, cpName, 'add_input', input, undefined, transport);
