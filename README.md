@@ -56,8 +56,8 @@ A two-part blog series about this project (both available in German and English)
 Until now almost every call against a BW 7.5 system failed with HTTP 406, because the 7.5 REST framework looks the `Accept` header up case-sensitively. A small ABAP **post-exit** neutralises that — an enhancement, no modification. With it in place **every REST endpoint that exists on 7.5 is reachable**.
 
 - **📘 [docs/BW75-SUPPORT.md](docs/BW75-SUPPORT.md)** — root cause, the ABAP code, the SE24 setup steps, and an honest list of what BW 7.5 ships no REST resource for at all
-- **`bw_system_profile`** — tells you on connect what the system is, which endpoint groups it publishes, and whether the preconditions hold. Start here on an unknown system, or when calls fail with 404 or 406
-- **`bw_read_metadata_tables`** — reads straight from the metadata tables where there is no REST resource: transformations (including routine source), DTPs, and the classic providers `ODSO`, `CUBE` and `MPRO`
+- **`bw_system_profile`** — tells you on connect what the system is, which endpoint groups it publishes, and whether the three preconditions hold: `Accept`-header handling, ADT DataPreview access, and whether query reporting is implemented. That last one matters on 7.5: the query endpoint is published, so the endpoint list alone suggests reading data works — the handler answers every call with "Reporting resource not implemented". Query *definitions* read fine. Start here on an unknown system, or when calls fail with 404 or 406
+- **`bw_read_metadata_tables`** — reads straight from the metadata tables where there is no REST resource: transformations (including routine source), DTPs, and the classic providers `ODSO`, `CUBE` and `MPRO`. InfoCubes and DataStore objects also report their **load history** — request, status, update mode, start time, who ran it, how long it took, records transferred and added, and the source. On classic BW that is the only way to see load status at all, because the manage API behind `bw_list_requests` does not exist there
 
 **🔗 Process chains, edited in place**
 
@@ -72,6 +72,12 @@ Until now almost every call against a BW 7.5 system failed with HTTP 406, becaus
 **📐 Query characteristic properties**
 
 - **`bw_update_query_characteristic`** — display of result rows, display as key/text, access type for result values, sorting, cumulation, display level, and the hierarchy assignment with its display options. `"*"` applies one set of properties to every characteristic in the layout
+
+**🗂️ aDSO field groups**
+
+- **`bw_update_adso`** takes a `dimension` on `add_field` and `add_pure_field`, so a new field is created in the right group — a key figure lands in the key figure group instead of the catch-all. That is where the value is: the second activation, and with it the reactivation of every aggregation level, transformation and DTP behind the aDSO, does not happen at all
+- `update_field_properties` takes the same parameter to move an existing field between groups, and changes nothing else about it
+- Group names are defined per aDSO rather than by a fixed vocabulary, so an unknown name is refused with the declared groups listed instead of quietly falling back to the catch-all
 
 **🔧 Minor changes and fixes**
 
@@ -240,10 +246,17 @@ Until now almost every call against a BW 7.5 system failed with HTTP 406, becaus
 - Read Planning Sequences (PLSQ) — ordered step list with aggregation level, planning function, and filter references
 - Read Planning Properties (PLCR) — key-date mode, maximum characteristic combinations, and save strategy for plan-enabled InfoProviders
 
+### System Diagnostics & Classic Objects
+- Profile the connected system — BW/4HANA vs classic BW, the REST endpoint groups it publishes and therefore which tool groups work on it, plus three preconditions: `Accept`-header handling, ADT DataPreview access, and whether query reporting is implemented
+- Read objects the connected system publishes no REST resource for, straight from the metadata tables: transformations (including start, end, expert and field routine source code), DTPs, and the classic providers — DataStore objects, InfoCubes and MultiProviders
+- Read the load history of an InfoCube or DataStore object — request, status, update mode, start time, user, duration, records transferred and added, and the source — which on a classic BW system is the only route to load status at all
+- SAP BW 7.5 on HANA is reachable for modeling reads after a small ABAP post-exit — see [docs/BW75-SUPPORT.md](docs/BW75-SUPPORT.md)
+
 ### Request Monitor & Runtime
 - List load requests for a target InfoProvider — status, last process status/action, record count, timestamp, user, TSN
 - Full status analysis of a single load request — header, DTP information (start/finish/duration), process step chain, and message log in one call
 - Activate loaded data (DSO request activation) — move a finished load from the inbound table into the active data table + change log
+- Monitor, diagnose and run remodeling requests — the five processing steps (`CHECK`, `SAVE`, `CONVERT`, `ACTIVATE`, `CLEANUP`) with their individual status and the application log per step, plus execute, restart, reset and reset-step. Running a rule restructures the InfoProvider and converts its data
 - Uses the BW/4HANA `/sap/bc/.../bw4` manage API (the same operations as the BW/4HANA Cockpit)
 
 ### General
@@ -452,6 +465,9 @@ Set a field routine, start routine, or end routine on a Transformation. Supports
 ### `bw_set_transformation_expert_routine`
 Write the code of an existing Start/End/Expert routine into the Transformation master so it survives activation and transport. Unlike a raw `WriteSource` on the generated class, this re-saves the master and keeps the routine code transport-stable.
 
+### `bw_set_transformation_routine_fields`
+Edit the list of target fields the global END routine writes ("Felder setzen" in the SAP GUI). Requires an existing END routine. Pass exactly one of `fields` (the complete set the routine should write) or `exclude_fields` (all target fields except these); neither, both, an unknown field name, or an empty resolved set is rejected. Does not activate — returns a `lock_handle` for `bw_activate`.
+
 ### `bw_delete_transformation_routine`
 Remove an existing routine from a Transformation field.
 
@@ -554,6 +570,15 @@ Remove one step from a Process Chain together with its edges and its inline proc
 
 Steps are addressed by name in all three tools: a DTP or process-variant name, an aDSO held by an `ADSOACT`/`ADSOREM` step, the program of an `ABAP` step (or `PROGRAM/VARIANT`), a collector type, or `#<index>` using the step numbers from `bw_get_process_chain`. An ambiguous name is rejected with the candidates listed rather than resolved by guesswork.
 
+### `bw_list_process_chain_runs` _(Read only)_
+List execution runs of one or all process chains from the monitoring log — one row per run with overall status, runtime deviation, start/end timestamps and duration. Filter by chain name, start date range and status code. Each row carries the `log_id` to pass into `bw_get_process_chain_run_detail`. Ordered by start time descending, default 20 runs.
+
+### `bw_list_process_chain_last_status` _(Read only)_
+The latest execution status and scheduling state of every process chain in the system, one row per chain — last run status, runtime deviation, scheduling status, next scheduled start, and the `log_id` of the most recent run. Chains that have never run appear too. Optionally filtered by the status of the last run or by its start date range.
+
+### `bw_get_process_chain_run_detail` _(Read only)_
+The execution detail of one run — every process step with type, variant, status, timestamps and parent/child relationships, plus the full message log. `chain_id` and `log_id` come from the two listing tools above. This is the tool to diagnose a failed run: the message log carries the actual error.
+
 ### `bw_preview_datasource` _(Read only)_
 Fetch a live data preview from a DataSource. Resolves field names automatically and renders a formatted table. Parameters: `datasource_name`, `source_system`, `records` (default 20).
 
@@ -579,6 +604,18 @@ Create a CompositeProvider. Without `copy_from`, a view node of the given type w
 Change a CompositeProvider. Eight actions: `add_field` / `remove_field` for fields, `add_input` / `remove_input` for source providers, `update_mapping` for one input's complete mapping list (omit the mappings to map every source field one to one), `update_join` / `remove_join` per input pair, and `update_settings` for description, stackable, default node and aggregation behaviour. Every action returns a `lock_handle` that `bw_activate` needs — an HCPR cannot be activated without it.
 
 Two things to know: both sides of a join key must be mapped onto the **same** target field, otherwise activation fails with "join fields need at least one common target field" — auto-mapping deliberately does not do this, so map the second side's key fields explicitly. And `remove_input` leaves the removed input's elements and any join referencing it behind; those have to be cleaned up separately.
+
+### `bw_get_aggregation_level` _(Read only)_
+Read an Aggregation Level (ALVL) — the planning-enabled view on an aDSO or CompositeProvider used by Integrated Planning / embedded BPC. Returns the underlying InfoProvider and the element list split into characteristics (type, length, conversion routine, base InfoObject, compounding, dimension group) and key figures (aggregation behavior, semantics, and the unit/currency reference).
+
+### `bw_get_planning_properties` _(Read only)_
+Read the Planning Properties (PLCR) of a plan-enabled InfoProvider — key-date mode, the maximum number of characteristic combinations, and the save strategy (planning sequence plus delta-read flag). The PLCR shares its technical name with the provider it belongs to.
+
+### `bw_get_planning_sequence` _(Read only)_
+Read a Planning Sequence (PLSQ) — the ordered list of planning steps, each with its type code, aggregation level, planning function and filter name.
+
+### `bw_get_planning_function` _(Read only)_
+Read a Planning Function (PLSE) — a planning operation (formula/FOX, copy, delete, repost, distribution, currency translation, custom exit, …) tied to an aggregation level. Returns the function type, aggregation level, documentation, the characteristic usage list, and the full parameter tree; for FORMULA functions the FOX code is surfaced as source.
 
 ### `bw_create_aggregation_level`
 Create an aggregation level (ALVL) on a planning-enabled aDSO or CompositeProvider, either over all its fields or a chosen subset. Needs at least one characteristic and one key figure. Activate with `bw_activate`, object type `alvl` and an empty `lock_handle`.
@@ -616,11 +653,20 @@ Read the metadata of a single logical source system — type, description, and c
 ### `bw_get_datasource` _(Read only)_
 Read the complete structure of a DataSource (RSDS): metadata (status, delta type, direct access, application component, package, timestamps), all fields with type, length, transfer flag, key flag, position, selection options, conversion exit, and unit/currency reference, plus active adapter configuration (ODP, HANA, File, CSV). Output format: `text` (default human-readable summary) or `raw` (XML from BW).
 
+### `bw_list_remote_entities` _(Read only)_
+List the remote entities (HANA views / virtual tables) a source system exposes as a DataSource basis — the value help Eclipse shows on the DataSource proposal page. Each entity's `technical_name` is exactly what binds into `bw_create_datasource`.
+
+### `bw_create_datasource`
+Create a DataSource (RSDS) on a remote entity from the server's field proposal, leaving it inactive. The server derives the complete field and segment structure from the entity — no field, key or partitioning editing. Local objects only (`$TMP`), no transport handling. The HANA entity binds through the adapter's `externalObject` attribute rather than by name equality, so take `hana_entity` from `bw_list_remote_entities`. Activate separately with `bw_activate` (`object_type` "rsds").
+
 ### `bw_change_datasource_delta`
 Change the delta process of a DataSource (`deltaProperties`). Full read-modify-write; leaves the object inactive for a separate `bw_activate`.
 
 ### `bw_set_datasource_fields`
 Set the transfer flag of one or more DataSource fields (`fieldProperties@transfer`) and/or the segment `language_field`. At least one of `fields` / `language_field` must be given.
+
+### `bw_get_open_hub` _(Read only)_
+Read an Open Hub Destination (DEST) — destination type, source, DB table, InfoArea, package, status, and the complete output field list with type/length, InfoObject binding, conversion routine, compounding and key flag, plus the file properties when the destination type is FILE.
 
 ### `bw_get_dataflow` _(Read only)_
 Read the complete structural data flow of a BW object — all connected sources and targets resolved recursively through Transformations, DTPs, InfoSources, aDSOs, DataSources, CompositeProviders, and InfoObjects. Mirrors the Eclipse BWMT Transient Data Flow view. Supports direction (`upwards` / `downwards` / `both`) and configurable depth. Note: routine-based lookups (ABAP/SQLScript) are not reflected — only structural BW dependencies.

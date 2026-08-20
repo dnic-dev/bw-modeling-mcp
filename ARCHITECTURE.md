@@ -136,7 +136,8 @@ src/
     ├── infosource.ts     # bw_get_infosource, bw_create_infosource, bw_update_infosource
     ├── metadata_tables.ts # bw_read_metadata_tables — reads TRFN, DTPA and the classic providers
     │                     # (ODSO, CUBE, MPRO) from their metadata tables via ADT DataPreview,
-    │                     # for systems that publish no REST resource for them
+    │                     # for systems that publish no REST resource for them; a cube or DSO
+    │                     # also reports its load history (RSSTATMANPART + RSBKREQUEST)
     ├── openhub.ts        # bw_get_open_hub
     ├── planning.ts       # bw_get_aggregation_level, bw_create_aggregation_level,
     │                     # bw_update_aggregation_level, bw_get_planning_properties,
