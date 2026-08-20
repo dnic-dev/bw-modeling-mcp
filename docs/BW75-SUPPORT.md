@@ -230,22 +230,29 @@ resource version rejects a higher one with HTTP 415).
 
 ---
 
-## What is still unavailable
+## No REST resource — but reachable another way
 
-These objects have **no REST resource on 7.5** — the limitation is the missing endpoint, not the
-header:
+For these the endpoint is missing, yet the object can still be read, because
+`bw_read_metadata_tables` goes to the metadata tables through the ADT DataPreview service. Read-only,
+and it needs ADT authorization for the calling user.
+
+| Area | Missing endpoint | How to read it instead |
+|---|---|---|
+| Transformations | `trfn` | `bw_read_metadata_tables` `TRFN` — field mappings with their rule types, and the source code of the start, end, expert and field routines |
+| DTPs | `dtpa` | `bw_read_metadata_tables` `DTPA` — path, resolved transformation, extraction mode and error handling. Filter selections and the semantic group are not readable: they live in a serialised ABAP object, not in relational columns |
+| Classic DSO, InfoCube, MultiProvider | `odso` and friends | `bw_read_metadata_tables` `ODSO` / `CUBE` / `MPRO` — key and data fields, dimensions, part providers |
+| Load status of a cube or DSO | `/sap/bw4/*` | `bw_read_metadata_tables` on the provider — the Load History section reads `RSSTATMANPART`, enriched from `RSBKREQUEST`: request, status, update mode, start, user, duration, records and source |
+| Data flow graph | `dmod` | `bw_xref` on the object — the same edges, one object at a time instead of a graph |
+
+## What is still unavailable
 
 | Area | Endpoint | Note |
 |---|---|---|
-| Transformations | `trfn` | not published by discovery |
-| DTPs | `dtpa` | not published by discovery |
 | Process chains | `rspc` | search by this object type dumps server-side |
 | Planning functions and sequences | `plcr`, `plsq`, `plse` | only `alvl` is available |
 | Transport operations | `cto/*` | not published by discovery |
-| Data flow graph | `dmod` | the DataFlow workspace in discovery is empty |
 | Query **data** | `comp/reporting` | the collection is published, but the handler answers "Reporting resource not implemented" — query *definitions* read fine |
-| Requests, monitoring, process variants, push | `/sap/bw4/*` | the BW/4HANA manage API does not exist on 7.5; `bw_read_metadata_tables` reports the load history of a cube or DSO from `RSSTATMANPART` instead |
-| Classic DSO, InfoCube, MultiProvider | `odso` and friends | see below |
+| Request monitor, process variants, push | `/sap/bw4/*` | the BW/4HANA manage API does not exist on 7.5; only the load history above is available |
 
 This is systematic rather than accidental: the BW Modeling Tools for 7.5 never supported editing
 transformations, DTPs or process chains — those capabilities arrived with BW/4HANA. Opening such an
