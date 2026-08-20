@@ -2,7 +2,7 @@
 
 Out of the box, almost every tool fails against a BW 7.5 system with **HTTP 406**. The cause is a
 single case-sensitive line in the 7.5 REST framework, and it can be neutralised with one small ABAP
-enhancement — no modification of SAP standard, no access key, no upgrade conflict.
+enhancement — no modification of SAP standard.
 
 With that enhancement in place, **every REST endpoint that exists on 7.5 becomes reachable**. What
 remains out of reach are the objects for which SAP never shipped a REST resource on 7.5 at all

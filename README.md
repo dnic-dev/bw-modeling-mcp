@@ -53,7 +53,7 @@ A two-part blog series about this project (both available in German and English)
 
 **🎯 SAP BW 7.5 on HANA**
 
-Until now almost every call against a BW 7.5 system failed with HTTP 406, because the 7.5 REST framework looks the `Accept` header up case-sensitively. A small ABAP **post-exit** neutralises that — an enhancement, no modification, no access key. With it in place **every REST endpoint that exists on 7.5 is reachable**.
+Until now almost every call against a BW 7.5 system failed with HTTP 406, because the 7.5 REST framework looks the `Accept` header up case-sensitively. A small ABAP **post-exit** neutralises that — an enhancement, no modification. With it in place **every REST endpoint that exists on 7.5 is reachable**.
 
 - **📘 [docs/BW75-SUPPORT.md](docs/BW75-SUPPORT.md)** — root cause, the ABAP code, the SE24 setup steps, and an honest list of what BW 7.5 ships no REST resource for at all
 - **`bw_system_profile`** — tells you on connect what the system is, which endpoint groups it publishes, and whether the preconditions hold. Start here on an unknown system, or when calls fail with 404 or 406
@@ -271,7 +271,7 @@ The BW MCP server handles the BW modeling structure — creating the Transformat
 | SAP BW Bridge (SAP BTP ABAP stack) | ✅ Via cookie authentication (`BW_COOKIE_FILE`) |
 | SAP BW on HANA (7.5) | ⚠️ Modeling reads after a small ABAP enhancement — see [BW 7.5 Support](docs/BW75-SUPPORT.md) |
 
-<p><em><sub>On SAP BW 7.5 the REST framework looks up the <code>Accept</code> header case-sensitively while the kernel delivers header names in lower case, so almost every call fails with HTTP 406. A ~20-line post-exit enhancement (no modification, no access key) resolves this and makes all REST endpoints that exist on 7.5 reachable. Objects for which BW 7.5 ships no REST resource at all — transformations, DTPs, process chains, classic DSOs, InfoCubes — remain unavailable; Eclipse opens the embedded SAP GUI for those as well. Details, ABAP code and setup steps: <a href="docs/BW75-SUPPORT.md">docs/BW75-SUPPORT.md</a>.</sub></em></p>
+<p><em><sub>On SAP BW 7.5 the REST framework looks up the <code>Accept</code> header case-sensitively while the kernel delivers header names in lower case, so almost every call fails with HTTP 406. A ~20-line post-exit enhancement (no modification) resolves this and makes all REST endpoints that exist on 7.5 reachable. Objects for which BW 7.5 ships no REST resource at all — transformations, DTPs, process chains, classic DSOs, InfoCubes — remain unavailable; Eclipse opens the embedded SAP GUI for those as well. Details, ABAP code and setup steps: <a href="docs/BW75-SUPPORT.md">docs/BW75-SUPPORT.md</a>.</sub></em></p>
 
 ---
 
