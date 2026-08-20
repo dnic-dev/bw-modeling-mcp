@@ -1,4 +1,11 @@
-import { BwClient, MEDIA_TYPES, createClientFromEnv, freshRead } from '../bw-client.js';
+import {
+  BwClient,
+  MEDIA_TYPES,
+  createClientFromEnv,
+  freshRead,
+  bwSeg,
+  bwEscapeName,
+} from '../bw-client.js';
 
 /** Resolved per call, not once at import — see the note on adsoAccept() in adso.ts. */
 const hcprAccept = (): string => MEDIA_TYPES['hcpr'];
@@ -172,7 +179,7 @@ export async function bwUpdateCompositeProvider(
     });
   }
 
-  const cpPath = `/sap/bw/modeling/hcpr/${compositeProviderName.toLowerCase()}/m`;
+  const cpPath = `/sap/bw/modeling/hcpr/${bwSeg(compositeProviderName)}/m`;
   const cpResult = await freshRead(cpPath, hcprAccept());
   const timestamp = cpResult.headers['timestamp'] ?? cpResult.headers['TIMESTAMP'];
   let xml = cpResult.body;
@@ -218,7 +225,7 @@ export async function bwUpdateCompositeProvider(
       const cached = providerViews.get(name);
       if (cached !== undefined) return cached;
       const result = await providerReader.get(
-        `/sap/bw/modeling/infoprov/${name}/a?view=dt`,
+        `/sap/bw/modeling/infoprov/${encodeURIComponent(bwEscapeName(name))}/a?view=dt`,
         IPROV_ACCEPT
       );
       providerViews.set(name, result.body);

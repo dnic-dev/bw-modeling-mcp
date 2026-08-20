@@ -1,4 +1,4 @@
-import { BwClient, MEDIA_TYPES, freshRead } from '../bw-client.js';
+import { BwClient, MEDIA_TYPES, freshRead, bwSeg, stripInfoAreaSentinel } from '../bw-client.js';
 
 const TRCS_MEDIA = 'application/vnd.sap.bw.modeling.trcs-v1_0_0+xml';
 
@@ -11,7 +11,7 @@ const TRCS_MEDIA = 'application/vnd.sap.bw.modeling.trcs-v1_0_0+xml';
  */
 export async function bwGetInfosource(client: BwClient, name: string): Promise<string> {
   const nameLower = name.toLowerCase();
-  const result = await freshRead(`/sap/bw/modeling/trcs/${nameLower}/m`, TRCS_MEDIA);
+  const result = await freshRead(`/sap/bw/modeling/trcs/${bwSeg(nameLower)}/m`, TRCS_MEDIA);
   const xml = result.body;
 
   // Root attributes
@@ -29,7 +29,7 @@ export async function bwGetInfosource(client: BwClient, name: string): Promise<s
   const objectStatus = (tlogoPart.match(/adtcore:version="([^"]*)"/) ?? [])[1] ?? '';
 
   // <infoArea>
-  const infoArea = (xml.match(/<infoArea>([^<]*)<\/infoArea>/) ?? [])[1] ?? '';
+  const infoArea = stripInfoAreaSentinel((xml.match(/<infoArea>([^<]*)<\/infoArea>/) ?? [])[1] ?? '');
 
   // Collect keyElement names: #///NAME → NAME
   const keyElements = new Set<string>();
@@ -155,7 +155,7 @@ export async function bwCreateInfosource(
   const lockHandle = await client.lock('trcs', name, { 'activity_context': 'CREA' });
 
   // Build URL — add copyFrom params before lockHandle when provided
-  let url = `/sap/bw/modeling/trcs/${name.toLowerCase()}`;
+  let url = `/sap/bw/modeling/trcs/${bwSeg(name)}`;
   const qs: string[] = [];
   if (copyFromObjectType && copyFromObjectName) {
     let encodedName = copyFromObjectName;
@@ -232,7 +232,7 @@ export async function bwUpdateInfosource(
   removeFields?: string[]
 ): Promise<string> {
   const nameUpper = name.toUpperCase();
-  const trcsPath = `/sap/bw/modeling/trcs/${name.toLowerCase()}/m`;
+  const trcsPath = `/sap/bw/modeling/trcs/${bwSeg(name)}/m`;
 
   // 1. Lock (no activity_context = update mode)
   const lockHandle = await client.lock('trcs', name);

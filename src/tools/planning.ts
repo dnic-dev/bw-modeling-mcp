@@ -1,4 +1,12 @@
-import { BwClient, MEDIA_TYPES, freshRead, decodeXmlEntities } from '../bw-client.js';
+import {
+  BwClient,
+  MEDIA_TYPES,
+  freshRead,
+  decodeXmlEntities,
+  bwSeg,
+  bwSegUpper,
+  stripInfoAreaSentinel,
+} from '../bw-client.js';
 
 function attr(tag: string, attrName: string): string {
   const m = tag.match(new RegExp(`\\b${attrName}="([^"]*)"`));
@@ -88,7 +96,7 @@ function parseAggLevelXml(xml: string, status: string): AggLevelInfo {
   const infoProvider = attr(compositeInputMatch[0], 'name');
 
   const tlogoPkg = xml.match(/<adtcore:packageRef\b[^>]*\bname="([^"]*)"/)?.[1] ?? '';
-  const infoArea = xml.match(/<infoArea[^>]*>([^<]+)<\/infoArea>/)?.[1]?.trim() ?? '';
+  const infoArea = stripInfoAreaSentinel(xml.match(/<infoArea[^>]*>([^<]+)<\/infoArea>/)?.[1]?.trim() ?? '');
 
   // Build dimension name → label map
   const dimensionMap = new Map<string, string>();
@@ -203,7 +211,7 @@ function parseAggLevelXml(xml: string, status: string): AggLevelInfo {
 }
 
 export async function bwGetAggregationLevel(client: BwClient, alvlName: string): Promise<string> {
-  const path = `/sap/bw/modeling/alvl/${alvlName.toLowerCase()}/m`;
+  const path = `/sap/bw/modeling/alvl/${bwSeg(alvlName)}/m`;
   const result = await client.get(path, MEDIA_TYPES['alvl']);
   const status = result.headers['object_status'] ?? result.headers['OBJECT_STATUS'] ?? 'unknown';
 
@@ -213,7 +221,7 @@ export async function bwGetAggregationLevel(client: BwClient, alvlName: string):
     `Aggregation Level: ${info.name}`,
     `Status:            ${info.status}`,
     `Description:       ${info.description}`,
-    `InfoArea:          ${info.infoArea}`,
+    `InfoArea:          ${info.infoArea || '(none)'}`,
     `Package:           ${info.package}`,
     `InfoProvider:      ${info.infoProvider}`,
     '',
@@ -345,7 +353,7 @@ interface ProviderElement {
  * the InfoObject when the aggregation level is activated.
  */
 async function fetchAlvlProviderElements(infoProvider: string): Promise<ProviderElement[]> {
-  const xml = (await freshRead(`/sap/bw/modeling/infoprov/${infoProvider.toUpperCase()}/A`, IPROV_ACCEPT)).body;
+  const xml = (await freshRead(`/sap/bw/modeling/infoprov/${bwSegUpper(infoProvider)}/A`, IPROV_ACCEPT)).body;
   const fieldNamePrefix = xml.match(/\bfieldNamePrefix="([^"]*)"/)?.[1] ?? '';
   const elements: ProviderElement[] = [];
   const elemRegex = /<element\b([\s\S]*?)(?:\/>|>([\s\S]*?)<\/element>)/g;
@@ -532,7 +540,7 @@ export async function bwCreateAggregationLevel(
   await client.unlock('alvl', alvlName);
 
   // Phase two: add the field list to the inactive version the create just persisted.
-  const alvlPath = `/sap/bw/modeling/alvl/${alvlName.toLowerCase()}/m`;
+  const alvlPath = `/sap/bw/modeling/alvl/${bwSeg(alvlName)}/m`;
   const shell = await freshRead(alvlPath, MEDIA_TYPES['alvl']);
   const timestamp = shell.headers['timestamp'] ?? shell.headers['TIMESTAMP'];
   const elementsXml = selected.map(buildAlvlElementXml).join('\n');
@@ -621,7 +629,7 @@ export async function bwUpdateAggregationLevelFields(
     throw new Error(`${action} requires at least one field.`);
   }
 
-  const alvlPath = `/sap/bw/modeling/alvl/${alvlName.toLowerCase()}/m`;
+  const alvlPath = `/sap/bw/modeling/alvl/${bwSeg(alvlName)}/m`;
   const current = await freshRead(alvlPath, MEDIA_TYPES['alvl']);
   const timestamp = current.headers['timestamp'] ?? current.headers['TIMESTAMP'];
   let xml = current.body;
@@ -755,7 +763,7 @@ function parsePlcrXml(xml: string, status: string): PlanningPropertiesInfo {
   const tlMatch = xml.match(/<tlogoProperties([^>]*)>/);
   const name = tlMatch ? (attr(tlMatch[1], 'adtcore:name') || providerName) : providerName;
   const tlogoPkg = xml.match(/<adtcore:packageRef\b[^>]*\bname="([^"]*)"/)?.[1] ?? '';
-  const infoArea = xml.match(/<infoArea[^>]*>([^<]+)<\/infoArea>/)?.[1]?.trim() ?? '';
+  const infoArea = stripInfoAreaSentinel(xml.match(/<infoArea[^>]*>([^<]+)<\/infoArea>/)?.[1]?.trim() ?? '');
 
   // atom:link rel="up" — underlying provider's resource URL and media type
   const upLinkMatch = xml.match(/<atom:link\b[^>]*\brel="up"[^>]*>/);
@@ -791,7 +799,7 @@ function parsePlcrXml(xml: string, status: string): PlanningPropertiesInfo {
 }
 
 export async function bwGetPlanningProperties(client: BwClient, providerName: string): Promise<string> {
-  const path = `/sap/bw/modeling/plcr/${providerName.toLowerCase()}/a`;
+  const path = `/sap/bw/modeling/plcr/${bwSeg(providerName)}/a`;
   const result = await client.get(path, MEDIA_TYPES['plcr']);
   const status = result.headers['object_status'] ?? result.headers['OBJECT_STATUS'] ?? 'unknown';
 
@@ -800,7 +808,7 @@ export async function bwGetPlanningProperties(client: BwClient, providerName: st
   const lines: string[] = [
     `Planning Properties: ${info.name}`,
     `Status:              ${info.status}`,
-    `InfoArea:            ${info.infoArea}`,
+    `InfoArea:            ${info.infoArea || '(none)'}`,
     `Package:             ${info.package}`,
     '',
     `── Provider ──`,
@@ -855,7 +863,7 @@ function parsePlsqXml(xml: string, status: string): PlsqInfo {
 
   const description = xml.match(/<description\b[^>]*\blabel="([^"]*)"/)?.[1] ?? '';
   const tlogoPkg = xml.match(/<adtcore:packageRef\b[^>]*\bname="([^"]*)"/)?.[1] ?? '';
-  const infoArea = xml.match(/<infoArea[^>]*>([^<]+)<\/infoArea>/)?.[1]?.trim() ?? '';
+  const infoArea = stripInfoAreaSentinel(xml.match(/<infoArea[^>]*>([^<]+)<\/infoArea>/)?.[1]?.trim() ?? '');
 
   // Steps are self-closing <step .../> elements; preserve document order
   const steps: PlsqStep[] = [];
@@ -880,7 +888,7 @@ function parsePlsqXml(xml: string, status: string): PlsqInfo {
 }
 
 export async function bwGetPlanningSequence(client: BwClient, seqName: string): Promise<string> {
-  const path = `/sap/bw/modeling/plsq/${seqName.toLowerCase()}/a`;
+  const path = `/sap/bw/modeling/plsq/${bwSeg(seqName)}/a`;
   const result = await client.get(path, MEDIA_TYPES['plsq']);
   const status = result.headers['object_status'] ?? result.headers['OBJECT_STATUS'] ?? 'unknown';
 
@@ -890,7 +898,7 @@ export async function bwGetPlanningSequence(client: BwClient, seqName: string): 
     `Planning Sequence: ${info.name}`,
     `Status:            ${info.status}`,
     `Description:       ${info.description}`,
-    `InfoArea:          ${info.infoArea}`,
+    `InfoArea:          ${info.infoArea || '(none)'}`,
     `Package:           ${info.package}`,
     '',
     `── Steps (${info.steps.length}) ──`,
@@ -1110,7 +1118,7 @@ function parsePlseXml(xml: string, status: string): PlseInfo {
 
   const description = xml.match(/<description\b[^>]*\blabel="([^"]*)"/)?.[1] ?? '';
   const tlogoPkg = xml.match(/<adtcore:packageRef\b[^>]*\bname="([^"]*)"/)?.[1] ?? '';
-  const infoArea = xml.match(/<infoArea[^>]*>([^<]+)<\/infoArea>/)?.[1]?.trim() ?? '';
+  const infoArea = stripInfoAreaSentinel(xml.match(/<infoArea[^>]*>([^<]+)<\/infoArea>/)?.[1]?.trim() ?? '');
 
   const charUsages: PlseCharUsage[] = [];
   const cuRe = /<charUsage\b([^>]*)(?:\/>|>[\s\S]*?<\/charUsage>)/g;
@@ -1168,7 +1176,7 @@ function parsePlseXml(xml: string, status: string): PlseInfo {
 }
 
 export async function bwGetPlanningFunction(client: BwClient, funcName: string): Promise<string> {
-  const path = `/sap/bw/modeling/plse/${funcName.toLowerCase()}/a`;
+  const path = `/sap/bw/modeling/plse/${bwSeg(funcName)}/a`;
   const result = await client.get(path, MEDIA_TYPES['plse']);
   const headerStatus = result.headers['object_status'] ?? result.headers['OBJECT_STATUS'] ?? '';
 
@@ -1180,7 +1188,7 @@ export async function bwGetPlanningFunction(client: BwClient, funcName: string):
     `Description:       ${info.description}`,
     `Function Type:     ${info.planningServiceType}`,
     `Aggregation Level: ${info.alvl}`,
-    `InfoArea:          ${info.infoArea}`,
+    `InfoArea:          ${info.infoArea || '(none)'}`,
     `Package:           ${info.package}`,
   ];
 

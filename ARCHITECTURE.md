@@ -134,6 +134,9 @@ src/
     ├── infoarea.ts       # bw_get_infoarea, bw_create_infoarea, bw_move_object
     ├── infoobject.ts     # bw_get_infoobject, bw_create_infoobject, bw_update_infoobject
     ├── infosource.ts     # bw_get_infosource, bw_create_infosource, bw_update_infosource
+    ├── metadata_tables.ts # bw_read_metadata_tables — reads TRFN, DTPA and the classic providers
+    │                     # (ODSO, CUBE, MPRO) from their metadata tables via ADT DataPreview,
+    │                     # for systems that publish no REST resource for them
     ├── openhub.ts        # bw_get_open_hub
     ├── planning.ts       # bw_get_aggregation_level, bw_create_aggregation_level,
     │                     # bw_update_aggregation_level, bw_get_planning_properties,
@@ -144,7 +147,9 @@ src/
     ├── processchain_write.ts # bw_create_process_chain, bw_update_process_chain,
     │                         # bw_activate_process_chain, bw_append_process_chain_dtp,
     │                         # bw_swap_process_chain_dtp, bw_add_process_chain_error_links,
-    │                         # bw_add_process_chain_program, bw_create_decision_variant — BW4 Cockpit REST API
+    │                         # bw_add_process_chain_program, bw_create_decision_variant,
+    │                         # bw_add_process_chain_edge, bw_remove_process_chain_edge,
+    │                         # bw_remove_process_chain_step — BW4 Cockpit REST API
     │                         # (create/update support ADSOACT and ADSOREM inline variants)
     ├── processvariant.ts # bw_get_process_variant — generic variant detail reader for all 93 process types
     ├── push.ts           # bw_push_data, bw_get_push_schema
@@ -152,12 +157,18 @@ src/
     │                     # bw_create_query — create empty or as a full copy (copy_from)
     ├── query_update.ts   # bw_update_query_layout, bw_update_query_filter,
     │                     # bw_update_query_key_figures, bw_update_query_settings
+    ├── query_characteristic.ts # bw_update_query_characteristic — per-characteristic display and
+    │                     # access properties of the rows/columns/free areas
     ├── reporting.ts      # bw_query_data, bw_get_filter_values — BICS reporting endpoint (/sap/bw/modeling/comp/reporting)
+    ├── remodeling.ts     # bw_list_remodeling_requests, bw_get_remodeling_request,
+    │                     # bw_run_remodeling — remodeling monitor via the bw4 manage API
     ├── repository.ts     # bw_list_contents
     ├── request_monitor.ts # bw_list_requests, bw_get_request, bw_activate_request — RSPM request monitor / data activation via the bw4 manage API
     ├── rkf_create.ts     # bw_create_rkf — create a reusable Restricted Key Figure (ELEM) via comp/enq + /rkf/<name>/a
     ├── roles.ts          # bw_get_roles, bw_get_role_queries, bw_get_query_roles, bw_set_query_roles
     ├── search.ts         # bw_search, bw_xref
+    ├── system_profile.ts # bw_system_profile — platform, published endpoint groups and the two
+    │                     # preconditions (Accept-header handling, ADT DataPreview access)
     ├── transport.ts      # bw_create_transport_task — add a task to a workbench transport
     └── transformation.ts # bw_get_transformation, bw_create_transformation,
                           # bw_update_transformation, bw_set_transformation_routine,

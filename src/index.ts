@@ -18,7 +18,9 @@ import { bwGetAdso, bwCreateAdso, FieldDef, bwUpdateAdso, bwUpdateAdsoAddPureFie
 import { bwGetInfoObject, bwCreateInfoObject, bwUpdateInfoObject, AttributeDef } from './tools/infoobject.js';
 import { bwGetTransformation, bwUpdateTransformation, bwCreateTransformation, bwSetTransformationRuntime, bwSetTransformationRoutine, bwDeleteTransformationRoutine, bwSetTransformationRoutineFields, bwSetTransformationExpertRoutine } from './tools/transformation.js';
 import { bwActivate } from './tools/activation.js';
-import { bwGetDtps, bwGetDtp, bwCreateDtp, bwRunDtp, bwUpdateDtp, bwSetDtpFilterRoutine, bwUnlockDtp } from './tools/dtp.js';
+import { bwSystemProfile } from './tools/system_profile.js';
+import { bwReadMetadataTables } from './tools/metadata_tables.js';
+import { bwGetDtps, bwGetDtp, bwCreateDtp, bwRunDtp, bwUpdateDtp, bwSetDtpFilterRoutine, bwUnlockDtp, DtpFilterSelectionInput } from './tools/dtp.js';
 import { bwSearch, bwXref } from './tools/search.js';
 import { bwDelete } from './tools/delete.js';
 import { bwCreateInfoArea, bwMoveObject, bwGetInfoarea } from './tools/infoarea.js';
@@ -28,6 +30,7 @@ import { bwPushData, bwGetPushSchema } from './tools/push.js';
 import { bwGetQuery, bwCreateQuery } from './tools/query.js';
 import { bwCreateVariable, CreateVariableArgs } from './tools/variable.js';
 import { bwUpdateQueryLayout, bwUpdateQueryFilter, bwUpdateQueryKeyFigures, bwUpdateQuerySettings, LayoutOperation, FilterOperation, KeyFigureOperation, UpdateQuerySettingsArgs } from './tools/query_update.js';
+import { bwUpdateQueryCharacteristic, UpdateQueryCharacteristicArgs } from './tools/query_characteristic.js';
 import {
   bwGetCompositeProvider,
   bwCreateCompositeProvider,
@@ -48,6 +51,12 @@ import { bwGetRoles, bwGetQueryRoles, bwSetQueryRoles, bwGetRoleQueries } from '
 import { bwGetProcessChain } from './tools/processchain.js';
 import { bwGetProcessVariant } from './tools/processvariant.js';
 import { bwListRequests, bwGetRequest, bwActivateRequest } from './tools/request_monitor.js';
+import {
+  bwListRemodelingRequests,
+  bwGetRemodelingRequest,
+  bwRunRemodeling,
+  type RemodelingAction,
+} from './tools/remodeling.js';
 import { bwGetOpenHub } from './tools/openhub.js';
 import {
   bwGetAggregationLevel,
@@ -59,7 +68,7 @@ import {
   bwGetPlanningFunction,
 } from './tools/planning.js';
 import { bwListProcessChainRuns, bwGetProcessChainRunDetail, bwListProcessChainLastStatus } from './tools/process_chain_monitor.js';
-import { bwCreateProcessChain, bwUpdateProcessChain, bwActivateProcessChain, bwAddProcessChainErrorLinks, bwSwapProcessChainDtp, bwAppendProcessChainDtp, bwAddProcessChainProgram, bwCreateDecisionVariant, CreateProcessChainParams, UpdateProcessChainParams, EdgeDef, TriggerEventConfig } from './tools/processchain_write.js';
+import { bwCreateProcessChain, bwUpdateProcessChain, bwActivateProcessChain, bwAddProcessChainErrorLinks, bwSwapProcessChainDtp, bwAppendProcessChainDtp, bwAddProcessChainProgram, bwAddProcessChainEdge, bwRemoveProcessChainEdge, bwRemoveProcessChainStep, bwCreateDecisionVariant, CreateProcessChainParams, UpdateProcessChainParams, EdgeDef, EdgeStatus, TriggerEventConfig } from './tools/processchain_write.js';
 import { bwCreateTransportTask } from './tools/transport.js';
 
 // Map the snake_case trigger_event tool argument to the TriggerEventConfig shape.
@@ -74,6 +83,96 @@ function mapTriggerEvent(raw: unknown): TriggerEventConfig | undefined {
     onlyOnce: e['only_once'] as boolean | undefined,
   };
 }
+
+// Map one process-chain step from the tool's snake_case schema onto the builder's step
+// model. Shared by bw_create_process_chain and bw_update_process_chain so both accept the
+// same step types. An ABAP step's SE38 selection variant arrives as program_variant,
+// because the step-level "variant" field already names the DECISION variant.
+function mapChainStep(s: Record<string, unknown>): Record<string, unknown> {
+  const base: Record<string, unknown> = { id: s['id'], type: s['type'] };
+  const copy = (from: string, to = from) => {
+    if (s[from] !== undefined) base[to] = s[from];
+  };
+  copy('dtp');
+  copy('variant');
+  copy('description');
+  copy('datastores');
+  copy('requestsSequential');
+  copy('errorOnNonActivation');
+  copy('remDatastores');
+  copy('object');
+  copy('program');
+  copy('program_variant', 'variant');
+  copy('program_package', 'programPackage');
+  copy('program_description', 'programDescription');
+  copy('variant_description', 'variantDescription');
+  copy('synchronous');
+  copy('local');
+  return base;
+}
+
+// Filter properties shared by bw_create_dtp and bw_update_dtp. The selection of a field is
+// always written as a whole: repeated calls replace it, they do not add to it.
+const DTP_FILTER_SCHEMA_PROPS = {
+  filter_field: {
+    type: 'string',
+    description:
+      'Filter field to set. Use the exact field name from bw_get_dtp; a name that does not ' +
+      'exist is rejected. Requires filter_value or filter_selections.',
+  },
+  filter_value: {
+    type: 'string',
+    description:
+      'One or more values for an Equal selection, comma-separated (e.g. "VAL1,VAL2,VAL3"). ' +
+      'REPLACE semantics: the list is the complete selection of that field, so pass all values ' +
+      'in one call. An empty string selects the BW initial value (not the literal "#"). ' +
+      'For ranges, patterns, exclusions or values containing a comma, use filter_selections. ' +
+      'Look values up with bw_get_filter_values first — a wrong value activates cleanly and ' +
+      'filters everything away.',
+  },
+  filter_excluding: {
+    type: 'boolean',
+    description:
+      'If true, all values of filter_value are excluded instead of included. Default false. ' +
+      'Applies to filter_value only; filter_selections carries a sign per entry.',
+  },
+  filter_selections: {
+    type: 'array',
+    description:
+      'Full selection vocabulary for one filter field, equivalent to an ABAP RANGE table. ' +
+      'REPLACE semantics like filter_value, and mutually exclusive with it. Each entry is ' +
+      'validated against the operators the field itself publishes, so an unsupported operator ' +
+      'is an error instead of a silently ignored setting.',
+    items: {
+      type: 'object',
+      properties: {
+        operator: {
+          type: 'string',
+          enum: ['Equal', 'NotEqual', 'Between', 'ContainsPattern', 'GreaterThan', 'GreaterEqual', 'LessThan', 'LessEqual'],
+          description:
+            'Selection operator (default "Equal"). RANGE equivalents: EQ = Equal, NE = NotEqual, ' +
+            'BT = Between, CP = ContainsPattern (use "*" as the wildcard), GT/GE/LT/LE = the ' +
+            'comparison operators. The comparison operators are include-only on the fields seen ' +
+            'so far; the field metadata decides.',
+        },
+        sign: {
+          type: 'string',
+          enum: ['I', 'E'],
+          description: 'I = include (default), E = exclude. Includes and excludes may be mixed on one field.',
+        },
+        low: {
+          type: 'string',
+          description: 'Value, lower bound (Between) or pattern (ContainsPattern). Empty string = BW initial value.',
+        },
+        high: {
+          type: 'string',
+          description: 'Upper bound. Only for operator "Between", where it is mandatory.',
+        },
+      },
+      required: ['low'],
+    },
+  },
+} as const;
 
 // ── Tool definitions ─────────────────────────────────────────────────────────
 
@@ -1347,6 +1446,117 @@ const TOOL_DEFINITIONS = [
       },
     },
     {
+      name: 'bw_list_remodeling_requests',
+      description:
+        'List remodeling requests from the remodeling monitor, with decoded status, last run ' +
+        'and creator. Remodeling changes the structure of an existing InfoProvider (e.g. adding, ' +
+        'deleting or reassigning a field of an aDSO) and converts the data it already holds. ' +
+        'Read-only. ' +
+        'A remodeling rule is created in the BW Modeling Tools (Eclipse); this tool family ' +
+        'monitors and runs the resulting requests, it does not create rules.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          info_provider: {
+            type: 'string',
+            description:
+              'Optional InfoProvider technical name (e.g. "OBJECT_NAME") to filter on. ' +
+              'Case-insensitive. Omit to list requests of all InfoProviders.',
+          },
+          status: {
+            type: 'string',
+            description:
+              'Comma-separated status codes to include (default all): N not scheduled, ' +
+              'S scheduled, R running, C completed, E error.',
+          },
+          top: {
+            type: 'number',
+            description: 'Upper cap on the number of requests to return (default 20).',
+          },
+        },
+      },
+    },
+    {
+      name: 'bw_get_remodeling_request',
+      description:
+        'Full status of one remodeling request: header, the five processing steps ' +
+        '(CHECK, SAVE, CONVERT, ACTIVATE, CLEANUP) with their individual status, and the ' +
+        'application log messages. Read-only. ' +
+        'This is the tool to diagnose a failed remodeling — the log carries the reason.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          info_provider: {
+            type: 'string',
+            description: 'InfoProvider technical name the rule belongs to. Case-insensitive.',
+          },
+          remodeling_rule: {
+            type: 'string',
+            description: 'Remodeling rule ID, from bw_list_remodeling_requests output.',
+          },
+          request_number: {
+            type: 'string',
+            description:
+              'Optional request GUID from bw_list_remodeling_requests output. When omitted, the ' +
+              'most recent request of the given InfoProvider and rule is resolved automatically.',
+          },
+          include_log: {
+            type: 'boolean',
+            description: 'Include the application log messages (default true).',
+          },
+          format: {
+            type: 'string',
+            enum: ['text', 'raw'],
+            description: 'Output format. "text" (default): readable summary. "raw": full parsed JSON.',
+          },
+        },
+        required: ['info_provider', 'remodeling_rule'],
+      },
+    },
+    {
+      name: 'bw_run_remodeling',
+      description:
+        'Start, restart or reset a remodeling request. WRITE OPERATION WITH DATA IMPACT: ' +
+        'executing a remodeling rule restructures the InfoProvider and converts its existing ' +
+        'data — it is not a plain reload and cannot simply be undone. ' +
+        'Asynchronous: the call schedules the run; monitor completion with ' +
+        'bw_get_remodeling_request. ' +
+        'Actions: "execute" starts a request that has not run, "restart" resumes a failed one, ' +
+        '"reset" resets the whole request, "reset_step" resets only the current step.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          action: {
+            type: 'string',
+            enum: ['execute', 'restart', 'reset', 'reset_step'],
+            description: 'Action to perform (default "execute").',
+          },
+          info_provider: {
+            type: 'string',
+            description: 'InfoProvider technical name the rule belongs to. Case-insensitive.',
+          },
+          remodeling_rule: {
+            type: 'string',
+            description: 'Remodeling rule ID, from bw_list_remodeling_requests output.',
+          },
+          request_number: {
+            type: 'string',
+            description:
+              'Optional request GUID from bw_list_remodeling_requests output. When omitted, the ' +
+              'most recent request of the given InfoProvider and rule is resolved automatically.',
+          },
+          start: {
+            type: 'string',
+            description:
+              'Start time for "execute" and "restart": "immediate" (default) or an ISO 8601 ' +
+              'timestamp to schedule the background job for a later point in time. ' +
+              'Ignored by the reset actions.',
+          },
+        },
+        required: ['info_provider', 'remodeling_rule'],
+      },
+    },
+    {
       name: 'bw_create_dtp',
       description:
         'Create a new DTP (Data Transfer Process) for an existing Transformation and activate it. ' +
@@ -1409,18 +1619,7 @@ const TOOL_DEFINITIONS = [
             type: 'string',
             description: 'Development package (default "$TMP").',
           },
-          filter_field: {
-            type: 'string',
-            description: 'Field name to filter on. Requires filter_dta_name and filter_value.',
-          },
-          filter_dta_name: {
-            type: 'string',
-            description: 'Internal dtaName for the filter field.',
-          },
-          filter_value: {
-            type: 'string',
-            description: 'Filter value for the Equal selection (e.g. "PL_001").',
-          },
+          ...DTP_FILTER_SCHEMA_PROPS,
         },
         required: ['trfn_name', 'source_name', 'source_type', 'target_name', 'target_type'],
       },
@@ -1446,7 +1645,8 @@ const TOOL_DEFINITIONS = [
     {
       name: 'bw_set_dtp_filter_routine',
       description:
-        'Set an ABAP filter routine on a DTP filter field. Use this only when custom ABAP code is needed for the filter logic, not for simple value filters.',
+        'Set an ABAP filter routine on a DTP filter field. Use this only when custom ABAP code is needed for the filter logic; for value sets, ranges and patterns use the filter parameters of bw_update_dtp. ' +
+        'Repeatable on the same field: the routine replaces the previous one, existing value selections on the field are kept, and a failed attempt leaves neither a routine nor a generated report behind.',
       inputSchema: {
         type: 'object',
         properties: {
@@ -1473,7 +1673,8 @@ const TOOL_DEFINITIONS = [
     {
       name: 'bw_update_dtp',
       description:
-        'Update DTP properties: description, simple value filter (e.g. field = value), extraction mode (Full vs Delta), and/or the semantic group. Use this for setting filter values on existing filter fields. ' +
+        'Update DTP properties: description, the value selection of one filter field, extraction mode (Full vs Delta), and/or the semantic group. Use this for setting filter values on existing filter fields. ' +
+        'A filter is written per field as a complete selection — a second call on the same field replaces the first, it does not add to it, so pass the whole value set at once. ' +
         'Note: switching extraction mode between Delta and Full (and back) has BW delta-init implications — a later delta load may require re-initialization of the delta on the source.',
       inputSchema: {
         type: 'object',
@@ -1486,25 +1687,13 @@ const TOOL_DEFINITIONS = [
             type: 'string',
             description: 'New description text for the DTP.',
           },
-          filter_field: {
-            type: 'string',
-            description: 'Field name to filter on. Requires filter_value.',
-          },
-          filter_dta_name: {
-            type: 'string',
-            description: 'Internal dtaName for the filter field. Reserved for future use.',
-          },
-          filter_value: {
-            type: 'string',
-            description: 'Filter value(s) for the selection. Comma-separated for multiple values (e.g. "VAL1,VAL2").',
-          },
-          filter_excluding: {
-            type: 'boolean',
-            description: 'If true, the filter excludes the given values (excluding="true"). Default false (inclusive).',
-          },
+          ...DTP_FILTER_SCHEMA_PROPS,
           filter_clear_fields: {
             type: 'string',
-            description: 'Comma-separated list of field names whose filter selections should be removed entirely.',
+            description:
+              'Comma-separated list of field names whose value selections are removed. The field ' +
+              'is deselected as well unless it carries a filter routine, which then stays the ' +
+              'active filter.',
           },
           extraction_mode: {
             type: 'string',
@@ -2102,6 +2291,144 @@ const TOOL_DEFINITIONS = [
       },
     },
     {
+      name: 'bw_update_query_characteristic',
+      description:
+        'Set the display and access properties of the characteristics in an existing BW Query - the ' +
+        'per-characteristic settings of the rows, columns, and free-characteristics areas: display of result ' +
+        'rows, display as key/text, access type for result values (read mode), sorting, cumulation, display ' +
+        'level, and the hierarchy assignment with its display options. Pass "*" as infoobject to apply one ' +
+        'set of properties to every characteristic in the layout. Every property also accepts "default", ' +
+        'which drops the explicit value and falls back to the InfoObject/query default. All specs are ' +
+        'applied in a single save. Characteristics must already be in the layout - add them with ' +
+        'bw_update_query_layout first. All names must be technical names (e.g. "QUERY_NAME", "CHAR_NAME").',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          query_name: {
+            type: 'string',
+            description: 'Technical name of the query to modify (e.g. "QUERY_NAME").',
+          },
+          transport: {
+            type: 'string',
+            description: 'Transport request number (e.g. DEVK900123). Only needed when the query lives on a transportable package; omit for $TMP queries.',
+          },
+          characteristics: {
+            type: 'array',
+            description: 'One entry per characteristic, or a single entry with infoobject "*" for all of them.',
+            items: {
+              type: 'object',
+              properties: {
+                infoobject: {
+                  type: 'string',
+                  description: 'Technical name of the characteristic (e.g. "CHAR_NAME"), or "*" for every characteristic in the layout.',
+                },
+                axis: {
+                  type: 'string',
+                  enum: ['rows', 'columns', 'free'],
+                  description: 'Restrict the change to one area. Omit to hit the characteristic wherever it sits.',
+                },
+                result_rows: {
+                  type: 'string',
+                  enum: ['always', 'suppressForOne', 'never', 'default'],
+                  description: 'Display of result rows: always show, show only when there is more than one value, or never show.',
+                },
+                display_as: {
+                  type: 'string',
+                  enum: ['Key', 'Text', 'KeyAndText', 'TextAndKey', 'noDisplay', 'default'],
+                  description: 'How characteristic values are rendered.',
+                },
+                text_type: {
+                  type: 'string',
+                  enum: ['standard', 'short', 'medium', 'long'],
+                  description: 'Which text the value rendering uses. Only together with display_as; defaults to "standard".',
+                },
+                access_type: {
+                  type: 'string',
+                  enum: ['masterdata', 'characteristicRelations', 'factdata', 'dimensiondata', 'default'],
+                  description: 'Access type for result values (read mode): master data table, characteristic relationships, values posted in the InfoProvider, or posted values.',
+                },
+                cumulate: {
+                  type: 'string',
+                  enum: ['on', 'off', 'default'],
+                  description: 'Show the characteristic cumulated.',
+                },
+                display_level: {
+                  type: 'string',
+                  enum: ['AlsoInSimple', 'Normal', 'DetailedOnly', 'default'],
+                  description: 'Level at which the characteristic is shown.',
+                },
+                sorting: {
+                  type: 'object',
+                  description: 'Sorting of the characteristic values.',
+                  properties: {
+                    by: {
+                      type: 'string',
+                      enum: ['Key', 'Text', 'default'],
+                      description: 'Sort by key or by text; "default" restores sorting as selected.',
+                    },
+                    direction: {
+                      type: 'string',
+                      enum: ['Ascending', 'Descending'],
+                      description: 'Sort direction (default "Ascending").',
+                    },
+                    sort_by_characteristic: {
+                      type: 'string',
+                      description: 'Characteristic or display attribute the sort runs on. Defaults to the characteristic itself.',
+                    },
+                  },
+                  required: ['by'],
+                },
+                hierarchy: {
+                  type: 'object',
+                  description: 'Hierarchy assignment and hierarchy display options.',
+                  properties: {
+                    name: {
+                      type: 'string',
+                      description: 'Technical name of the hierarchy; "" removes the assignment. Also switches the hierarchy on or off unless active is given explicitly.',
+                    },
+                    active: { type: 'boolean', description: 'Whether the assigned hierarchy is active.' },
+                    version: { type: 'string', description: 'Hierarchy version.' },
+                    valid_to: { type: 'string', description: 'Key date of the hierarchy (YYYYMMDD).' },
+                    expand_to_level: {
+                      type: 'integer',
+                      minimum: 0,
+                      description: 'Expand the hierarchy to this level; 0 restores the default.',
+                    },
+                    child_node_position: {
+                      type: 'string',
+                      enum: ['above', 'below', 'default'],
+                      description: 'Position of child nodes relative to their parent.',
+                    },
+                    postable_node_values: {
+                      type: 'string',
+                      enum: ['show', 'hide', 'default'],
+                      description: 'Show the values posted on nodes.',
+                    },
+                    suppress_single_child_nodes: {
+                      type: 'string',
+                      enum: ['on', 'off', 'default'],
+                      description: 'Suppress nodes that have only one child.',
+                    },
+                    sorting: {
+                      type: 'object',
+                      description: 'Sorting within the hierarchy; "default" sorts as in the hierarchy.',
+                      properties: {
+                        by: { type: 'string', enum: ['Key', 'Text', 'default'] },
+                        direction: { type: 'string', enum: ['Ascending', 'Descending'] },
+                      },
+                      required: ['by'],
+                    },
+                  },
+                },
+              },
+              required: ['infoobject'],
+            },
+          },
+        },
+        required: ['query_name', 'characteristics'],
+      },
+    },
+    {
       name: 'bw_get_composite_provider',
       description:
         'Read a CompositeProvider (HCPR) structure — general info, view node type (Union/Join), ' +
@@ -2299,6 +2626,47 @@ const TOOL_DEFINITIONS = [
           },
         },
         required: ['path'],
+      },
+    },
+    {
+      name: 'bw_read_metadata_tables',
+      description:
+        'Read a BW object definition directly from its metadata tables (via the ADT DataPreview service). ' +
+        'Read-only fallback for object types the connected system does not publish as a REST resource — ' +
+        'on classic SAP BW (7.5) that is typically transformations and DTPs, and the classic providers, ' +
+        'for which no release ships a REST resource. ' +
+        'Use bw_system_profile to see which endpoints a system publishes. ' +
+        'Supported object_type: TRFN (transformation incl. start/end/expert and field routine source code), ' +
+        'DTPA (data transfer process), ODSO (classic DataStore Object), CUBE (InfoCube) and MPRO (MultiProvider). ' +
+        'Requires ADT authorization for the calling user. Prefer bw_get_transformation where the REST endpoint exists.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          object_type: {
+            type: 'string',
+            description: 'Object type to read. Supported: TRFN, DTPA, ODSO, CUBE, MPRO.',
+          },
+          object_name: {
+            type: 'string',
+            description: 'Technical name of the object (for TRFN the UUID-like transformation ID).',
+          },
+        },
+        required: ['object_type', 'object_name'],
+      },
+    },
+    {
+      name: 'bw_system_profile',
+      description:
+        'Report what the connected BW system is and which tool groups work on it. ' +
+        'Distinguishes SAP BW/4HANA from classic SAP BW (7.5) via the system\'s own b4hanamode flag, ' +
+        'lists which REST endpoint groups the system publishes, and verifies two preconditions: ' +
+        'whether Accept-header handling works (a broken one makes almost every call fail with HTTP 406 on BW 7.5) ' +
+        'and whether the ADT DataPreview service is reachable for this user. ' +
+        'Call this first when connecting to an unknown system, or when tools fail with 404 or 406.',
+      inputSchema: {
+        type: 'object',
+        properties: {},
+        required: [],
       },
     },
     {
@@ -3335,9 +3703,9 @@ const TOOL_DEFINITIONS = [
         'Collectors (AND, OR, XOR) require no extra fields beyond their type. ' +
         'Edge status defaults: neutral for edges whose source is TRIGGER or a collector; positive for all others. ' +
         'For two-step DTP loading always use bw_create_dtp first; this tool builds the process chain around existing DTPs. ' +
-        'Supported step types: DTP_LOAD (DTP load), ADSOACT (DSO data activation), ADSOREM (DSO request cleanup), CHAIN (start a local sub-chain, verified), DECISION (branch on a decision variant, requires the variant field), and collectors AND / OR / XOR; the start trigger is implicit. ' +
+        'Supported step types: DTP_LOAD (DTP load), ADSOACT (DSO data activation), ADSOREM (DSO request cleanup), ABAP (execute an ABAP program, optionally with an SE38 selection variant), CHAIN (start a local sub-chain, verified), DECISION (branch on a decision variant, requires the variant field), and collectors AND / OR / XOR; the start trigger is implicit. ' +
         'A generic referenced-step path (any process type string plus an object name, bIsReference=true) is available and verified for DTP_LOAD and CHAIN; for other types it may work but is untested. ' +
-        'Other inline-configuration process types (for example program execution, OS command, attribute change run) are not supported in this version. ' +
+        'Other inline-configuration process types (for example OS command, attribute change run) are not supported in this version. ' +
         'Edges support on-success (positive) and unconditional (neutral) links; on-error (negative) links are accepted in the schema but not emitted by default. ' +
         'DECISION branch edges: set sub_status to the branch EVENTNO ("01"=THEN/JA, "02"=ELSE/NEIN) — such edges are always positive. Create the referenced decision variant first with bw_create_decision_variant. ' +
         'To start the chain on an event instead of immediately, pass trigger_event (start type "E").',
@@ -3362,6 +3730,7 @@ const TOOL_DEFINITIONS = [
               'Ordered list of steps. The TRIGGER (Start) node is implicit at index 0 — do not include it here. ' +
               'Each step has a caller-chosen id used for edge wiring. ' +
               'Step types: DTP_LOAD (requires dtp field), ADSOACT (requires datastores array), ADSOREM (requires remDatastores array), ' +
+              'ABAP (requires program field, optional program_variant), ' +
               'CHAIN (requires object = sub-chain name), DECISION (requires variant = decision variant name), AND / OR / XOR (collector, no extra fields), or any other BW process type (requires object field).',
             items: {
               type: 'object',
@@ -3369,7 +3738,7 @@ const TOOL_DEFINITIONS = [
                 id: { type: 'string', description: 'Caller-chosen identifier used to reference this step in edges (e.g. "step1").' },
                 type: {
                   type: 'string',
-                  description: 'Process type: "DTP_LOAD", "ADSOACT", "ADSOREM", "CHAIN", "DECISION", "AND", "OR", "XOR", or any BW process type string.',
+                  description: 'Process type: "DTP_LOAD", "ADSOACT", "ADSOREM", "ABAP", "CHAIN", "DECISION", "AND", "OR", "XOR", or any BW process type string.',
                 },
                 dtp: { type: 'string', description: 'DTP technical name. Required when type is "DTP_LOAD" (e.g. "DTP_...").' },
                 variant: { type: 'string', description: 'Decision variant technical name to reference. Required when type is "DECISION". Create it first with bw_create_decision_variant.' },
@@ -3402,9 +3771,37 @@ const TOOL_DEFINITIONS = [
                     },
                   },
                 },
+                program: {
+                  type: 'string',
+                  description: 'ABAP program / report to execute (e.g. "REPORT_NAME"). Required when type is "ABAP". The call is stored as an inline variant in the chain — no separate variant object is created.',
+                },
+                program_variant: {
+                  type: 'string',
+                  description: 'ABAP only. Optional ABAP report (SE38) selection variant name (e.g. "VARIANT_NAME"). Note this is a report variant, not the DECISION variant field above.',
+                },
+                program_package: {
+                  type: 'string',
+                  description: 'ABAP only. Optional package of the report (cosmetic value-help enrichment; the server re-derives it when omitted).',
+                },
+                program_description: {
+                  type: 'string',
+                  description: 'ABAP only. Optional report description (cosmetic).',
+                },
+                variant_description: {
+                  type: 'string',
+                  description: 'ABAP only. Optional report-variant description (cosmetic).',
+                },
+                synchronous: {
+                  type: 'boolean',
+                  description: 'ABAP only. Call mode. true (default) runs the program synchronously (X_SYNCHRON). Only the default is verified.',
+                },
+                local: {
+                  type: 'boolean',
+                  description: 'ABAP only. Call location. true (default) runs the program on this system (X_LOCAL). Only the default is verified.',
+                },
                 object: {
                   type: 'string',
-                  description: 'Technical name of the referenced BW object. Required for CHAIN (sub-chain name) and other generic referenced step types (any type other than DTP_LOAD, ADSOACT, ADSOREM, AND, OR, XOR).',
+                  description: 'Technical name of the referenced BW object. Required for CHAIN (sub-chain name) and other generic referenced step types (any type other than DTP_LOAD, ADSOACT, ADSOREM, ABAP, AND, OR, XOR).',
                 },
               },
               required: ['id', 'type'],
@@ -3464,9 +3861,11 @@ const TOOL_DEFINITIONS = [
         'Optionally activates after the update. ' +
         'A 412 on the PUT means the ETag was stale (chain modified between read and write); the error reports this explicitly. ' +
         'Use bw_create_process_chain to create a new chain; use this tool to update an existing one. ' +
-        'Supported step types: DTP_LOAD (DTP load), ADSOACT (DSO data activation), ADSOREM (DSO request cleanup), CHAIN (start a local sub-chain, verified), DECISION (branch on a decision variant, requires the variant field), and collectors AND / OR / XOR; the start trigger is implicit. ' +
+        'This tool REPLACES the whole step model, so every step that should survive must be listed — a step left out is deleted. ' +
+        'For a small change to a big chain prefer the targeted tools (bw_append_process_chain_dtp, bw_add_process_chain_program, bw_add_process_chain_edge, bw_remove_process_chain_edge, bw_remove_process_chain_step), which edit the server\'s own model in place and cannot drop a step they do not model. ' +
+        'Supported step types: DTP_LOAD (DTP load), ADSOACT (DSO data activation), ADSOREM (DSO request cleanup), ABAP (execute an ABAP program, optionally with an SE38 selection variant), CHAIN (start a local sub-chain, verified), DECISION (branch on a decision variant, requires the variant field), and collectors AND / OR / XOR; the start trigger is implicit. ' +
         'A generic referenced-step path (any process type string plus an object name, bIsReference=true) is available and verified for DTP_LOAD and CHAIN; for other types it may work but is untested. ' +
-        'Other inline-configuration process types (for example program execution, OS command, attribute change run) are not supported in this version. ' +
+        'Other inline-configuration process types (for example OS command, attribute change run) are not supported in this version — a chain containing one cannot be rewritten with this tool without losing that step. ' +
         'Edges support on-success (positive) and unconditional (neutral) links; on-error (negative) links are accepted in the schema but not emitted by default. ' +
         'DECISION branch edges: set sub_status to the branch EVENTNO ("01"/"02"); such edges are always positive. ' +
         'The trigger is preserved as-is unless trigger_event is passed (which sets an event start-condition); an existing event start-condition is preserved across updates.',
@@ -3496,7 +3895,7 @@ const TOOL_DEFINITIONS = [
                 id: { type: 'string', description: 'Caller-chosen identifier used to reference this step in edges.' },
                 type: {
                   type: 'string',
-                  description: 'Process type: "DTP_LOAD", "ADSOACT", "ADSOREM", "CHAIN", "DECISION", "AND", "OR", "XOR", or any BW process type string.',
+                  description: 'Process type: "DTP_LOAD", "ADSOACT", "ADSOREM", "ABAP", "CHAIN", "DECISION", "AND", "OR", "XOR", or any BW process type string.',
                 },
                 dtp: { type: 'string', description: 'DTP technical name. Required when type is "DTP_LOAD".' },
                 variant: { type: 'string', description: 'Decision variant technical name to reference. Required when type is "DECISION".' },
@@ -3528,6 +3927,34 @@ const TOOL_DEFINITIONS = [
                       packageSize: { type: 'number', description: 'Processing package size (PACKAGE_SIZE); 0 = server default.' },
                     },
                   },
+                },
+                program: {
+                  type: 'string',
+                  description: 'ABAP program / report to execute (e.g. "REPORT_NAME"). Required when type is "ABAP". The call is stored as an inline variant in the chain — no separate variant object is created. Re-specify every existing ABAP step here, otherwise the replacement drops it; read the current program and report variant from bw_get_process_chain.',
+                },
+                program_variant: {
+                  type: 'string',
+                  description: 'ABAP only. Optional ABAP report (SE38) selection variant name (e.g. "VARIANT_NAME"). Note this is a report variant, not the DECISION variant field above. Omitting it on an existing step silently drops the step\'s selection variant.',
+                },
+                program_package: {
+                  type: 'string',
+                  description: 'ABAP only. Optional package of the report (cosmetic value-help enrichment; the server re-derives it when omitted).',
+                },
+                program_description: {
+                  type: 'string',
+                  description: 'ABAP only. Optional report description (cosmetic).',
+                },
+                variant_description: {
+                  type: 'string',
+                  description: 'ABAP only. Optional report-variant description (cosmetic).',
+                },
+                synchronous: {
+                  type: 'boolean',
+                  description: 'ABAP only. Call mode. true (default) runs the program synchronously (X_SYNCHRON). Only the default is verified.',
+                },
+                local: {
+                  type: 'boolean',
+                  description: 'ABAP only. Call location. true (default) runs the program on this system (X_LOCAL). Only the default is verified.',
                 },
                 object: {
                   type: 'string',
@@ -3744,11 +4171,13 @@ const TOOL_DEFINITIONS = [
     {
       name: 'bw_append_process_chain_dtp',
       description:
-        'Append one DTP load step (optionally followed by its own DSO activation step) to an existing Process Chain (RSPC), ' +
-        'via the BW/4HANA Cockpit REST API. In-place edit: reads the current model, appends the node(s)/edge(s)/inline variant, ' +
+        'Add one DTP load step (optionally followed by its own DSO activation step) to an existing Process Chain (RSPC), ' +
+        'via the BW/4HANA Cockpit REST API. In-place edit: reads the current model, inserts the node(s)/edge(s)/inline variant, ' +
         'and PUTs it back — the caller does not supply the full model. ' +
-        'By default it appends behind the strand end closest to the trigger (to keep strands balanced); pass predecessor to choose a node. ' +
-        'edge_mode "both" (default) adds an on-success and an on-error edge per link ("always continue"); "success_only" adds only the on-success edge. ' +
+        'Positioning: pass "before" to place the block IN SERIES ahead of an existing step (the target\'s incoming edges are rerouted into the block, then the block links to the target), or "after" to place it in series between a step and its successors. ' +
+        'With neither, the block is only APPENDED behind the strand end closest to the trigger (or behind "predecessor") — the target keeps its existing successors, so the block ends up running in PARALLEL to them, not ahead of them. Use before/after whenever the new step must complete before an existing one starts. ' +
+        'When adsoact is given, the whole DTP → activation block is placed as one unit. ' +
+        'edge_mode defaults to "both", which adds an on-success AND an on-error edge per link ("always continue" — the successor runs even after a failed load). Pass "success_only" for an on-success edge only, which is what a chain whose existing DTP steps have no error edge expects. ' +
         'Idempotent: if the DTP is already a node in the chain, it is skipped without writing. ' +
         'Optionally activates afterwards and then verifies that no collector was inserted and no extra strand appeared. ' +
         'A 412 on the PUT means the ETag was stale (chain modified between read and write); the error reports this explicitly.',
@@ -3765,18 +4194,32 @@ const TOOL_DEFINITIONS = [
           },
           adsoact: {
             type: 'string',
-            description: 'Optional aDSO name (e.g. "ADSO_NAME"). When given, an ADSOACT step activating this aDSO is added right after the DTP (per-DTP activation).',
+            description: 'Optional aDSO name (e.g. "ADSO_NAME"). When given, an ADSOACT step activating this aDSO is added right after the DTP (per-DTP activation) and the two form one block that is placed together.',
+          },
+          before: {
+            type: 'string',
+            description:
+              'Insert the block IN SERIES BEFORE this node: the target\'s incoming edges are rerouted into the block, then the block links to the target. ' +
+              'Node reference — see the note below. Mutually exclusive with "after".',
+          },
+          after: {
+            type: 'string',
+            description:
+              'Insert the block IN SERIES AFTER this node — it runs between the target and its former successors. Mutually exclusive with "before".',
           },
           predecessor: {
             type: 'string',
             description:
-              'Node to append behind: a DTP variant name, an aDSO whose ADSOACT node holds it, or the literal "strand_end_auto" (default). ' +
-              'For "strand_end_auto" the terminal node closest to the trigger is chosen (ties → first).',
+              'Used only when neither before nor after is given. Node to APPEND behind, or the literal "strand_end_auto" (default = terminal node closest to the trigger, ties → first). ' +
+              'An append leaves the target\'s existing successors untouched, so the new block runs in parallel to them — pass before/after instead when it must run in sequence. ' +
+              'Node reference forms (same for before / after / predecessor): a DTP or process-variant name; an aDSO held by an ADSOACT/ADSOREM node; the program of an ABAP step, or "PROGRAM/VARIANT"; "TRIGGER" or a collector type ("AND"/"OR"); or "#<index>" using the step numbers printed by bw_get_process_chain. An ambiguous name is rejected with the candidates listed — use "#<index>" then.',
           },
           edge_mode: {
             type: 'string',
             enum: ['both', 'success_only'],
-            description: '"both" (default): add an on-success and an on-error edge per link. "success_only": add only the on-success edge.',
+            description:
+              '"both" (default): add an on-success AND an on-error edge per link, so the successor runs even after a failed load ("always continue"). ' +
+              '"success_only": add only the on-success edge. Match whatever the chain\'s existing steps use — the default adds an error edge that a success-only chain does not have.',
           },
           activate: {
             type: 'boolean',
@@ -3877,6 +4320,154 @@ const TOOL_DEFINITIONS = [
           },
         },
         required: ['name', 'program'],
+      },
+    },
+    {
+      name: 'bw_add_process_chain_edge',
+      description:
+        'Add one dependency (edge) between two existing steps of a Process Chain (RSPC), via the BW/4HANA Cockpit REST API. ' +
+        'In-place edit: reads the current model, appends the edge, and PUTs it back. ' +
+        'Use this to repair the wiring of a chain — for example to connect the end of a newly inserted block to the step that must run after it. ' +
+        'Note that an "always continue" dependency is TWO edges (one on-success, one on-error): call this twice, once with status "positive" and once with "negative". ' +
+        'Idempotent: an identical edge is skipped without writing. ' +
+        'A 412 on the PUT means the ETag was stale (chain modified between read and write); the error reports this explicitly.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          name: {
+            type: 'string',
+            description: 'Process chain technical name (e.g. "CHAIN_NAME"). Case-insensitive.',
+          },
+          from: {
+            type: 'string',
+            description:
+              'Source step. Node reference forms: a DTP or process-variant name; an aDSO held by an ADSOACT/ADSOREM node; the program of an ABAP step, or "PROGRAM/VARIANT"; ' +
+              '"TRIGGER" or a collector type ("AND"/"OR"); or "#<index>" using the step numbers printed by bw_get_process_chain. An ambiguous name is rejected with the candidates listed.',
+          },
+          to: {
+            type: 'string',
+            description: 'Target step. Same reference forms as "from".',
+          },
+          status: {
+            type: 'string',
+            enum: ['neutral', 'positive', 'negative'],
+            description:
+              'Edge condition: "positive" = on success, "negative" = on error, "neutral" = unconditional. ' +
+              'Defaults to "neutral" when the source is the TRIGGER or a collector (neither can succeed or fail), "positive" otherwise.',
+          },
+          sub_status: {
+            type: 'string',
+            description:
+              'Branch condition for an edge leaving a DECISION step: the branch EVENTNO, e.g. "01" (THEN/JA) or "02" (ELSE/NEIN). ' +
+              'Defaults to "00" (a normal, non-branch edge). A branch edge is always "positive".',
+          },
+          activate: {
+            type: 'boolean',
+            description: 'If true, activate the chain immediately after the edit. Default false.',
+          },
+          transport_request: {
+            type: 'string',
+            description:
+              'Optional transport request to record the change into. Only relevant when the chain is in a transportable package (not $TMP). ' +
+              'If the chain is transportable and exactly one request is available, it is chosen automatically; pass this to disambiguate when several are available. ' +
+              'Ignored for $TMP (local) chains.',
+          },
+        },
+        required: ['name', 'from', 'to'],
+      },
+    },
+    {
+      name: 'bw_remove_process_chain_edge',
+      description:
+        'Remove the dependency (edge) between two existing steps of a Process Chain (RSPC), via the BW/4HANA Cockpit REST API. ' +
+        'In-place edit: reads the current model, drops the matching edge(s), and PUTs it back. ' +
+        'By default every edge between the two steps is removed, which is what an "always continue" dependency needs (it is stored as an on-success plus an on-error edge); pass status to remove just one of them. ' +
+        'Use this together with bw_add_process_chain_edge to re-route a mis-wired chain. ' +
+        'Removing an edge can leave a step unreachable from the start — the chain will not activate until every step has a path from the trigger. ' +
+        'Reports a skip when no matching edge exists. ' +
+        'A 412 on the PUT means the ETag was stale (chain modified between read and write); the error reports this explicitly.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          name: {
+            type: 'string',
+            description: 'Process chain technical name (e.g. "CHAIN_NAME"). Case-insensitive.',
+          },
+          from: {
+            type: 'string',
+            description:
+              'Source step. Node reference forms: a DTP or process-variant name; an aDSO held by an ADSOACT/ADSOREM node; the program of an ABAP step, or "PROGRAM/VARIANT"; ' +
+              '"TRIGGER" or a collector type ("AND"/"OR"); or "#<index>" using the step numbers printed by bw_get_process_chain.',
+          },
+          to: {
+            type: 'string',
+            description: 'Target step. Same reference forms as "from".',
+          },
+          status: {
+            type: 'string',
+            enum: ['neutral', 'positive', 'negative'],
+            description: 'Remove only edges with this condition. Omit to remove every edge between the two steps.',
+          },
+          sub_status: {
+            type: 'string',
+            description: 'Remove only edges with this branch condition (a DECISION branch EVENTNO, e.g. "01"). Omit to ignore the branch condition.',
+          },
+          activate: {
+            type: 'boolean',
+            description: 'If true, activate the chain immediately after the edit. Default false.',
+          },
+          transport_request: {
+            type: 'string',
+            description:
+              'Optional transport request to record the change into. Only relevant when the chain is in a transportable package (not $TMP). ' +
+              'If the chain is transportable and exactly one request is available, it is chosen automatically; pass this to disambiguate when several are available. ' +
+              'Ignored for $TMP (local) chains.',
+          },
+        },
+        required: ['name', 'from', 'to'],
+      },
+    },
+    {
+      name: 'bw_remove_process_chain_step',
+      description:
+        'Remove one step (node) from a Process Chain (RSPC), via the BW/4HANA Cockpit REST API. ' +
+        'In-place edit: reads the current model, drops the node together with every edge touching it and its inline process variant, and PUTs it back. ' +
+        'By default the gap is bridged — every predecessor of the removed step takes over every successor, keeping the condition of the edge that ran into the removed step — so the strand stays connected. Pass reconnect=false to leave the successors disconnected. ' +
+        'Use this to roll back a step that was inserted in the wrong place. ' +
+        'The TRIGGER (Start) step cannot be removed. ' +
+        'A 412 on the PUT means the ETag was stale (chain modified between read and write); the error reports this explicitly.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          name: {
+            type: 'string',
+            description: 'Process chain technical name (e.g. "CHAIN_NAME"). Case-insensitive.',
+          },
+          step: {
+            type: 'string',
+            description:
+              'Step to remove. Node reference forms: a DTP or process-variant name; an aDSO held by an ADSOACT/ADSOREM node; the program of an ABAP step, or "PROGRAM/VARIANT"; ' +
+              'a collector type ("AND"/"OR"); or "#<index>" using the step numbers printed by bw_get_process_chain. An ambiguous name is rejected with the candidates listed — use "#<index>" then.',
+          },
+          reconnect: {
+            type: 'boolean',
+            description:
+              'true (default): bridge the gap so each predecessor of the removed step links to each of its successors. ' +
+              'false: drop the edges without bridging, which leaves the successors as a strand nothing leads to (the chain then will not activate until they are re-wired with bw_add_process_chain_edge).',
+          },
+          activate: {
+            type: 'boolean',
+            description: 'If true, activate the chain immediately after the edit. Default false.',
+          },
+          transport_request: {
+            type: 'string',
+            description:
+              'Optional transport request to record the change into. Only relevant when the chain is in a transportable package (not $TMP). ' +
+              'If the chain is transportable and exactly one request is available, it is chosen automatically; pass this to disambiguate when several are available. ' +
+              'Ignored for $TMP (local) chains.',
+          },
+        },
+        required: ['name', 'step'],
       },
     },
     {
@@ -4334,6 +4925,37 @@ async function handleToolCall(
         );
         break;
 
+      case 'bw_list_remodeling_requests':
+        text = await bwListRemodelingRequests(
+          client,
+          args?.info_provider as string | undefined,
+          args?.status as string | undefined,
+          args?.top as number | undefined ?? 20,
+        );
+        break;
+
+      case 'bw_get_remodeling_request':
+        text = await bwGetRemodelingRequest(
+          client,
+          args?.info_provider as string,
+          args?.remodeling_rule as string,
+          args?.request_number as string | undefined,
+          args?.include_log as boolean | undefined ?? true,
+          args?.format as 'text' | 'raw' | undefined ?? 'text',
+        );
+        break;
+
+      case 'bw_run_remodeling':
+        text = await bwRunRemodeling(
+          client,
+          args?.action as RemodelingAction | undefined ?? 'execute',
+          args?.info_provider as string,
+          args?.remodeling_rule as string,
+          args?.request_number as string | undefined,
+          args?.start as string | undefined ?? 'immediate',
+        );
+        break;
+
       case 'bw_create_dtp':
         text = await bwCreateDtp(client, {
           trfn_name: args?.trfn_name as string,
@@ -4347,8 +4969,9 @@ async function handleToolCall(
           description: args?.description as string | undefined,
           package: args?.package as string | undefined,
           filter_field: args?.filter_field as string | undefined,
-          filter_dta_name: args?.filter_dta_name as string | undefined,
           filter_value: args?.filter_value as string | undefined,
+          filter_excluding: args?.filter_excluding as boolean | undefined,
+          filter_selections: args?.filter_selections as DtpFilterSelectionInput[] | undefined,
         });
         break;
 
@@ -4370,9 +4993,9 @@ async function handleToolCall(
           dtp_name: args?.dtp_name as string,
           description: args?.description as string | undefined,
           filter_field: args?.filter_field as string | undefined,
-          filter_dta_name: args?.filter_dta_name as string | undefined,
           filter_value: args?.filter_value as string | undefined,
           filter_excluding: args?.filter_excluding as boolean | undefined,
+          filter_selections: args?.filter_selections as DtpFilterSelectionInput[] | undefined,
           filter_clear_fields: args?.filter_clear_fields as string | undefined,
           extraction_mode: args?.extraction_mode as 'full' | 'delta' | undefined,
           semantic_group_fields: args?.semantic_group_fields as string | undefined,
@@ -4456,8 +5079,24 @@ async function handleToolCall(
         text = await bwUpdateQuerySettings(client, args as unknown as UpdateQuerySettingsArgs);
         break;
 
+      case 'bw_update_query_characteristic':
+        text = await bwUpdateQueryCharacteristic(client, args as unknown as UpdateQueryCharacteristicArgs);
+        break;
+
       case 'bw_list_contents':
         text = await bwListContents(client, args?.path as string);
+        break;
+
+      case 'bw_read_metadata_tables':
+        text = await bwReadMetadataTables(
+          client,
+          args?.object_type as string,
+          args?.object_name as string,
+        );
+        break;
+
+      case 'bw_system_profile':
+        text = await bwSystemProfile(client);
         break;
 
       case 'bw_list_source_systems':
@@ -4826,18 +5465,7 @@ async function handleToolCall(
 
       case 'bw_create_process_chain': {
         const rawSteps = (args?.steps as Array<Record<string, unknown>>) ?? [];
-        const steps = rawSteps.map((s) => {
-          const base: Record<string, unknown> = { id: s['id'], type: s['type'] };
-          if (s['dtp'] !== undefined) base['dtp'] = s['dtp'];
-          if (s['variant'] !== undefined) base['variant'] = s['variant'];
-          if (s['description'] !== undefined) base['description'] = s['description'];
-          if (s['datastores'] !== undefined) base['datastores'] = s['datastores'];
-          if (s['requestsSequential'] !== undefined) base['requestsSequential'] = s['requestsSequential'];
-          if (s['errorOnNonActivation'] !== undefined) base['errorOnNonActivation'] = s['errorOnNonActivation'];
-          if (s['remDatastores'] !== undefined) base['remDatastores'] = s['remDatastores'];
-          if (s['object'] !== undefined) base['object'] = s['object'];
-          return base;
-        });
+        const steps = rawSteps.map(mapChainStep);
         const rawEdges = (args?.edges as Array<Record<string, unknown>>) ?? [];
         const edges: EdgeDef[] = rawEdges.map((e) => ({
           from: e['from'] as string,
@@ -4859,18 +5487,7 @@ async function handleToolCall(
 
       case 'bw_update_process_chain': {
         const rawSteps2 = (args?.steps as Array<Record<string, unknown>>) ?? [];
-        const steps2 = rawSteps2.map((s) => {
-          const base: Record<string, unknown> = { id: s['id'], type: s['type'] };
-          if (s['dtp'] !== undefined) base['dtp'] = s['dtp'];
-          if (s['variant'] !== undefined) base['variant'] = s['variant'];
-          if (s['description'] !== undefined) base['description'] = s['description'];
-          if (s['datastores'] !== undefined) base['datastores'] = s['datastores'];
-          if (s['requestsSequential'] !== undefined) base['requestsSequential'] = s['requestsSequential'];
-          if (s['errorOnNonActivation'] !== undefined) base['errorOnNonActivation'] = s['errorOnNonActivation'];
-          if (s['remDatastores'] !== undefined) base['remDatastores'] = s['remDatastores'];
-          if (s['object'] !== undefined) base['object'] = s['object'];
-          return base;
-        });
+        const steps2 = rawSteps2.map(mapChainStep);
         const rawEdges2 = (args?.edges as Array<Record<string, unknown>>) ?? [];
         const edges2: EdgeDef[] = rawEdges2.map((e) => ({
           from: e['from'] as string,
@@ -4934,6 +5551,8 @@ async function handleToolCall(
           name: args?.name as string,
           dtp: args?.dtp as string,
           adsoact: args?.adsoact as string | undefined,
+          before: args?.before as string | undefined,
+          after: args?.after as string | undefined,
           predecessor: args?.predecessor as string | undefined,
           edgeMode: args?.edge_mode as 'both' | 'success_only' | undefined,
           activate: (args?.activate as boolean) ?? false,
@@ -4956,6 +5575,40 @@ async function handleToolCall(
           variantDescription: args?.variant_description as string | undefined,
           synchronous: args?.synchronous as boolean | undefined,
           local: args?.local as boolean | undefined,
+          activate: (args?.activate as boolean) ?? false,
+          transportRequest: args?.transport_request as string | undefined,
+        });
+        break;
+
+      case 'bw_add_process_chain_edge':
+        text = await bwAddProcessChainEdge(client, {
+          name: args?.name as string,
+          from: args?.from as string,
+          to: args?.to as string,
+          status: args?.status as EdgeStatus | undefined,
+          subStatus: args?.sub_status as string | undefined,
+          activate: (args?.activate as boolean) ?? false,
+          transportRequest: args?.transport_request as string | undefined,
+        });
+        break;
+
+      case 'bw_remove_process_chain_edge':
+        text = await bwRemoveProcessChainEdge(client, {
+          name: args?.name as string,
+          from: args?.from as string,
+          to: args?.to as string,
+          status: args?.status as EdgeStatus | undefined,
+          subStatus: args?.sub_status as string | undefined,
+          activate: (args?.activate as boolean) ?? false,
+          transportRequest: args?.transport_request as string | undefined,
+        });
+        break;
+
+      case 'bw_remove_process_chain_step':
+        text = await bwRemoveProcessChainStep(client, {
+          name: args?.name as string,
+          step: args?.step as string,
+          reconnect: (args?.reconnect as boolean | undefined) ?? true,
           activate: (args?.activate as boolean) ?? false,
           transportRequest: args?.transport_request as string | undefined,
         });

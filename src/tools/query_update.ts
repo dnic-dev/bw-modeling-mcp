@@ -1,4 +1,4 @@
-import { BwClient, createClientFromEnv } from '../bw-client.js';
+import { BwClient, createClientFromEnv, bwSeg } from '../bw-client.js';
 import { QUERY_ACCEPT_LIST, queryAccept, queryWriteMediaType, variableAccept, ckfAccept, rkfAccept, structureAccept } from './query.js';
 
 /**
@@ -18,7 +18,7 @@ import { QUERY_ACCEPT_LIST, queryAccept, queryWriteMediaType, variableAccept, ck
  */
 
 /** Escape a string for use in an XML attribute value or text node. */
-function escapeXml(s: string): string {
+export function escapeXml(s: string): string {
   return s
     .replace(/&/g, '&amp;')
     .replace(/</g, '&lt;')
@@ -27,7 +27,7 @@ function escapeXml(s: string): string {
 }
 
 /** Escape a string for literal use inside a RegExp. */
-function escapeRegex(s: string): string {
+export function escapeRegex(s: string): string {
   return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 }
 
@@ -165,7 +165,7 @@ function insertIntoFilter(doc: string, fragment: string, what: string): string {
  * InfoObject. These blocks never nest, so a lazy match up to the corresponding
  * closing tag captures exactly one element.
  */
-function matchDimensionElement(
+export function matchDimensionElement(
   doc: string,
   iobj: string
 ): { container: string; id: string | undefined; start: number; end: number } | null {
@@ -239,7 +239,7 @@ function removeFilterSelectionsMatching(doc: string, predicate: (openTag: string
  * subComponents (reusable structures / CKFs / RKFs) carry member trees of their
  * own and would otherwise be matched by mistake.
  */
-function locateMainComponentRegion(doc: string, what: string): { start: number; end: number } {
+export function locateMainComponentRegion(doc: string, what: string): { start: number; end: number } {
   const start = doc.indexOf('<Qry:mainComponent');
   if (start < 0) {
     throw new Error(`Could not locate '<Qry:mainComponent' in the query document (${what}).`);
@@ -409,14 +409,14 @@ function findMemberReferencingComponent(doc: string, componentId: string): strin
  *   GET full document (+ timestamp header) → lock → PUT mutated document with
  *   lockHandle + timestamp → forceCacheUpdate GET → unlock.
  */
-async function withQueryDocument(
+export async function withQueryDocument(
   client: BwClient,
   queryName: string,
   mutate: (xml: string) => string,
   corrNr?: string,
 ): Promise<{ messages: string[] }> {
   const nameLower = queryName.toLowerCase();
-  const path = `/sap/bw/modeling/query/${nameLower}/a`;
+  const path = `/sap/bw/modeling/query/${bwSeg(nameLower)}/a`;
 
   const getResult = await client.get(path, queryAccept());
   const timestamp = getResult.headers['timestamp'];
@@ -877,7 +877,7 @@ async function resolveVariable(client: BwClient, variableName: string): Promise<
   }
   const elemuid = existResult.headers['elemuid'];
 
-  const varResult = await client.get(`/sap/bw/modeling/variable/${nameLower}/a`, variableAccept());
+  const varResult = await client.get(`/sap/bw/modeling/variable/${bwSeg(nameLower)}/a`, variableAccept());
   const body = varResult.body;
 
   const mainMatch = body.match(/<Qry:mainComponent\b[^>]*?(\/>|>[\s\S]*?<\/Qry:mainComponent>)/);
@@ -1489,7 +1489,7 @@ async function resolveComponent(
   const accept = kind === 'ckf' ? ckfAccept() : rkfAccept();
   const expectedType = kind === 'ckf' ? 'Qry:CalculatedMeasure' : 'Qry:RestrictedMeasure';
 
-  const { body } = await client.get(`/sap/bw/modeling/${kind}/${nameLower}/a`, accept);
+  const { body } = await client.get(`/sap/bw/modeling/${kind}/${bwSeg(nameLower)}/a`, accept);
 
   const mainMatch = body.match(/<Qry:mainComponent\b[^>]*?(\/>|>[\s\S]*?<\/Qry:mainComponent>)/);
   const rootTag = body.match(/<([\w:]+)[\s>]/)?.[1] ?? '(unknown root)';
@@ -1550,7 +1550,7 @@ async function resolveStructure(
   const nameLower = structureName.toLowerCase();
   const nameUpper = structureName.toUpperCase();
 
-  const { body } = await client.get(`/sap/bw/modeling/structure/${nameLower}/a`, structureAccept());
+  const { body } = await client.get(`/sap/bw/modeling/structure/${bwSeg(nameLower)}/a`, structureAccept());
 
   const mainMatch = body.match(/<Qry:mainComponent\b[^>]*?(\/>|>[\s\S]*?<\/Qry:mainComponent>)/);
   const rootTag = body.match(/<([\w:]+)[\s>]/)?.[1] ?? '(unknown root)';

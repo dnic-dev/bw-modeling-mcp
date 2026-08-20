@@ -1,4 +1,4 @@
-import { BwClient, MEDIA_TYPES, createClientFromEnv, freshRead } from '../bw-client.js';
+import { BwClient, MEDIA_TYPES, createClientFromEnv, freshRead, bwSeg } from '../bw-client.js';
 
 // ── KYF: objectSpecificDataType → keyfigureType / semantics ──────────────────
 
@@ -125,7 +125,7 @@ export async function bwCreateInfoObject(
     // fixedUnit / fixedCurrency: SAP only accepts these via PUT after creation
     if (args.fixed_unit || args.fixed_currency) {
       const freshClient = createClientFromEnv();
-      const getResult = await freshClient.get(`/sap/bw/modeling/iobj/${nameLower}/m`, MEDIA_TYPES['iobj']);
+      const getResult = await freshClient.get(`/sap/bw/modeling/iobj/${bwSeg(nameLower)}/m`, MEDIA_TYPES['iobj']);
       const timestamp = getResult.headers['timestamp'] ?? getResult.headers['TIMESTAMP'];
       let xml = getResult.body;
 
@@ -171,7 +171,7 @@ export async function bwCreateInfoObject(
   await client.create('iobj', nameLower, lockHandle, minimalXml, { 'Development-Class': pkg });
 
   // Step 3: GET server-created object (defaults) to obtain enriched XML + timestamp
-  const getResult = await client.get(`/sap/bw/modeling/iobj/${nameLower}/m`, MEDIA_TYPES['iobj']);
+  const getResult = await client.get(`/sap/bw/modeling/iobj/${bwSeg(nameLower)}/m`, MEDIA_TYPES['iobj']);
   const timestamp = getResult.headers['timestamp'] ?? getResult.headers['TIMESTAMP'];
 
   // Step 4: Lock again (stateful_enqueue) — same session, server returns same lockHandle
@@ -254,7 +254,7 @@ export async function bwCreateInfoObject(
     for (const parent of args.compound_infoobjects) {
       const parentLower = parent.toLowerCase();
       const parentUpper = parent.toUpperCase();
-      const parentGet = await freshClient.get(`/sap/bw/modeling/iobj/${parentLower}/a`, MEDIA_TYPES['iobj']);
+      const parentGet = await freshClient.get(`/sap/bw/modeling/iobj/${bwSeg(parentLower)}/a`, MEDIA_TYPES['iobj']);
       const parentXml = parentGet.body;
       const parentProps = parseInfoObjectProps(parentXml);
       const parentLongDescMatch = parentXml.match(/<longDescription>([^<]+)<\/longDescription>/);
@@ -391,7 +391,7 @@ export async function bwUpdateInfoObject(
   try {
     // Step 2: GET current XML — fresh session to avoid SAP session state pollution
     const freshClient = createClientFromEnv();
-    const getResult = await freshClient.get(`/sap/bw/modeling/iobj/${nameLower}/m`, MEDIA_TYPES['iobj']);
+    const getResult = await freshClient.get(`/sap/bw/modeling/iobj/${bwSeg(nameLower)}/m`, MEDIA_TYPES['iobj']);
     const timestamp = getResult.headers['timestamp'] ?? getResult.headers['TIMESTAMP'];
     let xml = getResult.body;
 
@@ -440,7 +440,7 @@ export async function bwUpdateInfoObject(
       const attrUpper = attr.name.toUpperCase();
       const attrLower = attr.name.toLowerCase();
 
-      const attrGet = await freshClient.get(`/sap/bw/modeling/iobj/${attrLower}/a`, MEDIA_TYPES['iobj']);
+      const attrGet = await freshClient.get(`/sap/bw/modeling/iobj/${bwSeg(attrLower)}/a`, MEDIA_TYPES['iobj']);
       const attrXml = attrGet.body;
       const props = parseInfoObjectProps(attrXml);
       const longDescMatch = attrXml.match(/<longDescription>([^<]+)<\/longDescription>/);
@@ -561,7 +561,7 @@ export async function bwGetInfoObject(
   infoObjectName: string
 ): Promise<string> {
   const accept = MEDIA_TYPES['iobj'];
-  const path = `/sap/bw/modeling/iobj/${infoObjectName.toLowerCase()}/m`;
+  const path = `/sap/bw/modeling/iobj/${bwSeg(infoObjectName)}/m`;
   const result = await freshRead(path, accept);
   const status = result.headers['object_status'] ?? result.headers['OBJECT_STATUS'] ?? 'unknown';
   return `InfoObject: ${infoObjectName.toUpperCase()}\nStatus: ${status}\n\n${result.body}`;

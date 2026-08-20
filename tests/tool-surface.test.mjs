@@ -38,20 +38,20 @@ test('the full tool surface is still registered', async () => {
   // This change is additive — a transport and an auth layer. It must not alter the
   // tools stdio users already depend on.
   const names = await listTools();
-  assert.equal(names.length, 90);
+  assert.equal(names.length, 99);
 });
 
 test('every tool is classified, and the split matches the verb audit', async () => {
   const names = await listTools();
   const write = names.filter((n) => requiredScope(n) === 'write');
-  assert.equal(write.length, 49);
-  assert.equal(names.length - write.length, 41);
+  assert.equal(write.length, 54);
+  assert.equal(names.length - write.length, 45);
 });
 
 test('a reader is offered only the read tools', async () => {
   const names = await listTools();
   const offered = filterToolsByScope(names.map((name) => ({ name })), { token: 't', clientId: 'c', scopes: ['read'] });
-  assert.equal(offered.length, 41);
+  assert.equal(offered.length, 45);
   assert.ok(!offered.some((t) => requiredScope(t.name) === 'write'));
 });
 

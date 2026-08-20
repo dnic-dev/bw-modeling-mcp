@@ -1,4 +1,4 @@
-import { BwClient, createClientFromEnv, MEDIA_TYPES } from '../bw-client.js';
+import { BwClient, createClientFromEnv, MEDIA_TYPES, bwSeg } from '../bw-client.js';
 import { QUERY_ACCEPT_LIST, queryWriteMediaType } from './query.js';
 
 export interface CreateVariableArgs {
@@ -150,8 +150,8 @@ export async function bwCreateVariable(
   const timestampIso = new Date().toISOString().replace(/\.\d{3}Z$/, 'Z');
   const descEsc = escapeXml(args.description);
 
-  const basePath = `/sap/bw/modeling/variable/${nameLower}/a`;
-  const enqPath = `/sap/bw/modeling/comp/enq/${nameLower}`;
+  const basePath = `/sap/bw/modeling/variable/${bwSeg(nameLower)}/a`;
+  const enqPath = `/sap/bw/modeling/comp/enq/${bwSeg(nameLower)}`;
 
   // Step 1: compexist — name check + server-generated ELEMUID.
   const existResult = await client.rawGet(

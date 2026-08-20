@@ -1,4 +1,4 @@
-import { BwClient, MEDIA_TYPES } from '../bw-client.js';
+import { BwClient, MEDIA_TYPES, bwSeg, stripInfoAreaSentinel } from '../bw-client.js';
 
 // ── bwMoveObject ──────────────────────────────────────────────────────────────
 
@@ -34,7 +34,7 @@ export async function bwMoveObject(
       </bwModel:moveProperties>
     </atom:content>
     <atom:link
-      href="/sap/bw/modeling/${typeLower}/${nameLower}/m"
+      href="/sap/bw/modeling/${typeLower}/${bwSeg(nameLower)}/m"
       type="application/*"
       rel="self">
     </atom:link>
@@ -129,7 +129,7 @@ export async function bwCreateInfoArea(
  */
 export async function bwGetInfoarea(client: BwClient, name: string): Promise<string> {
   const nameLower = name.toLowerCase();
-  const result = await client.get(`/sap/bw/modeling/area/${nameLower}`, MEDIA_TYPES['area']);
+  const result = await client.get(`/sap/bw/modeling/area/${bwSeg(nameLower)}`, MEDIA_TYPES['area']);
   const body = result.body;
 
   try {
@@ -143,10 +143,14 @@ export async function bwGetInfoarea(client: BwClient, name: string): Promise<str
       parsed['label'] ??
       '';
 
+    // Tree navigation is the one place the placeholder is meaningful, so an object parked
+    // under it reports no parent rather than the placeholder's name.
     const parentArea: string | null =
-      parsed['tlogoProperties']?.['infoArea'] ??
-      parsed['parentInfoArea'] ??
-      null;
+      stripInfoAreaSentinel(
+        parsed['tlogoProperties']?.['infoArea'] ??
+        parsed['parentInfoArea'] ??
+        '',
+      ) || null;
 
     const objectStatus: string =
       parsed['tlogoProperties']?.['adtcore:version'] ??

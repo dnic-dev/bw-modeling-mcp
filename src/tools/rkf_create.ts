@@ -1,4 +1,4 @@
-import { BwClient, createClientFromEnv } from '../bw-client.js';
+import { BwClient, createClientFromEnv, bwSeg } from '../bw-client.js';
 import { rkfAccept, rkfWriteMediaType, QUERY_ACCEPT_LIST, queryWriteMediaType } from './query.js';
 
 /**
@@ -183,8 +183,8 @@ export async function bwCreateRkf(client: BwClient, args: CreateRkfArgs): Promis
   const timestampIso = new Date().toISOString().replace(/\.\d{3}Z$/, 'Z');
   const descEsc = escapeXml(args.description);
 
-  const basePath = `/sap/bw/modeling/rkf/${nameLower}/a`;
-  const enqPath = `/sap/bw/modeling/comp/enq/${nameLower}`;
+  const basePath = `/sap/bw/modeling/rkf/${bwSeg(nameLower)}/a`;
+  const enqPath = `/sap/bw/modeling/comp/enq/${bwSeg(nameLower)}`;
   const rkfMedia = rkfWriteMediaType();
 
   // ── Phase A: create the skeleton (session A + a fresh POST session) ──────────

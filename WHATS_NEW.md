@@ -8,6 +8,39 @@ For the complete, structured change history see [CHANGELOG.md](CHANGELOG.md).
 
 ---
 
+## What's New — v1.3.0
+
+**🚀 CompositeProvider authoring**
+
+- **`bw_create_composite_provider`** — a Union or Join node with its source providers attached, or a copy of an existing CompositeProvider
+- **`bw_update_composite_provider`** grew from two actions to eight: `add_input`, `remove_input`, `update_mapping`, `update_join`, `remove_join` and `update_settings` alongside the existing `add_field` / `remove_field`
+- Field mappings are resolved from each source's own metadata, so field-based and InfoObject-based providers both work as sources
+- Join conditions are set per input pair — which is how BW models an N-way join: one condition per pair
+
+Verified against a BW/4HANA system all the way to an **activated** CompositeProvider. That distinction matters here: the backend accepts a model it will later refuse to activate, so a successful save proves nothing.
+
+This began as a contribution — the traced payloads come from [#20](https://github.com/dnic-dev/bw-modeling-mcp/pull/20) by [@JosephManu12](https://github.com/JosephManu12), ported onto the current code base and extended.
+
+**📊 Aggregation levels**
+
+- **`bw_create_aggregation_level`** and **`bw_update_aggregation_level`** — built on an aDSO or on a CompositeProvider, over all fields of the provider or a chosen subset
+- Reading planning objects was already possible; the aggregation level is the first one the server can create
+
+**🎛️ Query variables**
+
+- **`bw_create_variable`** covers all four processing types — user entry, **customer exit**, authorization and replacement path — for characteristic values, hierarchies and hierarchy nodes, with the usual selection and entry-requirement options
+
+**🔧 Minor changes and fixes**
+
+- Locks are released by the session that holds them — previously `?action=unlock` from another session answered HTTP 200 without releasing anything, leaving objects locked until the session timed out or SM12 was used ([#13](https://github.com/dnic-dev/bw-modeling-mcp/issues/13))
+- `bw_unlock` accepts `hcpr` and `alvl`
+- `adtcore:masterSystem` comes from the system's logical system name instead of the URL host, which produced `LOCALHOST` behind a destination ([#13](https://github.com/dnic-dev/bw-modeling-mcp/issues/13))
+- The CompositeProvider read uses a fresh session, so it no longer serves a stale model buffer right after a write
+- Labels are XML-escaped on write and decoded on read — an `&` used to fail the request with HTTP 500
+- Key figures are detected in Union nodes, which carry no dimension to read them from
+
+---
+
 ## What's New — v1.2.0
 
 **Central hosting on SAP BTP Cloud Foundry with XSUAA OAuth and role-based access control. Game-changer for enterprise deployments.**

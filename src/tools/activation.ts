@@ -1,4 +1,4 @@
-import { BwClient, MEDIA_TYPES, createClientFromEnv } from '../bw-client.js';
+import { BwClient, MEDIA_TYPES, createClientFromEnv, bwSeg } from '../bw-client.js';
 
 /**
  * Parse all <atom:title> entries from an activation/atom feed response.
@@ -89,7 +89,7 @@ export async function bwActivate(
   if (typeLower === 'trfn' || typeLower === 'dtpa') {
     const mediaKey = typeLower as keyof typeof MEDIA_TYPES;
     await activationClient.get(
-      `/sap/bw/modeling/${typeLower}/${objectName.toLowerCase()}/m?forceCacheUpdate=true`,
+      `/sap/bw/modeling/${typeLower}/${bwSeg(objectName)}/m?forceCacheUpdate=true`,
       MEDIA_TYPES[mediaKey]
     );
   }

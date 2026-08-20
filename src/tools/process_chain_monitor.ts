@@ -13,9 +13,19 @@ function buildODataUrl(service: string, entitySet: string, opts: {
   return `/sap/opu/odata/sap/${service}/${entitySet}?` + params.join('&');
 }
 
-function odataDateToIso(v: string | undefined): string | undefined {
+/**
+ * Convert an OData V2 verbose date to ISO 8601.
+ *
+ * The offset suffix is optional and must be tolerated: these services return the day fields
+ * as `/Date(<ms>)/` but every timestamp field as `/Date(<ms>+0000)/`, and without the suffix
+ * in the pattern each timestamp fell through unparsed and reached the output as the raw
+ * `/Date(…)/` string. The leading number is always epoch milliseconds in UTC — the suffix
+ * only states which local time the source meant, so it is ignored here and the result is UTC.
+ * Its digit count is not fixed (the spec counts minutes), hence `\d+` rather than `\d{4}`.
+ */
+export function odataDateToIso(v: string | undefined): string | undefined {
   if (!v) return undefined;
-  const m = /\/Date\((-?\d+)\)\//.exec(v);
+  const m = /\/Date\((-?\d+)(?:[+-]\d+)?\)\//.exec(v);
   return m ? new Date(Number(m[1])).toISOString() : v;
 }
 

@@ -49,40 +49,43 @@ A two-part blog series about this project (both available in German and English)
 
 ---
 
-## 🆕 What's New — v1.3.0
+## 🆕 What's New — v1.4.0
 
-**🚀 CompositeProvider authoring**
+**🎯 SAP BW 7.5 on HANA**
 
-- **`bw_create_composite_provider`** — a Union or Join node with its source providers attached, or a copy of an existing CompositeProvider
-- **`bw_update_composite_provider`** grew from two actions to eight: `add_input`, `remove_input`, `update_mapping`, `update_join`, `remove_join` and `update_settings` alongside the existing `add_field` / `remove_field`
-- Field mappings are resolved from each source's own metadata, so field-based and InfoObject-based providers both work as sources
-- Join conditions are set per input pair — which is how BW models an N-way join: one condition per pair
+Until now almost every call against a BW 7.5 system failed with HTTP 406, because the 7.5 REST framework looks the `Accept` header up case-sensitively. A small ABAP **post-exit** neutralises that — an enhancement, no modification, no access key. With it in place **every REST endpoint that exists on 7.5 is reachable**.
 
-Verified against a BW/4HANA system all the way to an **activated** CompositeProvider. That distinction matters here: the backend accepts a model it will later refuse to activate, so a successful save proves nothing.
+- **📘 [docs/BW75-SUPPORT.md](docs/BW75-SUPPORT.md)** — root cause, the ABAP code, the SE24 setup steps, and an honest list of what BW 7.5 ships no REST resource for at all
+- **`bw_system_profile`** — tells you on connect what the system is, which endpoint groups it publishes, and whether the preconditions hold. Start here on an unknown system, or when calls fail with 404 or 406
+- **`bw_read_metadata_tables`** — reads straight from the metadata tables where there is no REST resource: transformations (including routine source), DTPs, and the classic providers `ODSO`, `CUBE` and `MPRO`
 
-This began as a contribution — the traced payloads come from [#20](https://github.com/dnic-dev/bw-modeling-mcp/pull/20) by [@JosephManu12](https://github.com/JosephManu12), ported onto the current code base and extended.
+**🔗 Process chains, edited in place**
 
-**📊 Aggregation levels**
+- **`bw_add_process_chain_edge`**, **`bw_remove_process_chain_edge`**, **`bw_remove_process_chain_step`** — change one dependency or one step instead of rewriting the whole model. Removing a step takes its edges and its inline variant with it and bridges the gap, so the strand stays connected
+- Steps are addressed by name — a DTP, an aDSO, the program of an ABAP step, a collector type, or `#<index>`. An ambiguous name is rejected with the candidates listed rather than resolved by guesswork
+- `before` / `after` now inserts a DTP or ABAP block **in series**: the target's edges are rerouted through the block, so it really runs ahead of or behind that step
 
-- **`bw_create_aggregation_level`** and **`bw_update_aggregation_level`** — built on an aDSO or on a CompositeProvider, over all fields of the provider or a chosen subset
-- Reading planning objects was already possible; the aggregation level is the first one the server can create
+**🧱 Remodeling monitor**
 
-**🎛️ Query variables**
+- **`bw_list_remodeling_requests`**, **`bw_get_remodeling_request`**, **`bw_run_remodeling`** — monitor, diagnose and run remodeling requests: the five processing steps with their status and the application log per step, plus execute, restart, reset and reset-step. Running a rule restructures the InfoProvider and converts its data, so this is a write with data impact
 
-- **`bw_create_variable`** covers all four processing types — user entry, **customer exit**, authorization and replacement path — for characteristic values, hierarchies and hierarchy nodes, with the usual selection and entry-requirement options
+**📐 Query characteristic properties**
+
+- **`bw_update_query_characteristic`** — display of result rows, display as key/text, access type for result values, sorting, cumulation, display level, and the hierarchy assignment with its display options. `"*"` applies one set of properties to every characteristic in the layout
 
 **🔧 Minor changes and fixes**
 
-- Locks are released by the session that holds them — previously `?action=unlock` from another session answered HTTP 200 without releasing anything, leaving objects locked until the session timed out or SM12 was used ([#13](https://github.com/dnic-dev/bw-modeling-mcp/issues/13))
-- `bw_unlock` accepts `hcpr` and `alvl`
-- `adtcore:masterSystem` comes from the system's logical system name instead of the URL host, which produced `LOCALHOST` behind a destination ([#13](https://github.com/dnic-dev/bw-modeling-mcp/issues/13))
-- The CompositeProvider read uses a fresh session, so it no longer serves a stale model buffer right after a write
-- Labels are XML-escaped on write and decoded on read — an `&` used to fail the request with HTTP 500
-- Key figures are detected in Union nodes, which carry no dimension to read them from
+- DTP filters take the full range vocabulary — sign `I`/`E` with `Equal`, `Between`, `ContainsPattern` and the comparison operators — validated against the operators the field itself publishes
+- The CSRF token fetch is retried once on a dead keep-alive socket, which used to abort a run of process-chain writes mid-sequence
+- Process-chain run timestamps are parsed again ([#15](https://github.com/dnic-dev/bw-modeling-mcp/issues/15))
+- `bw_get_request` works for requests without a process log ([#16](https://github.com/dnic-dev/bw-modeling-mcp/issues/16))
+- A failed transformation model serialization is reported as such instead of dumped ([#17](https://github.com/dnic-dev/bw-modeling-mcp/issues/17))
+- `NODESNOTCONNECTED` is no longer reported as an InfoArea ([#18](https://github.com/dnic-dev/bw-modeling-mcp/issues/18))
+- Namespaced object names such as `/NAMESPACE/OBJECT_NAME` are addressed correctly in every URL ([#19](https://github.com/dnic-dev/bw-modeling-mcp/issues/19))
 
 ---
 
-**Earlier releases** — the "What's New" notes for v1.2.0 and older are archived in [WHATS_NEW.md](WHATS_NEW.md); the full structured history is in [CHANGELOG.md](CHANGELOG.md).
+**Earlier releases** — the "What's New" notes for v1.3.0 and older are archived in [WHATS_NEW.md](WHATS_NEW.md); the full structured history is in [CHANGELOG.md](CHANGELOG.md).
 
 ---
 
@@ -153,6 +156,7 @@ This began as a contribution — the traced payloads come from [#20](https://git
 - Update key figures — basic key figures, references to global RKFs/CKFs, and local formula members with exception aggregation and display properties
 - Build local formula members from the full BW analytic-engine operator catalog — arithmetic, percentage, data, mathematical, trigonometric, and boolean operators plus ternary `IF`; operand counts are validated before saving
 - Update query settings (properties)
+- Update the display and access properties of each characteristic in the layout — display of result rows, display as key/text, access type for result values, sorting, cumulation, display level, and the hierarchy assignment with its display options; in bulk across every characteristic with `"*"`
 - Record query edits on a transport request for queries on a transportable package
 - Delete a query
 - Create characteristic variables — user entry, customer exit, authorization or replacement path; as characteristic value, hierarchy or hierarchy nodes; interval, single value, several single values or comparison operators
@@ -211,9 +215,10 @@ This began as a contribution — the traced payloads come from [#20](https://git
 - Automatic variant detail per step: ABAP program and selection variant, TRIGGER scheduling parameters, ADSOACT/ADSOREM aDSO targets and cleanup settings, PLSWITCHL/P target aDSO, DECISION branching formulas — all embedded inline in a single tool call
 - Recursive sub-chain expansion: CHAIN-type steps reference other Process Chains — call `bw_get_process_chain` again on any referenced chain name to expand the full hierarchy
 - Generic process variant reader: covers all 93 BW/4HANA process types including custom Z-types; unknown types return oDetail as raw JSON
-- Create a Process Chain from a step and edge list — supported types: `DTP_LOAD`, `ADSOACT`, `ADSOREM` (DSO request cleanup), `CHAIN`, collectors `AND` / `OR` / `XOR`
+- Create a Process Chain from a step and edge list — supported types: `DTP_LOAD`, `ADSOACT`, `ADSOREM` (DSO request cleanup), `ABAP` (execute an ABAP program, optionally with an SE38 selection variant), `CHAIN`, `DECISION`, collectors `AND` / `OR` / `XOR`
 - Replace the step model of an existing chain; activate a chain
-- Incrementally edit an existing chain — append a DTP load step (optionally with its own DSO activation), swap one DTP load variant for another, add on-error (negative) links mirroring the existing success links, add an "Execute ABAP Program" step (optionally with an SE38 variant) positioned before/after any step
+- Incrementally edit an existing chain — insert a DTP load step (optionally with its own DSO activation) or an "Execute ABAP Program" step **in series** before or after any existing step, swap one DTP load variant for another, add on-error (negative) links mirroring the existing success links
+- Repair the wiring of an existing chain — add or remove a single dependency between two steps, or remove a step altogether with the gap bridged automatically
 - Create a DECISION process variant for use as a branch/decision step
 - Monitor execution runs: history with status and timestamps, step-level and message-level run detail, last status per chain across the entire system
 
@@ -264,14 +269,15 @@ The BW MCP server handles the BW modeling structure — creating the Transformat
 |---|---|
 | SAP BW/4HANA (all versions) | ✅ Full support |
 | SAP BW Bridge (SAP BTP ABAP stack) | ✅ Via cookie authentication (`BW_COOKIE_FILE`) |
+| SAP BW on HANA (7.5) | ⚠️ Modeling reads after a small ABAP enhancement — see [BW 7.5 Support](docs/BW75-SUPPORT.md) |
 
-<p><em><sub>SAP BW on HANA (7.5) is not supported. While individual tools may work, most HTTP communications cannot reliably pass through the server-side version negotiation in BW 7.5, causing most tools to fail with HTTP 406 errors.</sub></em></p>
+<p><em><sub>On SAP BW 7.5 the REST framework looks up the <code>Accept</code> header case-sensitively while the kernel delivers header names in lower case, so almost every call fails with HTTP 406. A ~20-line post-exit enhancement (no modification, no access key) resolves this and makes all REST endpoints that exist on 7.5 reachable. Objects for which BW 7.5 ships no REST resource at all — transformations, DTPs, process chains, classic DSOs, InfoCubes — remain unavailable; Eclipse opens the embedded SAP GUI for those as well. Details, ABAP code and setup steps: <a href="docs/BW75-SUPPORT.md">docs/BW75-SUPPORT.md</a>.</sub></em></p>
 
 ---
 
 ## Requirements
 
-- SAP BW/4HANA system with the internal SAP APIs enabled
+- SAP BW/4HANA system with the internal SAP APIs enabled (SAP BW 7.5 works for modeling reads once the enhancement in [docs/BW75-SUPPORT.md](docs/BW75-SUPPORT.md) is in place)
 - Node.js 18 or later
 - An MCP-compatible AI client (Claude Desktop, Claude Code, etc.)
 
@@ -364,6 +370,12 @@ Search BW objects by name or description. Supports wildcards (`*`). Optionally f
 Find all objects that reference a given BW object (where-used analysis). Use this to find Transformations and DTPs connected to an aDSO, or to find the process chain(s) a DTP belongs to (`object_type=DTPA`).
 
 For DataSources (`object_type=RSDS`): pass `source_system` — the correctly space-padded objectName is built automatically.
+
+### `bw_system_profile` _(Read only)_
+Report what the connected BW system is and which tool groups work on it. Distinguishes SAP BW/4HANA from classic SAP BW via the system's own `b4hanamode` flag, lists which REST endpoint groups the system publishes, and verifies two preconditions: whether `Accept`-header handling works (a broken one makes almost every call fail with HTTP 406 on BW 7.5 — see [docs/BW75-SUPPORT.md](docs/BW75-SUPPORT.md)) and whether the ADT DataPreview service is reachable for this user. Call this first when connecting to an unknown system, or when tools fail with 404 or 406.
+
+### `bw_read_metadata_tables` _(Read only)_
+Read an object definition directly from its metadata tables, via the ADT DataPreview service. Read-only fallback for the object types a system publishes no REST resource for — on classic SAP BW typically transformations and DTPs, and on every release the classic providers. Supported `object_type`: `TRFN` (including start, end, expert and field routine source code), `DTPA`, `ODSO`, `CUBE` and `MPRO`. Requires ADT authorization for the calling user; prefer `bw_get_transformation` where the REST endpoint exists.
 
 ### `bw_get_adso`
 Read the full structure of an aDSO — fields, key fields, settings, version state.
@@ -495,6 +507,9 @@ Edit the query key figures — add basic key figures, references to global RKFs/
 ### `bw_update_query_settings`
 Edit query properties (settings). Accepts an optional `transport` request number.
 
+### `bw_update_query_characteristic`
+Set the per-characteristic display and access properties of the rows, columns, and free-characteristics areas — display of result rows, display as key/text (with short/medium/long text), access type for result values (read mode), sorting, cumulation, display level, and the hierarchy assignment with its display options (expand-to-level, child node position, postable node values, single-child suppression, hierarchy sorting). Pass `"*"` as `infoobject` to apply one set of properties to every characteristic in the layout; every property also accepts `"default"` to drop the explicit value. Accepts an optional `transport` request number.
+
 ### `bw_get_process_chain` _(Read only)_
 Read a Process Chain (RSPC) definition — header metadata, scheduling and monitoring settings, all steps with type, variant, last execution status, conditional dependencies with DECISION branch labels, and automatically embedded variant configuration per step. Set `include_variant_details=false` for a fast structural overview. Output format: `text` (default) or `raw` (full JSON).
 
@@ -502,16 +517,16 @@ Read a Process Chain (RSPC) definition — header metadata, scheduling and monit
 Read the detail configuration of a single Process Chain step variant. Generic across all process types — oDetail rendered as indented JSON. Use process_type and variant_name from `bw_get_process_chain` output.
 
 ### `bw_create_process_chain`
-Create a Process Chain (RSPC) from a step and edge list — builds the model, creates a trigger-only skeleton, then updates it with the full model in one operation; optionally activates. Supported step types: `DTP_LOAD`, `ADSOACT`, `ADSOREM` (DSO request cleanup), `CHAIN` (local sub-chain start), collectors `AND` / `OR` / `XOR`.
+Create a Process Chain (RSPC) from a step and edge list — builds the model, creates a trigger-only skeleton, then updates it with the full model in one operation; optionally activates. Supported step types: `DTP_LOAD`, `ADSOACT`, `ADSOREM` (DSO request cleanup), `ABAP` (execute an ABAP program, optionally with an SE38 selection variant), `CHAIN` (local sub-chain start), `DECISION`, collectors `AND` / `OR` / `XOR`.
 
 ### `bw_update_process_chain`
-Replace the step model (nodes and edges) of an existing Process Chain, preserving the existing trigger node and scheduling. Optionally overrides description and InfoArea.
+Replace the step model (nodes and edges) of an existing Process Chain, preserving the existing trigger node and scheduling. Optionally overrides description and InfoArea. Replaces the whole step model, so every step that should survive must be listed — for a small change to a large chain prefer the in-place tools below.
 
 ### `bw_activate_process_chain`
 Activate an existing Process Chain. Returns the top-level activation message, severity, and full log.
 
 ### `bw_append_process_chain_dtp`
-Append one DTP load step (optionally followed by its own DSO activation step) to an existing Process Chain, wiring it after a given predecessor step.
+Add one DTP load step (optionally followed by its own DSO activation step) to an existing Process Chain. `before` / `after` place the whole block **in series** relative to an existing step — the target's incoming (or outgoing) edges are rerouted through the block, so the new steps really run ahead of (or behind) it. Without them the block is only appended behind the strand end and runs in parallel to the target's existing successors.
 
 ### `bw_swap_process_chain_dtp`
 Swap one DTP load variant for another in an existing Process Chain, keeping the surrounding edges intact.
@@ -524,6 +539,17 @@ Create a DECISION process variant (a standalone TLOGO object) for use as a branc
 
 ### `bw_add_process_chain_program`
 Add an "Execute ABAP Program" step (RSPC process type ABAP) to an existing Process Chain, optionally with a named SE38 selection variant. In-place edit — the program call is stored as an inline process variant inside the chain model (no separate variant object). Positioning via `before` / `after` / `predecessor` (default: strand end closest to the trigger); idempotent (a matching ABAP step is skipped), with ETag concurrency and transport handling.
+
+### `bw_add_process_chain_edge`
+Add one dependency between two existing steps of a Process Chain. Edge condition defaults to neutral out of the trigger or a collector, positive elsewhere; `sub_status` addresses a DECISION branch. An "always continue" dependency is two edges (positive plus negative), so call it twice. Idempotent — an identical edge is skipped without writing.
+
+### `bw_remove_process_chain_edge`
+Remove the dependency between two existing steps. By default both halves of an "always continue" link go; `status` narrows the removal to one of them.
+
+### `bw_remove_process_chain_step`
+Remove one step from a Process Chain together with its edges and its inline process variant. By default the gap is bridged — every predecessor takes over every successor, keeping the condition of the edge that ran into the removed step — so the strand stays connected. The trigger cannot be removed.
+
+Steps are addressed by name in all three tools: a DTP or process-variant name, an aDSO held by an `ADSOACT`/`ADSOREM` step, the program of an `ABAP` step (or `PROGRAM/VARIANT`), a collector type, or `#<index>` using the step numbers from `bw_get_process_chain`. An ambiguous name is rejected with the candidates listed rather than resolved by guesswork.
 
 ### `bw_preview_datasource` _(Read only)_
 Fetch a live data preview from a DataSource. Resolves field names automatically and renders a formatted table. Parameters: `datasource_name`, `source_system`, `records` (default 20).
@@ -602,6 +628,15 @@ List load requests for a target InfoProvider via the BW/4HANA manage API — sta
 ### `bw_get_request` _(Read only)_
 Full status analysis of one load request in a single call — request header, DTP information (start/finish/duration), process step chain, and message log. Output format: `text` (default) or `raw` (parsed JSON of all four payloads).
 
+### `bw_list_remodeling_requests` _(Read only)_
+List remodeling requests from the remodeling monitor — InfoProvider, rule, decoded status, last run, and creator. Remodeling restructures an existing InfoProvider (adding, deleting or reassigning a field) and converts the data it already holds. Filter by `info_provider` and by status (`N` not scheduled, `S` scheduled, `R` running, `C` completed, `E` error).
+
+### `bw_get_remodeling_request` _(Read only)_
+Full status of one remodeling request — header, the five processing steps (`CHECK`, `SAVE`, `CONVERT`, `ACTIVATE`, `CLEANUP`) with their individual status, and the application log messages grouped per step. The request is addressed by `info_provider` plus `remodeling_rule`; the internal request GUID is resolved automatically. This is the tool to diagnose a failed remodeling.
+
+### `bw_run_remodeling`
+Start, restart or reset a remodeling request — `action` = `execute` \ `restart` \ `reset` \ `reset_step`. `start` accepts `immediate` (default) or an ISO 8601 timestamp to schedule the background job. Runs asynchronously; monitor completion with `bw_get_remodeling_request`. Note: executing a rule restructures the InfoProvider and converts its existing data — this is not a plain reload and cannot simply be undone. Remodeling rules themselves are created in the BW Modeling Tools; this tool family monitors and runs the resulting requests.
+
 ### `bw_activate_request`
 Activate loaded data (DSO request activation) — move a finished load from the inbound table into the active data table and change log. This is the runtime request activation (BW/4HANA manage API), distinct from the modeling-object activation done by `bw_activate`; it applies only to aDSOs that have an activation step and runs asynchronously.
 
@@ -636,7 +671,7 @@ See [ARCHITECTURE.md](ARCHITECTURE.md) for the full technical architecture and c
 ## Roadmap
 
 - **Tool consolidation** — collapse today's one-tool-per-operation surface into a small set of verb-based tools (`bw_read`, `bw_find`, `bw_write_*`, …) that cover the same operations. Same functionality, a single consistent `name` parameter across all reads, and each new operation then costs one enum value instead of a whole new tool — so coverage keeps growing while the surface stays within MCP clients' tool limits.
-- **More modeling & Cockpit coverage** — integrate and complete further BW modeling and BW/4HANA Cockpit operations, e.g. **CompositeProvider create/modify** (read already supported), Open ODS Views, additional runtime and monitoring operations, and further modeling objects.
+- **More modeling & Cockpit coverage** — integrate and complete further BW modeling and BW/4HANA Cockpit operations, e.g. Open ODS Views, further planning objects, additional runtime and monitoring operations, and further modeling objects.
 
 ---
 

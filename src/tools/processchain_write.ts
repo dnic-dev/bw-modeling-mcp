@@ -1,4 +1,4 @@
-import { BwClient } from '../bw-client.js';
+import { BwClient, bwSeg } from '../bw-client.js';
 
 const BASE = '/sap/bc/http/sap/bw4/v1/modeling/processchains';
 const DECISION_VARIANTS_BASE = '/sap/bc/http/sap/bw4/v1/modeling/processtypes/decision/variants';
@@ -6,6 +6,13 @@ const VALIDATEOBJECT_PATH = '/sap/bc/http/sap/bw4/v1/modeling/transports/validat
 const JSON_CT = 'application/json';
 
 const COLLECTORS = new Set(['AND', 'OR', 'XOR']);
+
+// Collector node types that RSPC may hold (AND / OR / EXOR); XOR kept as a synonym.
+const COLLECTOR_TYPES = new Set(['AND', 'OR', 'EXOR', 'XOR']);
+
+// Step types whose configuration is stored INLINE in the chain model (as an entry in
+// aInlineVariant) rather than referenced as a separate variant object.
+const INLINE_STEP_TYPES = new Set(['ADSOACT', 'ADSOREM', 'ABAP']);
 
 const TRIGGER_SCHEDULE_DETAIL = {
   startdttyp: 'I',
@@ -96,12 +103,45 @@ interface StepGeneric {
   description?: string;
 }
 
-export type Step = StepDtpLoad | StepAdsoAct | StepAdsoRem | StepCollector | StepDecision | StepGeneric;
+// An "Execute ABAP Program" call. The program is stored as an inline process variant
+// inside the chain model — there is no separate variant object to create first.
+export interface AbapProgramSpec {
+  // ABAP program / report to execute.
+  program: string;
+  // Optional ABAP report (SE38) selection variant name.
+  variant?: string;
+  // Step description (sVariantDescription). Cosmetic.
+  description?: string;
+  // Cosmetic value-help enrichment; the server re-derives these when omitted.
+  programPackage?: string;
+  programDescription?: string;
+  variantDescription?: string;
+  // Call mode. true (default) → X_SYNCHRON.
+  synchronous?: boolean;
+  // Call location. true (default) → X_LOCAL (run on this system).
+  local?: boolean;
+}
+
+interface StepAbap extends AbapProgramSpec {
+  id: string;
+  type: 'ABAP';
+}
+
+export type Step =
+  | StepDtpLoad
+  | StepAdsoAct
+  | StepAdsoRem
+  | StepCollector
+  | StepDecision
+  | StepAbap
+  | StepGeneric;
+
+export type EdgeStatus = 'neutral' | 'positive' | 'negative';
 
 export interface EdgeDef {
   from: string;
   to: string;
-  status?: 'neutral' | 'positive' | 'negative';
+  status?: EdgeStatus;
   // Branch condition for edges leaving a DECISION node: the branch's EVENTNO
   // ("01" for the first/THEN branch, "02" for the second/ELSE branch). Normal
   // (non-branch) edges use "00" (the default when omitted).
@@ -198,12 +238,62 @@ export interface AppendProcessChainDtpParams {
   dtp: string;
   // Optional aDSO to activate in an ADSOACT step appended right after the DTP.
   adsoact?: string;
-  // Node to append behind: a DTP/variant name, an aDSO held by an ADSOACT node, or
-  // the literal "strand_end_auto" (default).
+  // Insert the whole block (DTP, plus the optional ADSOACT) IN SERIES ahead of this node:
+  // the target's incoming edges are rerouted into the block, then the block links to the
+  // target. This is what makes a DTP placeable in the middle of an existing chain.
+  before?: string;
+  // Insert the block IN SERIES behind this node: the target's outgoing edges are rerouted
+  // to leave from the end of the block, so the block runs between the target and its
+  // former successors.
+  after?: string;
+  // Used only when neither before nor after is given. Node to append behind: a DTP/variant
+  // name, an aDSO held by an ADSOACT node, or the literal "strand_end_auto" (default).
+  // NOTE this only APPENDS — the target keeps its existing successors, so the block ends
+  // up parallel to them. Use before/after to place a block in series.
   predecessor?: string;
   // "both" (default): add a positive and a negative edge per link ("always continue");
   // "success_only": add only the positive edge.
   edgeMode?: 'both' | 'success_only';
+  activate?: boolean;
+  transportRequest?: string;
+}
+
+export interface AddProcessChainEdgeParams {
+  name: string;
+  // Source node reference (see resolveChainNodeRef for the accepted forms).
+  from: string;
+  // Target node reference.
+  to: string;
+  // Edge condition. Defaults to neutral out of the TRIGGER or a collector, positive otherwise.
+  status?: EdgeStatus;
+  // Branch condition for an edge leaving a DECISION node: the branch's EVENTNO
+  // ("01" = THEN, "02" = ELSE). Defaults to "00" (a normal, non-branch edge).
+  subStatus?: string;
+  activate?: boolean;
+  transportRequest?: string;
+}
+
+export interface RemoveProcessChainEdgeParams {
+  name: string;
+  from: string;
+  to: string;
+  // Restrict the removal to edges with this condition. Omit to remove every edge between
+  // the two nodes (both the on-success and the on-error edge of an "always continue" link).
+  status?: EdgeStatus;
+  // Restrict the removal to this branch condition. Omit to ignore the branch condition.
+  subStatus?: string;
+  activate?: boolean;
+  transportRequest?: string;
+}
+
+export interface RemoveProcessChainStepParams {
+  name: string;
+  // Node reference of the step to remove.
+  step: string;
+  // true (default): bridge the gap — every predecessor of the removed step takes over
+  // every successor, so the strand stays connected. false: drop the step's edges without
+  // bridging, which leaves its successors as a strand no longer reachable from the start.
+  reconnect?: boolean;
   activate?: boolean;
   transportRequest?: string;
 }
@@ -431,6 +521,11 @@ function buildNode(step: Step, inlineKeyMap: Map<string, string>): object {
       iAutoRepeatWaitDuration: 0,
     };
   }
+  if (step.type === 'ABAP') {
+    // The program call lives in an inline variant, so the node only carries the key that
+    // buildModelParts assigned; buildAbapProgramVariant builds both halves.
+    return buildAbapProgramVariant(inlineKeyMap.get(step.id)!, step as StepAbap).node;
+  }
   if (COLLECTORS.has(step.type)) {
     return { sProcessType: step.type };
   }
@@ -587,6 +682,285 @@ function parseActivateResponse(body: string): {
   };
 }
 
+// ── Chain topology helpers ─────────────────────────────────────────────────────
+//
+// Pure functions over the server's own chain model ({ aNode, aEdge, aInlineVariant }),
+// shared by every in-place edit tool. Edges are INDEX-based (iNodeIndexFrom /
+// iNodeIndexTo point into aNode), which is what makes node removal delicate: dropping a
+// node shifts every later index, so all surviving edge endpoints have to follow.
+
+// Human-readable label for a chain node, used in results and error messages so a caller
+// can tell two same-typed nodes apart without re-reading the chain.
+export function chainNodeLabel(model: any, index: number): string {
+  const node = (model.aNode ?? [])[index];
+  if (!node) return `#${index}`;
+  const type = String(node.sProcessType ?? '?').toUpperCase();
+  const detail = (model.aInlineVariant ?? []).find(
+    (v: any) => v.sProcessVariant === node.sProcessVariant
+  )?.oDetail;
+  if (type === 'ABAP') {
+    const prog = detail?.PROGRAM?.[0]?.key ?? '';
+    const va = detail?.VARIANT?.[0]?.key ?? '';
+    return `#${index} ABAP ${prog}${va ? `/${va}` : ''}`.trimEnd();
+  }
+  if (type === 'ADSOACT' || type === 'ADSOREM') {
+    const ds = (detail?.DATASTORES ?? []).map((d: any) => d.DATASTORE).filter(Boolean).join(',');
+    return `#${index} ${type}${ds ? ` ${ds}` : ''}`;
+  }
+  if (type === 'TRIGGER' || COLLECTOR_TYPES.has(type)) return `#${index} ${type}`;
+  return `#${index} ${type} ${node.sProcessVariant ?? ''}`.trimEnd();
+}
+
+// The (uppercase) names a node answers to when referenced by a tool parameter.
+function chainNodeAliases(model: any, index: number): string[] {
+  const node = (model.aNode ?? [])[index];
+  if (!node) return [];
+  const type = String(node.sProcessType ?? '').toUpperCase();
+  const detail = (model.aInlineVariant ?? []).find(
+    (v: any) => v.sProcessVariant === node.sProcessVariant
+  )?.oDetail;
+  const aliases: string[] = [];
+  if (node.sProcessVariant) aliases.push(String(node.sProcessVariant).toUpperCase());
+  if (type === 'TRIGGER' || COLLECTOR_TYPES.has(type)) aliases.push(type);
+  if (type === 'ADSOACT' || type === 'ADSOREM') {
+    for (const d of detail?.DATASTORES ?? []) {
+      if (d.DATASTORE) aliases.push(String(d.DATASTORE).toUpperCase());
+    }
+  }
+  if (type === 'ABAP') {
+    const prog = detail?.PROGRAM?.[0]?.key;
+    const va = detail?.VARIANT?.[0]?.key;
+    if (prog) {
+      aliases.push(String(prog).toUpperCase());
+      // A program used more than once in the chain is only unambiguous together with its
+      // selection variant, so accept the "PROGRAM/VARIANT" form too.
+      if (va) aliases.push(`${String(prog).toUpperCase()}/${String(va).toUpperCase()}`);
+    }
+  }
+  return aliases;
+}
+
+// Resolve a caller-supplied node reference to a node index. Accepted forms:
+//   "#3"                    → node index 3 (always unambiguous; indices match the
+//                             "[n]" numbers printed by bw_get_process_chain)
+//   "TRIGGER" / "OR" / ...  → the trigger, or a collector by its type
+//   "DTP_NAME"              → a node's own process variant
+//   "ADSO_NAME"             → an aDSO held by an ADSOACT / ADSOREM node
+//   "REPORT_NAME"           → the program of an ABAP step
+//   "REPORT_NAME/VARIANT"   → that program with a specific SE38 variant
+// Throws with the full node list when nothing matches, and names the candidates when the
+// reference is ambiguous — an ambiguous reference must never silently pick one node.
+export function resolveChainNodeRef(model: any, ref: string, role = 'node'): number {
+  const nodes: any[] = model.aNode ?? [];
+  const raw = String(ref ?? '').trim();
+  if (!raw) throw new Error(`Empty ${role} reference.`);
+
+  const nodeList = () => nodes.map((_n, i) => chainNodeLabel(model, i)).join('; ');
+
+  if (/^#\d+$/.test(raw)) {
+    const i = Number(raw.slice(1));
+    if (!nodes[i]) {
+      throw new Error(`${role} reference '${raw}': no node at that index (chain has ${nodes.length} nodes: ${nodeList()}).`);
+    }
+    return i;
+  }
+
+  const u = raw.toUpperCase();
+  const hits = nodes.map((_n, i) => i).filter((i) => chainNodeAliases(model, i).includes(u));
+  if (hits.length === 1) return hits[0];
+  if (hits.length > 1) {
+    throw new Error(
+      `${role} reference '${ref}' is ambiguous — it matches ${hits.map((i) => chainNodeLabel(model, i)).join(', ')}. ` +
+      `Pass "#<index>" to pick one.`
+    );
+  }
+  throw new Error(`${role} reference '${ref}' matches no node in the chain. Nodes: ${nodeList()}.`);
+}
+
+// Edge condition a new link out of `fromIdx` gets when the caller picks none: neutral out
+// of the TRIGGER or a collector (neither can succeed or fail), positive everywhere else.
+export function defaultStatusForNode(model: any, fromIdx: number): EdgeStatus {
+  const type = String((model.aNode ?? [])[fromIdx]?.sProcessType ?? '').toUpperCase();
+  return type === 'TRIGGER' || COLLECTOR_TYPES.has(type) ? 'neutral' : 'positive';
+}
+
+// Add one edge unless an identical one already exists. Returns the edge as stored, or
+// null when it was already present (so the caller can report an idempotent no-op).
+export function addChainEdge(
+  model: any,
+  fromIdx: number,
+  toIdx: number,
+  status?: EdgeStatus,
+  subStatus = '00'
+): { iNodeIndexFrom: number; iNodeIndexTo: number; sStatus: string; sSubStatus: string } | null {
+  const edges: any[] = model.aEdge ?? (model.aEdge = []);
+  if (fromIdx === toIdx) {
+    throw new Error(`Cannot link ${chainNodeLabel(model, fromIdx)} to itself.`);
+  }
+  // A branch edge (a sub-status other than "00") is always positive — the branch condition
+  // itself already decides, so an on-error branch edge has no meaning in RSPC.
+  const effective = status ?? (subStatus !== '00' ? 'positive' : defaultStatusForNode(model, fromIdx));
+  const exists = edges.some(
+    (e) =>
+      e.iNodeIndexFrom === fromIdx &&
+      e.iNodeIndexTo === toIdx &&
+      e.sStatus === effective &&
+      (e.sSubStatus ?? '00') === subStatus
+  );
+  if (exists) return null;
+  const edge = { iNodeIndexFrom: fromIdx, iNodeIndexTo: toIdx, sStatus: effective, sSubStatus: subStatus };
+  edges.push(edge);
+  return edge;
+}
+
+// Remove the edges between two nodes. status / subStatus narrow the match; omitting both
+// removes every edge of the pair (which is what an "always continue" link needs, since it
+// is stored as two edges — one positive, one negative). Returns the removed edges.
+export function removeChainEdges(
+  model: any,
+  fromIdx: number,
+  toIdx: number,
+  status?: EdgeStatus,
+  subStatus?: string
+): any[] {
+  const edges: any[] = model.aEdge ?? (model.aEdge = []);
+  const matches = (e: any) =>
+    e.iNodeIndexFrom === fromIdx &&
+    e.iNodeIndexTo === toIdx &&
+    (status === undefined || e.sStatus === status) &&
+    (subStatus === undefined || (e.sSubStatus ?? '00') === subStatus);
+  const removed = edges.filter(matches);
+  model.aEdge = edges.filter((e) => !matches(e));
+  return removed;
+}
+
+export interface RemoveStepResult {
+  removedLabel: string;
+  edgesRemoved: number;
+  edgesReconnected: number;
+  inlineVariantRemoved: string | null;
+}
+
+// Remove one step from the chain. Every edge touching it goes; with `reconnect` each
+// predecessor takes over each successor so the strand stays in one piece. The bridging
+// edge keeps the condition of the edge that ran INTO the removed step, because that is the
+// edge whose source still decides (a DECISION branch into the removed step therefore stays
+// a branch edge to its successor).
+export function removeChainStep(model: any, idx: number, reconnect = true): RemoveStepResult {
+  const nodes: any[] = model.aNode ?? (model.aNode = []);
+  const edges: any[] = model.aEdge ?? (model.aEdge = []);
+  const node = nodes[idx];
+  if (!node) throw new Error(`No node at index ${idx}.`);
+  if (String(node.sProcessType ?? '').toUpperCase() === 'TRIGGER') {
+    throw new Error('The TRIGGER (Start) node cannot be removed — a chain always needs exactly one.');
+  }
+
+  const removedLabel = chainNodeLabel(model, idx);
+  const incoming = edges.filter((e) => e.iNodeIndexTo === idx && e.iNodeIndexFrom !== idx);
+  const outgoing = edges.filter((e) => e.iNodeIndexFrom === idx && e.iNodeIndexTo !== idx);
+  const kept = edges.filter((e) => e.iNodeIndexFrom !== idx && e.iNodeIndexTo !== idx);
+  const edgesRemoved = edges.length - kept.length;
+
+  let edgesReconnected = 0;
+  if (reconnect) {
+    for (const inE of incoming) {
+      for (const outE of outgoing) {
+        if (inE.iNodeIndexFrom === outE.iNodeIndexTo) continue;
+        const bridge = {
+          iNodeIndexFrom: inE.iNodeIndexFrom,
+          iNodeIndexTo: outE.iNodeIndexTo,
+          sStatus: inE.sStatus,
+          sSubStatus: inE.sSubStatus ?? '00',
+        };
+        const dup = kept.some(
+          (e) =>
+            e.iNodeIndexFrom === bridge.iNodeIndexFrom &&
+            e.iNodeIndexTo === bridge.iNodeIndexTo &&
+            e.sStatus === bridge.sStatus &&
+            (e.sSubStatus ?? '00') === bridge.sSubStatus
+        );
+        if (!dup) {
+          kept.push(bridge);
+          edgesReconnected++;
+        }
+      }
+    }
+  }
+
+  const shift = (i: number) => (i > idx ? i - 1 : i);
+  for (const e of kept) {
+    e.iNodeIndexFrom = shift(e.iNodeIndexFrom);
+    e.iNodeIndexTo = shift(e.iNodeIndexTo);
+  }
+
+  nodes.splice(idx, 1);
+  model.aEdge = kept;
+
+  // Drop the step's inline variant, unless it is an object reference (shared, not owned by
+  // the node) or another surviving node still points at the same key.
+  let inlineVariantRemoved: string | null = null;
+  const key = node.sProcessVariant;
+  if (node.bIsReference === false && key && !nodes.some((n) => n.sProcessVariant === key)) {
+    const variants: any[] = model.aInlineVariant ?? [];
+    const remaining = variants.filter((v) => v.sProcessVariant !== key);
+    if (remaining.length < variants.length) {
+      model.aInlineVariant = remaining;
+      inlineVariantRemoved = key;
+    }
+  }
+
+  return { removedLabel, edgesRemoved, edgesReconnected, inlineVariantRemoved };
+}
+
+// Wire a freshly appended block of nodes into the chain IN SERIES.
+//   before: every edge that pointed at the target now points at the block entry, then the
+//           block exit links to the target  → pred → BLOCK → target
+//   after:  every edge leaving the target now leaves from the block exit, then the target
+//           links to the block entry        → target → BLOCK → former successors
+// Rerouted edges keep their own condition and branch condition, so a neutral edge out of
+// the trigger and a DECISION branch edge both survive the move. `link` draws the new edges
+// and owns the edge_mode decision (on-success only, or on-success plus on-error).
+export function spliceBlockInSeries(
+  model: any,
+  blockIndices: number[],
+  mode: 'before' | 'after',
+  targetIdx: number,
+  link: (from: number, to: number) => void
+): void {
+  const edges: any[] = model.aEdge ?? (model.aEdge = []);
+  const entry = blockIndices[0];
+  const exit = blockIndices[blockIndices.length - 1];
+  const inBlock = new Set(blockIndices);
+  if (inBlock.has(targetIdx)) {
+    throw new Error('The insertion target cannot be part of the inserted block.');
+  }
+
+  if (mode === 'before') {
+    let rerouted = 0;
+    for (const e of edges) {
+      if (e.iNodeIndexTo === targetIdx && !inBlock.has(e.iNodeIndexFrom)) {
+        e.iNodeIndexTo = entry;
+        rerouted++;
+      }
+    }
+    if (rerouted === 0) {
+      throw new Error(
+        `'before' target ${chainNodeLabel(model, targetIdx)} has no incoming edge to reroute — ` +
+        `nothing can be inserted ahead of a node that nothing leads to.`
+      );
+    }
+    link(exit, targetIdx);
+    return;
+  }
+
+  for (const e of edges) {
+    if (e.iNodeIndexFrom === targetIdx && !inBlock.has(e.iNodeIndexTo)) {
+      e.iNodeIndexFrom = exit;
+    }
+  }
+  link(targetIdx, entry);
+}
+
 // ── buildModelParts ────────────────────────────────────────────────────────────
 //
 // Builds the non-trigger part of the model from the high-level step/edge input.
@@ -606,11 +980,12 @@ function buildModelParts(
   const nodeTypeMap = new Map<string, string>([['TRIGGER', 'TRIGGER']]);
   steps.forEach((step) => nodeTypeMap.set(step.id, step.type));
 
-  // assign INLINE_n keys to inline-configured nodes (ADSOACT, ADSOREM); trigger owns INLINE_0
+  // assign INLINE_n keys to inline-configured nodes (ADSOACT, ADSOREM, ABAP); trigger owns
+  // INLINE_0. These are placeholders — the server rewrites them to generated ILV_ keys on save.
   let inlineCounter = 1;
   const inlineKeyMap = new Map<string, string>();
   for (const step of steps) {
-    if (step.type === 'ADSOACT' || step.type === 'ADSOREM') {
+    if (INLINE_STEP_TYPES.has(step.type)) {
       inlineKeyMap.set(step.id, `INLINE_${inlineCounter++}`);
     }
   }
@@ -637,12 +1012,12 @@ function buildModelParts(
   }));
 
   const stepInlineVariants = steps
-    .filter((s) => s.type === 'ADSOACT' || s.type === 'ADSOREM')
-    .map((s) =>
-      s.type === 'ADSOACT'
-        ? buildAdsoActVariant(s as StepAdsoAct, inlineKeyMap)
-        : buildAdsoRemVariant(s as StepAdsoRem, inlineKeyMap)
-    );
+    .filter((s) => INLINE_STEP_TYPES.has(s.type))
+    .map((s) => {
+      if (s.type === 'ADSOACT') return buildAdsoActVariant(s as StepAdsoAct, inlineKeyMap);
+      if (s.type === 'ADSOREM') return buildAdsoRemVariant(s as StepAdsoRem, inlineKeyMap);
+      return buildAbapProgramVariant(inlineKeyMap.get(s.id)!, s as StepAbap).inlineVariant;
+    });
 
   return { stepNodes, aEdge, stepInlineVariants };
 }
@@ -677,6 +1052,92 @@ function attachActivation(
   if (activation.errors.length > 0) {
     result.activationErrors = activation.errors;
   }
+}
+
+// ── Shared in-place edit cycle ─────────────────────────────────────────────────
+//
+// GET the server's own model (for the ETag), let `mutate` edit it, PUT it back with the
+// transport header, then optionally activate. Editing the server's model rather than
+// rebuilding it from high-level input is what keeps step types the tool does not model
+// (inline variants, notifications, repeat settings) intact.
+//
+// `mutate` reports the fields to include in the result. Returning a skipReason skips the
+// PUT entirely, which is how the tools stay idempotent.
+
+interface ChainEditOutcome {
+  report: Record<string, unknown>;
+  skipReason?: string;
+}
+
+async function editChainModel(
+  client: BwClient,
+  name: string,
+  mutate: (model: any) => ChainEditOutcome,
+  opts: { activate?: boolean; transportRequest?: string } = {}
+): Promise<{ result: Record<string, unknown>; model: any; skipped: boolean }> {
+  const { activate = false, transportRequest } = opts;
+  const nameLc = name.toLowerCase();
+
+  let etag: string;
+  let model: any;
+  try {
+    const got = await client.rawGet(`${BASE}/${nameLc}`, { Accept: JSON_CT });
+    etag = got.headers['etag'] as string;
+    if (!etag) throw new Error('No ETag returned by GET');
+    const root = JSON.parse(got.body);
+    // The GET body may wrap the model as { model: ... } or be the bare model;
+    // the PUT body must always be the bare model object.
+    model = root.model ?? root;
+  } catch (err: any) {
+    throw new Error(`GET chain '${name}': ${err.message}`);
+  }
+
+  model.aNode = model.aNode ?? [];
+  model.aEdge = model.aEdge ?? [];
+  model.aInlineVariant = model.aInlineVariant ?? [];
+
+  const { report, skipReason } = mutate(model);
+  if (skipReason) {
+    return { result: { chain: name, skipped: true, reason: skipReason, ...report }, model, skipped: true };
+  }
+
+  const csrf = await client.getCsrfToken();
+  const { header: transportHeader, warning: transportWarning } =
+    await resolveTransportHeader(client, `${BASE}/${nameLc}`, csrf, transportRequest);
+  // resolveTransportHeader may have refreshed the CSRF token (on a 404 retry); use the
+  // current token for the PUT so it never goes out with a stale token.
+  const putCsrf = await client.getCsrfToken();
+  await client
+    .rawPut(`${BASE}/${nameLc}`, JSON.stringify(model), {
+      'Content-Type': JSON_CT,
+      Accept: '*/*',
+      'x-csrf-token': putCsrf,
+      'If-Match': etag,
+      'X-Requested-With': 'XMLHttpRequest',
+      ...transportHeader,
+    })
+    .catch((err: Error) => {
+      const stale = err.message.includes('HTTP 412');
+      throw new Error(
+        stale
+          ? `PUT model failed: ETag is stale (412 Precondition Failed) — the chain was modified between the GET and PUT. Re-read and retry. ${err.message}`
+          : `PUT edited model: ${err.message}`
+      );
+    });
+  refreshCsrf(client);
+
+  const result: Record<string, unknown> = {
+    chain: name,
+    ...report,
+    nodes: model.aNode.length,
+    edges: model.aEdge.length,
+    activated: activate,
+  };
+  if (transportWarning) result.transportWarning = transportWarning;
+  if (activate) {
+    attachActivation(result, await activateChain(client, nameLc));
+  }
+  return { result, model, skipped: false };
 }
 
 // ── bw_create_process_chain ────────────────────────────────────────────────────
@@ -1228,7 +1689,7 @@ export async function bwSwapProcessChainDtp(
   if (refreshDescription) {
     try {
       const meta = await client.rawGet(
-        `/sap/bc/http/sap/bw4/v1/modeling/processtypes/dtp_load/variants/${newDtp.toLowerCase()}/a`,
+        `/sap/bc/http/sap/bw4/v1/modeling/processtypes/dtp_load/variants/${bwSeg(newDtp)}/a`,
         { Accept: JSON_CT }
       );
       const md = JSON.parse(meta.body);
@@ -1289,11 +1750,78 @@ export async function bwSwapProcessChainDtp(
 // see payloads/process_chain_create_update_activate.md,
 // "Appending a DTP step (+ per-DTP activation) in place".
 
-// Collector node types that RSPC may insert (AND / OR / EXOR); XOR kept as a synonym.
-const COLLECTOR_TYPES = new Set(['AND', 'OR', 'EXOR', 'XOR']);
-
 function countCollectors(ns: any[]): number {
   return ns.filter((n) => COLLECTOR_TYPES.has(String(n.sProcessType ?? '').toUpperCase())).length;
+}
+
+// The default append point: the terminal node (no outgoing edge, not the TRIGGER) closest
+// to the trigger, chosen to keep parallel strands balanced; ties → first. `exclude` skips
+// the not-yet-wired nodes of the block being inserted, which have no outgoing edge either.
+function resolveStrandEnd(model: any, exclude: Set<number> = new Set()): number {
+  const nodes: any[] = model.aNode ?? [];
+  const edges: any[] = model.aEdge ?? [];
+  const hasOut = new Set(edges.map((e: any) => e.iNodeIndexFrom));
+  const predOf = (i: number) =>
+    edges.filter((e: any) => e.iNodeIndexTo === i).map((e: any) => e.iNodeIndexFrom);
+  const distFromTrigger = (i: number) => {
+    let d = 0, cur = i, guard = 0;
+    while (guard++ < 200) {
+      const ps = predOf(cur).filter(
+        (p: number) => String(nodes[p]?.sProcessType ?? '').toUpperCase() !== 'TRIGGER'
+      );
+      if (!ps.length) break;
+      cur = ps[0];
+      d++;
+    }
+    return d;
+  };
+  const terminals = nodes
+    .map((_n: unknown, i: number) => i)
+    .filter(
+      (i) =>
+        !exclude.has(i) &&
+        !hasOut.has(i) &&
+        String(nodes[i].sProcessType ?? '').toUpperCase() !== 'TRIGGER'
+    );
+  if (!terminals.length) throw new Error('No terminal strand end found to append to.');
+  return terminals.sort((a, b) => distFromTrigger(a) - distFromTrigger(b))[0];
+}
+
+// Place an already-appended block of nodes into the chain according to the caller's
+// before / after / predecessor choice, and describe where it landed. Shared by the DTP and
+// the ABAP program tool so both position steps by the same rules.
+function placeBlock(
+  model: any,
+  blockIndices: number[],
+  opts: { before?: string; after?: string; predecessor?: string },
+  link: (from: number, to: number) => void
+): string {
+  const { before, after, predecessor } = opts;
+  if (before && after) {
+    throw new Error("Pass only one of 'before' or 'after' (they are mutually exclusive).");
+  }
+  if (before) {
+    const targetIdx = resolveChainNodeRef(model, before, "'before' target");
+    spliceBlockInSeries(model, blockIndices, 'before', targetIdx, link);
+    return `in series before ${chainNodeLabel(model, targetIdx)}`;
+  }
+  if (after) {
+    const targetIdx = resolveChainNodeRef(model, after, "'after' target");
+    spliceBlockInSeries(model, blockIndices, 'after', targetIdx, link);
+    return `in series after ${chainNodeLabel(model, targetIdx)}`;
+  }
+  const exclude = new Set(blockIndices);
+  const predIdx =
+    !predecessor || predecessor === 'strand_end_auto'
+      ? resolveStrandEnd(model, exclude)
+      : resolveChainNodeRef(model, predecessor, 'predecessor');
+  if (exclude.has(predIdx)) {
+    throw new Error('The predecessor cannot be part of the inserted block.');
+  }
+  link(predIdx, blockIndices[0]);
+  // An append does NOT reroute the target's existing successors, so the block runs
+  // alongside them rather than ahead of them; before/after is what puts it in series.
+  return `appended behind ${chainNodeLabel(model, predIdx)}`;
 }
 
 // Terminal strand ends: nodes with no outgoing edge, excluding the TRIGGER.
@@ -1306,154 +1834,87 @@ export async function bwAppendProcessChainDtp(
   client: BwClient,
   params: AppendProcessChainDtpParams
 ): Promise<string> {
-  const { name, dtp, adsoact, predecessor, edgeMode = 'both', activate = false, transportRequest } = params;
+  const { name, dtp, adsoact, before, after, predecessor, edgeMode = 'both', activate = false, transportRequest } = params;
   const nameLc = name.toLowerCase();
 
-  // ── Step 1: GET current chain (ETag + model) ───────────────────────────────
-  let etag: string;
-  let model: any;
-  try {
-    const got = await client.rawGet(`${BASE}/${nameLc}`, { Accept: JSON_CT });
-    etag = got.headers['etag'] as string;
-    if (!etag) throw new Error('No ETag returned by GET');
-    const root = JSON.parse(got.body);
-    // The GET body may wrap the model as { model: ... } or be the bare model;
-    // the PUT body must always be the bare model object.
-    model = root.model ?? root;
-  } catch (err: any) {
-    throw new Error(`GET chain '${name}': ${err.message}`);
-  }
-
-  const nodes: any[] = model.aNode ?? (model.aNode = []);
-  const edges: any[] = model.aEdge ?? (model.aEdge = []);
-  model.aInlineVariant = model.aInlineVariant ?? [];
-
-  // Idempotency: DTP already present → skip, no PUT.
-  if (nodes.some((n) => (n.sProcessVariant ?? '').toUpperCase() === dtp.toUpperCase())) {
-    return JSON.stringify({ chain: name, skipped: true, reason: 'DTP already present' }, null, 2);
-  }
-
-  // ── Step 2: Resolve the predecessor index ──────────────────────────────────
-  const hasOut = new Set(edges.map((e) => e.iNodeIndexFrom));
-  const predOf = (i: number) => edges.filter((e) => e.iNodeIndexTo === i).map((e) => e.iNodeIndexFrom);
-  const distFromTrigger = (i: number) => {
-    let d = 0, cur = i, guard = 0;
-    while (guard++ < 200) {
-      const ps = predOf(cur).filter((p) => nodes[p].sProcessType !== 'TRIGGER');
-      if (!ps.length) break;
-      cur = ps[0];
-      d++;
-    }
-    return d;
-  };
-  let predIdx: number;
-  if (!predecessor || predecessor === 'strand_end_auto') {
-    // Pick the terminal (no outgoing edge, excluding TRIGGER) closest to the trigger;
-    // ties → first, to keep strands balanced.
-    const terminals = nodes.map((_n, i) => i).filter((i) => !hasOut.has(i) && nodes[i].sProcessType !== 'TRIGGER');
-    if (!terminals.length) throw new Error('No terminal strand end found to append to.');
-    predIdx = terminals.sort((a, b) => distFromTrigger(a) - distFromTrigger(b))[0];
-  } else {
-    const u = predecessor.toUpperCase();
-    predIdx = nodes.findIndex((n) => (n.sProcessVariant ?? '').toUpperCase() === u);
-    if (predIdx < 0) {
-      // aDSO match: an ADSOACT node whose inline DATASTORES contains the name.
-      predIdx = nodes.findIndex((n) => {
-        if (n.sProcessType !== 'ADSOACT') return false;
-        const iv = model.aInlineVariant.find((v: any) => v.sProcessVariant === n.sProcessVariant);
-        return (iv?.oDetail?.DATASTORES ?? []).some((d: any) => (d.DATASTORE ?? '').toUpperCase() === u);
-      });
-    }
-    if (predIdx < 0) throw new Error(`Predecessor '${predecessor}' not found in chain '${name}'.`);
-  }
-
-  // ── Step 3: Append the DTP node (+ edges, + optional ADSOACT) ──────────────
-  const dtpIdx = nodes.length;
-  nodes.push({
-    sProcessType: 'DTP_LOAD', bIsReference: true, bSkipped: false, iAutoRepeatCount: 0,
-    iAutoRepeatWaitDuration: 0, iDebugWaitDuration: 0, sNotificationFailure: '', sNotificationSuccess: '',
-    sProcessVariant: dtp, sVariantDescription: '',
-  });
-  const link = (from: number, to: number) => {
-    edges.push({ iNodeIndexFrom: from, iNodeIndexTo: to, sStatus: 'positive', sSubStatus: '00' });
-    if (edgeMode !== 'success_only') {
-      edges.push({ iNodeIndexFrom: from, iNodeIndexTo: to, sStatus: 'negative', sSubStatus: '00' });
-    }
-  };
-  link(predIdx, dtpIdx);
-
-  const added: string[] = [dtp];
-  // Optional per-DTP ADSOACT.
-  if (adsoact) {
-    // Placeholder inline key; the server reassigns it to a generated ILV_ key on save.
-    const key = `INLINE_APPEND_${dtpIdx}`;
-    const actIdx = nodes.length;
-    nodes.push({
-      sProcessType: 'ADSOACT', bIsReference: false, bSkipped: false, iAutoRepeatCount: 0,
-      iAutoRepeatWaitDuration: 0, iDebugWaitDuration: 0, sNotificationFailure: '', sNotificationSuccess: '',
-      sProcessVariant: key,
-    });
-    model.aInlineVariant.push({
-      sProcessVariant: key,
-      sVariantDescription: '',
-      oDetail: {
-        sId: '',
-        DATASTORES: [{ DATASTORE: adsoact, DESCRIPTION: '', HOTCOLDFLAG: '' }],
-        NOCONDENSE: false,
-        NOREQACTWARN: false,
-      },
-      aSocket: [],
-    });
-    link(dtpIdx, actIdx);
-    added.push(`ADSOACT(${adsoact})`);
-  }
-
   // Baseline for the post-activation invariant check: the counts of the model we send.
-  // The append adds no collector and appends behind an existing node without drawing a
-  // new edge from the TRIGGER, so RSPC must not raise either of these on save.
-  const collectorsSent = countCollectors(nodes);
-  const strandsSent = countTerminalStrands(nodes, edges);
+  // Neither an append nor an in-series splice adds a collector or draws a new edge from
+  // the TRIGGER, so RSPC must not raise either of these on save.
+  let collectorsSent = 0;
+  let strandsSent = 0;
 
-  // ── Step 4: PUT the edited model with If-Match and the transport header ────
-  const csrf = await client.getCsrfToken();
-  const { header: transportHeader, warning: transportWarning } =
-    await resolveTransportHeader(client, `${BASE}/${nameLc}`, csrf, transportRequest);
-  // resolveTransportHeader may have refreshed the CSRF token (on a 404 retry); use the
-  // current token for the PUT so it never goes out with a stale token.
-  const putCsrf = await client.getCsrfToken();
-  await client
-    .rawPut(`${BASE}/${nameLc}`, JSON.stringify(model), {
-      'Content-Type': JSON_CT,
-      Accept: '*/*',
-      'x-csrf-token': putCsrf,
-      'If-Match': etag,
-      'X-Requested-With': 'XMLHttpRequest',
-      ...transportHeader,
-    })
-    .catch((err: Error) => {
-      const stale = err.message.includes('HTTP 412');
-      throw new Error(
-        stale
-          ? `PUT model failed: ETag is stale (412 Precondition Failed) — the chain was modified between the GET and PUT. Re-read and retry. ${err.message}`
-          : `PUT edited model: ${err.message}`
-      );
-    });
-  refreshCsrf(client);
+  const { result, skipped } = await editChainModel(
+    client,
+    name,
+    (model) => {
+      const nodes: any[] = model.aNode;
+      const edges: any[] = model.aEdge;
 
-  // ── Step 5: Result (+ optional activation and invariant verification) ──────
-  const result: Record<string, unknown> = {
-    chain: name,
-    appended: added,
-    nodes: nodes.length,
-    edges: edges.length,
-    activated: activate,
-  };
-  if (transportWarning) result.transportWarning = transportWarning;
+      // Idempotency: DTP already present → skip, no PUT.
+      if (nodes.some((n) => (n.sProcessVariant ?? '').toUpperCase() === dtp.toUpperCase())) {
+        return { report: {}, skipReason: 'DTP already present' };
+      }
 
-  if (activate) {
-    attachActivation(result, await activateChain(client, nameLc));
-    // Confirm RSPC did not insert a collector and did not add a terminal strand
-    // beyond what we sent. Re-read the chain and compare.
+      // ── Build the block: the DTP, optionally followed by its own ADSOACT ────
+      const dtpIdx = nodes.length;
+      nodes.push({
+        sProcessType: 'DTP_LOAD', bIsReference: true, bSkipped: false, iAutoRepeatCount: 0,
+        iAutoRepeatWaitDuration: 0, iDebugWaitDuration: 0, sNotificationFailure: '', sNotificationSuccess: '',
+        sProcessVariant: dtp, sVariantDescription: '',
+      });
+      const link = (from: number, to: number) => {
+        edges.push({ iNodeIndexFrom: from, iNodeIndexTo: to, sStatus: 'positive', sSubStatus: '00' });
+        if (edgeMode !== 'success_only') {
+          edges.push({ iNodeIndexFrom: from, iNodeIndexTo: to, sStatus: 'negative', sSubStatus: '00' });
+        }
+      };
+
+      const blockIndices = [dtpIdx];
+      const added: string[] = [dtp];
+      if (adsoact) {
+        // Placeholder inline key; the server reassigns it to a generated ILV_ key on save.
+        const key = `INLINE_APPEND_${dtpIdx}`;
+        const actIdx = nodes.length;
+        nodes.push({
+          sProcessType: 'ADSOACT', bIsReference: false, bSkipped: false, iAutoRepeatCount: 0,
+          iAutoRepeatWaitDuration: 0, iDebugWaitDuration: 0, sNotificationFailure: '', sNotificationSuccess: '',
+          sProcessVariant: key,
+        });
+        model.aInlineVariant.push({
+          sProcessVariant: key,
+          sVariantDescription: '',
+          oDetail: {
+            sId: '',
+            DATASTORES: [{ DATASTORE: adsoact, DESCRIPTION: '', HOTCOLDFLAG: '' }],
+            NOCONDENSE: false,
+            NOREQACTWARN: false,
+          },
+          aSocket: [],
+        });
+        blockIndices.push(actIdx);
+        added.push(`ADSOACT(${adsoact})`);
+      }
+
+      // ── Wire the block in: in series (before/after) or appended ─────────────
+      // The internal DTP → ADSOACT link is drawn first so the block is one strand before
+      // placeBlock connects its entry and exit to the surrounding chain.
+      for (let i = 1; i < blockIndices.length; i++) {
+        link(blockIndices[i - 1], blockIndices[i]);
+      }
+      const placement = placeBlock(model, blockIndices, { before, after, predecessor }, link);
+
+      collectorsSent = countCollectors(nodes);
+      strandsSent = countTerminalStrands(nodes, edges);
+
+      return { report: { appended: added, placement } };
+    },
+    { activate, transportRequest }
+  );
+
+  // ── Post-activation invariant verification ────────────────────────────────
+  // Confirm RSPC did not insert a collector and did not add a terminal strand beyond what
+  // we sent. Re-read the chain and compare.
+  if (!skipped && activate) {
     try {
       const check = await client.rawGet(`${BASE}/${nameLc}`, { Accept: JSON_CT });
       const checkRoot = JSON.parse(check.body);
@@ -1504,7 +1965,7 @@ const ABAP_PROGRAM_URI_BASE = '/sap/bc/http/sap/bw4/v1/system/abapreports';
 
 function buildAbapProgramVariant(
   key: string,
-  params: AddProcessChainProgramParams
+  params: AbapProgramSpec
 ): { node: object; inlineVariant: object } {
   const prog = params.program.toUpperCase();
   const variant = params.variant ? params.variant.toUpperCase() : undefined;
@@ -1567,177 +2028,167 @@ function buildAbapProgramVariant(
   return { node, inlineVariant };
 }
 
-// Resolve a node index from a name: a node's own sProcessVariant (DTP/variant name), or
-// an aDSO held by an ADSOACT node's inline DATASTORES. Mirrors bw_append_process_chain_dtp.
-function findChainNodeIndex(model: any, nodes: any[], nameU: string): number {
-  let idx = nodes.findIndex((n) => (n.sProcessVariant ?? '').toUpperCase() === nameU);
-  if (idx < 0) {
-    idx = nodes.findIndex((n) => {
-      if (n.sProcessType !== 'ADSOACT') return false;
-      const iv = (model.aInlineVariant ?? []).find((v: any) => v.sProcessVariant === n.sProcessVariant);
-      return (iv?.oDetail?.DATASTORES ?? []).some((d: any) => (d.DATASTORE ?? '').toUpperCase() === nameU);
-    });
-  }
-  return idx;
-}
-
 export async function bwAddProcessChainProgram(
   client: BwClient,
   params: AddProcessChainProgramParams
 ): Promise<string> {
   const { name, program, variant, before, after, predecessor, edgeMode = 'both', activate = false, transportRequest } = params;
-  const nameLc = name.toLowerCase();
-
-  if (before && after) {
-    throw new Error("Pass only one of 'before' or 'after' (they are mutually exclusive).");
-  }
-
-  // ── Step 1: GET current chain (ETag + model) ───────────────────────────────
-  let etag: string;
-  let model: any;
-  try {
-    const got = await client.rawGet(`${BASE}/${nameLc}`, { Accept: JSON_CT });
-    etag = got.headers['etag'] as string;
-    if (!etag) throw new Error('No ETag returned by GET');
-    const root = JSON.parse(got.body);
-    model = root.model ?? root;
-  } catch (err: any) {
-    throw new Error(`GET chain '${name}': ${err.message}`);
-  }
-
-  const nodes: any[] = model.aNode ?? (model.aNode = []);
-  const edges: any[] = model.aEdge ?? (model.aEdge = []);
-  model.aInlineVariant = model.aInlineVariant ?? [];
 
   const progU = program.toUpperCase();
   const varU = variant ? variant.toUpperCase() : undefined;
 
-  // Idempotency: an ABAP step already calling the same program (+ variant) → skip.
-  const duplicate = nodes.some((n) => {
-    if (n.sProcessType !== 'ABAP') return false;
-    const iv = model.aInlineVariant.find((v: any) => v.sProcessVariant === n.sProcessVariant);
-    const p = (iv?.oDetail?.PROGRAM?.[0]?.key ?? '').toUpperCase();
-    const v = (iv?.oDetail?.VARIANT?.[0]?.key ?? '').toUpperCase();
-    return p === progU && (varU ? v === varU : true);
-  });
-  if (duplicate) {
-    return JSON.stringify(
-      { chain: name, skipped: true, reason: `ABAP step for program '${progU}'${varU ? ` (variant '${varU}')` : ''} already present` },
-      null,
-      2
-    );
-  }
+  const { result } = await editChainModel(
+    client,
+    name,
+    (model) => {
+      const nodes: any[] = model.aNode;
+      const edges: any[] = model.aEdge;
 
-  // ── Step 2: Build the new ABAP node + inline variant (placeholder key) ──────
-  const newIdx = nodes.length;
-  const key = `INLINE_PROG_${newIdx}`;
-  const { node, inlineVariant } = buildAbapProgramVariant(key, params);
-  nodes.push(node);
-  model.aInlineVariant.push(inlineVariant);
-
-  const link = (from: number, to: number) => {
-    edges.push({ iNodeIndexFrom: from, iNodeIndexTo: to, sStatus: 'positive', sSubStatus: '00' });
-    if (edgeMode !== 'success_only') {
-      edges.push({ iNodeIndexFrom: from, iNodeIndexTo: to, sStatus: 'negative', sSubStatus: '00' });
-    }
-  };
-
-  // ── Step 3: Wire the new node into the topology ────────────────────────────
-  let placement: string;
-  if (before) {
-    const targetIdx = findChainNodeIndex(model, nodes, before.toUpperCase());
-    if (targetIdx < 0) throw new Error(`'before' node '${before}' not found in chain '${name}'.`);
-    // Reroute every edge that pointed at the target so it now points at the new node,
-    // preserving each edge's status (e.g. the neutral edge coming from the trigger).
-    let rerouted = 0;
-    for (const e of edges) {
-      if (e.iNodeIndexTo === targetIdx && e.iNodeIndexFrom !== newIdx) {
-        e.iNodeIndexTo = newIdx;
-        rerouted++;
+      // Idempotency: an ABAP step already calling the same program (+ variant) → skip.
+      const duplicate = nodes.some((n) => {
+        if (n.sProcessType !== 'ABAP') return false;
+        const iv = model.aInlineVariant.find((v: any) => v.sProcessVariant === n.sProcessVariant);
+        const p = (iv?.oDetail?.PROGRAM?.[0]?.key ?? '').toUpperCase();
+        const v = (iv?.oDetail?.VARIANT?.[0]?.key ?? '').toUpperCase();
+        return p === progU && (varU ? v === varU : true);
+      });
+      if (duplicate) {
+        return {
+          report: {},
+          skipReason: `ABAP step for program '${progU}'${varU ? ` (variant '${varU}')` : ''} already present`,
+        };
       }
-    }
-    if (rerouted === 0) {
-      throw new Error(`'before' node '${before}' has no incoming edge to reroute (cannot insert ahead of a start node).`);
-    }
-    link(newIdx, targetIdx);
-    placement = `before ${before.toUpperCase()}`;
-  } else if (after) {
-    const targetIdx = findChainNodeIndex(model, nodes, after.toUpperCase());
-    if (targetIdx < 0) throw new Error(`'after' node '${after}' not found in chain '${name}'.`);
-    // Reroute the target's outgoing edges to leave from the new node instead, then link
-    // target → new, so the program runs between the target and its former successors.
-    for (const e of edges) {
-      if (e.iNodeIndexFrom === targetIdx && e.iNodeIndexTo !== newIdx) {
-        e.iNodeIndexFrom = newIdx;
-      }
-    }
-    link(targetIdx, newIdx);
-    placement = `after ${after.toUpperCase()}`;
-  } else {
-    // Strand-end append (same rule as bw_append_process_chain_dtp).
-    const hasOut = new Set(edges.map((e) => e.iNodeIndexFrom));
-    const predOf = (i: number) => edges.filter((e) => e.iNodeIndexTo === i).map((e) => e.iNodeIndexFrom);
-    const distFromTrigger = (i: number) => {
-      let d = 0, cur = i, guard = 0;
-      while (guard++ < 200) {
-        const ps = predOf(cur).filter((p) => nodes[p].sProcessType !== 'TRIGGER');
-        if (!ps.length) break;
-        cur = ps[0];
-        d++;
-      }
-      return d;
-    };
-    let predIdx: number;
-    if (!predecessor || predecessor === 'strand_end_auto') {
-      const terminals = nodes
-        .map((_n, i) => i)
-        .filter((i) => i !== newIdx && !hasOut.has(i) && nodes[i].sProcessType !== 'TRIGGER');
-      if (!terminals.length) throw new Error('No terminal strand end found to append to.');
-      predIdx = terminals.sort((a, b) => distFromTrigger(a) - distFromTrigger(b))[0];
-    } else {
-      predIdx = findChainNodeIndex(model, nodes, predecessor.toUpperCase());
-      if (predIdx < 0) throw new Error(`Predecessor '${predecessor}' not found in chain '${name}'.`);
-    }
-    link(predIdx, newIdx);
-    placement = predecessor && predecessor !== 'strand_end_auto' ? `after ${predecessor.toUpperCase()}` : 'at strand end';
-  }
 
-  // ── Step 4: PUT the edited model with If-Match and the transport header ─────
-  const csrf = await client.getCsrfToken();
-  const { header: transportHeader, warning: transportWarning } =
-    await resolveTransportHeader(client, `${BASE}/${nameLc}`, csrf, transportRequest);
-  const putCsrf = await client.getCsrfToken();
-  await client
-    .rawPut(`${BASE}/${nameLc}`, JSON.stringify(model), {
-      'Content-Type': JSON_CT,
-      Accept: '*/*',
-      'x-csrf-token': putCsrf,
-      'If-Match': etag,
-      'X-Requested-With': 'XMLHttpRequest',
-      ...transportHeader,
-    })
-    .catch((err: Error) => {
-      const stale = err.message.includes('HTTP 412');
-      throw new Error(
-        stale
-          ? `PUT model failed: ETag is stale (412 Precondition Failed) — the chain was modified between the GET and PUT. Re-read and retry. ${err.message}`
-          : `PUT edited model: ${err.message}`
-      );
-    });
-  refreshCsrf(client);
+      // Placeholder inline key; the server reassigns it to a generated ILV_ key on save.
+      const newIdx = nodes.length;
+      const { node, inlineVariant } = buildAbapProgramVariant(`INLINE_PROG_${newIdx}`, params);
+      nodes.push(node);
+      model.aInlineVariant.push(inlineVariant);
 
-  // ── Step 5: Result (+ optional activation) ─────────────────────────────────
-  const result: Record<string, unknown> = {
-    chain: name,
-    added: `ABAP program ${progU}${varU ? ` (variant ${varU})` : ''}`,
-    placement,
-    nodes: nodes.length,
-    edges: edges.length,
-    activated: activate,
-  };
-  if (transportWarning) result.transportWarning = transportWarning;
-  if (activate) {
-    attachActivation(result, await activateChain(client, nameLc));
-  }
+      const link = (from: number, to: number) => {
+        edges.push({ iNodeIndexFrom: from, iNodeIndexTo: to, sStatus: 'positive', sSubStatus: '00' });
+        if (edgeMode !== 'success_only') {
+          edges.push({ iNodeIndexFrom: from, iNodeIndexTo: to, sStatus: 'negative', sSubStatus: '00' });
+        }
+      };
+
+      const placement = placeBlock(model, [newIdx], { before, after, predecessor }, link);
+
+      return {
+        report: {
+          added: `ABAP program ${progU}${varU ? ` (variant ${varU})` : ''}`,
+          placement,
+        },
+      };
+    },
+    { activate, transportRequest }
+  );
+
+  return JSON.stringify(result, null, 2);
+}
+
+// ── bw_add_process_chain_edge / bw_remove_process_chain_edge ────────────────────
+//
+// Single-edge maintenance on an existing chain. Together with bw_remove_process_chain_step
+// this is what makes a mis-wired chain repairable through the tools instead of only in RSPC:
+// an "always continue" link is two edges (positive + negative), so removing one without a
+// status removes the pair.
+
+export async function bwAddProcessChainEdge(
+  client: BwClient,
+  params: AddProcessChainEdgeParams
+): Promise<string> {
+  const { name, from, to, status, subStatus = '00', activate = false, transportRequest } = params;
+
+  const { result } = await editChainModel(
+    client,
+    name,
+    (model) => {
+      const fromIdx = resolveChainNodeRef(model, from, "'from' node");
+      const toIdx = resolveChainNodeRef(model, to, "'to' node");
+      const fromLabel = chainNodeLabel(model, fromIdx);
+      const toLabel = chainNodeLabel(model, toIdx);
+      const edge = addChainEdge(model, fromIdx, toIdx, status, subStatus);
+      if (!edge) {
+        return { report: { edge: `${fromLabel} → ${toLabel}` }, skipReason: 'an identical edge already exists' };
+      }
+      return {
+        report: {
+          added_edge: `${fromLabel} → ${toLabel}`,
+          condition: edge.sStatus,
+          branch: edge.sSubStatus,
+        },
+      };
+    },
+    { activate, transportRequest }
+  );
+
+  return JSON.stringify(result, null, 2);
+}
+
+export async function bwRemoveProcessChainEdge(
+  client: BwClient,
+  params: RemoveProcessChainEdgeParams
+): Promise<string> {
+  const { name, from, to, status, subStatus, activate = false, transportRequest } = params;
+
+  const { result } = await editChainModel(
+    client,
+    name,
+    (model) => {
+      const fromIdx = resolveChainNodeRef(model, from, "'from' node");
+      const toIdx = resolveChainNodeRef(model, to, "'to' node");
+      const label = `${chainNodeLabel(model, fromIdx)} → ${chainNodeLabel(model, toIdx)}`;
+      const removed = removeChainEdges(model, fromIdx, toIdx, status, subStatus);
+      if (removed.length === 0) {
+        // Report rather than throw: the caller asked for an end state that already holds.
+        return { report: { edge: label }, skipReason: 'no matching edge exists' };
+      }
+      return {
+        report: {
+          removed_edge: label,
+          removed_conditions: removed.map((e) => `${e.sStatus}${e.sSubStatus !== '00' ? `/${e.sSubStatus}` : ''}`),
+        },
+      };
+    },
+    { activate, transportRequest }
+  );
+
+  return JSON.stringify(result, null, 2);
+}
+
+// ── bw_remove_process_chain_step ────────────────────────────────────────────────
+
+export async function bwRemoveProcessChainStep(
+  client: BwClient,
+  params: RemoveProcessChainStepParams
+): Promise<string> {
+  const { name, step, reconnect = true, activate = false, transportRequest } = params;
+
+  const { result } = await editChainModel(
+    client,
+    name,
+    (model) => {
+      const idx = resolveChainNodeRef(model, step, 'step');
+      const removal = removeChainStep(model, idx, reconnect);
+      const report: Record<string, unknown> = {
+        removed_step: removal.removedLabel,
+        edges_removed: removal.edgesRemoved,
+        edges_reconnected: removal.edgesReconnected,
+        reconnected: reconnect,
+      };
+      if (removal.inlineVariantRemoved) report.inline_variant_removed = removal.inlineVariantRemoved;
+      // A step with successors but no predecessors leaves them unreachable; say so rather
+      // than letting activation fail with a bare RSPC message.
+      if (!reconnect) {
+        report.note =
+          'reconnect was false — any successors of the removed step are now a strand that ' +
+          'nothing leads to. Wire them up with bw_add_process_chain_edge before activating.';
+      }
+      return { report };
+    },
+    { activate, transportRequest }
+  );
+
   return JSON.stringify(result, null, 2);
 }

@@ -1,4 +1,4 @@
-import { BwClient, MEDIA_TYPES } from '../bw-client.js';
+import { BwClient, MEDIA_TYPES, bwSeg, stripInfoAreaSentinel } from '../bw-client.js';
 
 interface OpenHubField {
   name: string;
@@ -66,7 +66,7 @@ function parseOpenHubXml(xml: string, status: string): OpenHubInfo {
   const tlMatch = xml.match(/<tlogoProperties([^>]*)>/);
   const tlAttrs = tlMatch?.[1] ?? '';
   const tlogoPkg = xml.match(/<adtcore:packageRef\b[^>]*\bname="([^"]*)"/)?.[1] ?? '';
-  const infoArea = xml.match(/<infoArea[^>]*>([^<]+)<\/infoArea>/)?.[1]?.trim() ?? '';
+  const infoArea = stripInfoAreaSentinel(xml.match(/<infoArea[^>]*>([^<]+)<\/infoArea>/)?.[1]?.trim() ?? '');
 
   // Key elements — collect the name tokens from #///<name>
   const keyNames = new Set<string>();
@@ -167,7 +167,7 @@ function parseOpenHubXml(xml: string, status: string): OpenHubInfo {
 }
 
 export async function bwGetOpenHub(client: BwClient, openHubName: string): Promise<string> {
-  const path = `/sap/bw/modeling/dest/${openHubName.toLowerCase()}/m`;
+  const path = `/sap/bw/modeling/dest/${bwSeg(openHubName)}/m`;
   const result = await client.get(path, MEDIA_TYPES['dest']);
   const status = result.headers['object_status'] ?? result.headers['OBJECT_STATUS'] ?? 'unknown';
 
@@ -181,7 +181,7 @@ export async function bwGetOpenHub(client: BwClient, openHubName: string): Promi
     '',
     `Source:   ${info.sourceTlogo} ${info.sourceObjnm}`,
     `DB Table: ${info.dbTable}`,
-    `InfoArea: ${info.infoArea}`,
+    `InfoArea: ${info.infoArea || '(none)'}`,
     `Package:  ${info.package}`,
     '',
     `── Fields (${info.fields.length}) ──`,

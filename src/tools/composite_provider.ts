@@ -1,4 +1,11 @@
-import { BwClient, decodeXmlEntities, freshRead } from '../bw-client.js';
+import {
+  BwClient,
+  decodeXmlEntities,
+  freshRead,
+  bwSeg,
+  bwSegUpper,
+  stripInfoAreaSentinel,
+} from '../bw-client.js';
 
 const HCPR_ACCEPT = [
   'application/vnd.sap.bw.modeling.hcpr-v1_0_0+xml',
@@ -23,7 +30,7 @@ export async function bwGetCompositeProvider(
   client: BwClient,
   compositeProviderName: string
 ): Promise<string> {
-  const path = `/sap/bw/modeling/hcpr/${compositeProviderName.toLowerCase()}/m`;
+  const path = `/sap/bw/modeling/hcpr/${bwSeg(compositeProviderName)}/m`;
   // Fresh session, not this client: a session that has just written the object serves its
   // own pinned model buffer afterwards, which drops attributes the write did set.
   const result = await freshRead(path, HCPR_ACCEPT);
@@ -47,7 +54,7 @@ export async function bwGetCompositeProvider(
   const responsible = attr(tlogoAttrs, 'adtcore:responsible');
   const changedAt = attr(tlogoAttrs, 'adtcore:changedAt');
   const changedBy = attr(tlogoAttrs, 'adtcore:changedBy');
-  const infoArea = xml.match(/<infoArea>([^<]+)<\/infoArea>/)?.[1] ?? '';
+  const infoArea = stripInfoAreaSentinel(xml.match(/<infoArea>([^<]+)<\/infoArea>/)?.[1] ?? '');
   const packageName = xml.match(/adtcore:packageRef[^>]*adtcore:name="([^"]+)"/)?.[1] ?? '';
 
   // viewNode
@@ -373,7 +380,7 @@ const IPROV_ACCEPT = [
   'application/vnd.sap.bw.modeling.iprov-v9_99_9+xml',
 ].join(',');
 
-const HCPR_PATH = (name: string) => `/sap/bw/modeling/hcpr/${name.toLowerCase()}/m`;
+const HCPR_PATH = (name: string) => `/sap/bw/modeling/hcpr/${bwSeg(name)}/m`;
 
 function escapeRegex(value: string): string {
   return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
@@ -471,7 +478,7 @@ const SEMANTICS_TAG: Record<string, string> = {
 export async function fetchCompositeSourceFields(
   providerName: string
 ): Promise<{ fieldNamePrefix: string; lastModified?: string; fields: SourceFieldMeta[] }> {
-  const path = `/sap/bw/modeling/infoprov/${providerName.toUpperCase()}/a?view=dt`;
+  const path = `/sap/bw/modeling/infoprov/${bwSegUpper(providerName)}/a?view=dt`;
   const xml = (await freshRead(path, IPROV_ACCEPT)).body;
 
   const fieldNamePrefix = xml.match(/\bfieldNamePrefix="([^"]*)"/)?.[1] ?? '';

@@ -1,4 +1,4 @@
-import { BwClient } from '../bw-client.js';
+import { BwClient, bwSeg } from '../bw-client.js';
 
 interface Socket {
   sStatus?: string;
@@ -25,7 +25,7 @@ export async function bwGetProcessVariant(
   variantName: string,
   format: 'text' | 'raw' = 'text',
 ): Promise<string> {
-  const url = `/sap/bw4/v1/modeling/processtypes/${encodeURIComponent(processType.toLowerCase())}/variants/${encodeURIComponent(variantName.toLowerCase())}/m`;
+  const url = `/sap/bw4/v1/modeling/processtypes/${encodeURIComponent(processType.toLowerCase())}/variants/${bwSeg(variantName)}/m`;
   const result = await client.rawGet(url, { Accept: 'application/json' });
   const parsed = JSON.parse(result.body) as ProcessVariant;
 

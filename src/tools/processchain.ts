@@ -1,4 +1,4 @@
-import { BwClient } from '../bw-client.js';
+import { BwClient, bwSeg, stripInfoAreaSentinel } from '../bw-client.js';
 
 const ACCEPT = 'application/vnd.sap.bw4.modeling.processchain-v1_0_0+json';
 
@@ -43,8 +43,21 @@ interface EventIdEntry {
   key?: string;
 }
 
+interface VariantEntry {
+  key?: string;
+}
+
+interface DatastoreEntry {
+  DATASTORE?: string;
+  ACTION?: string;
+}
+
 interface VariantDetail {
   PROGRAM?: ProgramEntry[];
+  VARIANT?: VariantEntry[];
+  X_SYNCHRON?: string;
+  X_LOCAL?: string;
+  DATASTORES?: DatastoreEntry[];
   eventid?: EventIdEntry[];
   eventparm?: string;
   startdttyp?: string;
@@ -102,7 +115,7 @@ async function fetchVariantDetail(
   const NO_DETAIL_TYPES = new Set(['OR', 'AND', 'EXOR', 'CHAIN', 'DTP_LOAD', 'DTP_ADSO']);
   if (NO_DETAIL_TYPES.has(processType.toUpperCase())) return null;
   try {
-    const url = `/sap/bw4/v1/modeling/processtypes/${processType.toLowerCase()}/variants/${variantName.toLowerCase()}/m`;
+    const url = `/sap/bw4/v1/modeling/processtypes/${processType.toLowerCase()}/variants/${bwSeg(variantName)}/m`;
     const result = await client.rawGet(url, { Accept: '*/*' });
     if (result.body.trim().startsWith('<')) return null;
     const parsed = JSON.parse(result.body);
@@ -120,7 +133,7 @@ export async function bwGetProcessChain(
   format: 'text' | 'raw' = 'text',
   includeVariantDetails: boolean = true,
 ): Promise<string> {
-  const url = `/sap/bw/modeling/rspc/${encodeURIComponent(chainName.toLowerCase())}/m`;
+  const url = `/sap/bw/modeling/rspc/${bwSeg(chainName)}/m`;
   const result = await client.rawGet(url, { Accept: ACCEPT });
   const parsed = JSON.parse(result.body) as ProcessChain;
 
@@ -156,7 +169,14 @@ function renderText(pc: ProcessChain, variantDetailMap: Record<string, string> =
   lines.push(`Process Chain: ${header.sProcessChainId ?? ''}`);
   lines.push(`Description:   ${header.sDescription ?? ''}`);
   lines.push(`Status:        ${header.sObjectStatus ?? ''} / Version: ${header.sObjectVersion ?? ''}`);
-  lines.push(`InfoArea:      ${header.sLocation ?? ''} — ${header.sLocationDescription ?? ''}`);
+  // Drop the description together with the name: for an unassigned chain it reads
+  // "unassigned nodes", which describes the placeholder folder, not an InfoArea.
+  const chainArea = stripInfoAreaSentinel(header.sLocation ?? '');
+  lines.push(
+    chainArea
+      ? `InfoArea:      ${chainArea} — ${header.sLocationDescription ?? ''}`
+      : 'InfoArea:      (none)',
+  );
   lines.push(`Active:        ${header.bActive ?? false}`);
 
   // Section 2 — Scheduling
@@ -261,6 +281,16 @@ function renderText(pc: ProcessChain, variantDetailMap: Record<string, string> =
       if (detail.PROGRAM && detail.PROGRAM.length >= 1) {
         const p = detail.PROGRAM[0];
         lines.push(`      ABAP Program: ${p.key ?? ''}  Package: ${p.row?.package || '(unknown)'}`);
+        // The report variant carries the step's selection — an update that replaces the
+        // step model must re-specify it, so it has to be visible here.
+        lines.push(`      Report Variant: ${detail.VARIANT?.[0]?.key || '(none)'}`);
+        lines.push(`      Call: ${detail.X_SYNCHRON ? 'synchronous' : 'asynchronous'} / ${detail.X_LOCAL ? 'local' : 'remote'}`);
+      }
+      if (detail.DATASTORES && detail.DATASTORES.length >= 1) {
+        const ds = detail.DATASTORES
+          .map((d) => `${d.DATASTORE ?? ''}${d.ACTION ? ` (action ${d.ACTION})` : ''}`)
+          .join(', ');
+        lines.push(`      DataStores: ${ds}`);
       }
       if (detail.eventid && detail.eventid.length >= 1) {
         lines.push(`      Trigger Event: ${detail.eventid[0].key ?? ''}  Param: ${detail.eventparm ?? ''}`);

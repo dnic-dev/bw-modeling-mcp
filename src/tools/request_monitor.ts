@@ -194,10 +194,17 @@ export async function bwGetRequest(
     }, null, 2);
   }
 
-  // The message log is the mandatory section. If even it failed, there is nothing useful to
-  // return — surface the error like before.
-  if (logsRes.status === 'rejected') {
-    throw new Error(errMsg(logsRes));
+  // No section is mandatory — only a request where every one of the four failed has nothing
+  // to report. A request can legitimately have no process log at all: an activation request
+  // (storage AT) answers the log endpoint with 404 "process does not exist", and treating
+  // that as fatal threw away the header, DTP information and process steps that were there.
+  if (
+    headerRes.status === 'rejected' &&
+    dtpInfoRes.status === 'rejected' &&
+    processesRes.status === 'rejected' &&
+    logsRes.status === 'rejected'
+  ) {
+    throw new Error(errMsg(headerRes));
   }
 
   const requestStatus = await getRequestStatusMap(client);
@@ -260,12 +267,20 @@ export async function bwGetRequest(
 
   // Section 4 — message log. longText is SAPscript-to-HTML; its only added value over
   // message is the "Meldungsnr. {MSGID}" — extract that and append it, drop the raw HTML.
-  const logs = JSON.parse(logsRes.value.body) as LogMessage[];
   lines.push('');
-  lines.push(`── Message Log (${logs.length}) ──`);
-  for (const log of logs) {
-    const msgNo = log.longText?.match(/Meldungsnr\.\s*([A-Z0-9_\/]+)/)?.[1];
-    lines.push(`  [${log.severity ?? ''}] ${log.message ?? ''}${msgNo ? ` (${msgNo})` : ''}`);
+  if (logsRes.status === 'fulfilled') {
+    const logs = JSON.parse(logsRes.value.body) as LogMessage[];
+    lines.push(`── Message Log (${logs.length}) ──`);
+    for (const log of logs) {
+      const msgNo = log.longText?.match(/Meldungsnr\.\s*([A-Z0-9_\/]+)/)?.[1];
+      lines.push(`  [${log.severity ?? ''}] ${log.message ?? ''}${msgNo ? ` (${msgNo})` : ''}`);
+    }
+  } else {
+    // Not the storage-code hint used for the other sections: this endpoint takes no storage
+    // code, so a failure here means the request genuinely carries no process log.
+    lines.push('── Message Log ──');
+    const reason = errMsg(logsRes).split('\n').map((l) => l.trim()).filter(Boolean).join(' — ');
+    lines.push(`  (no message log for this request: ${reason})`);
   }
 
   return lines.join('\n');

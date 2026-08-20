@@ -1,4 +1,11 @@
-import { BwClient, MEDIA_TYPES, createClientFromEnv, freshRead, resolveMasterSystem } from '../bw-client.js';
+import {
+  BwClient,
+  MEDIA_TYPES,
+  createClientFromEnv,
+  freshRead,
+  resolveMasterSystem,
+  bwSeg,
+} from '../bw-client.js';
 import { parseInfoObjectProps } from './infoobject.js';
 import { parseActivationMessages, parseDtpsDeactivated, bwActivate } from './activation.js';
 
@@ -20,7 +27,7 @@ const trfnAccept = (): string => MEDIA_TYPES['trfn'];
 async function freshReadInactive(
   trfnLower: string
 ): Promise<{ body: string; headers: Record<string, string> }> {
-  return freshRead(`/sap/bw/modeling/trfn/${trfnLower}/m`, trfnAccept());
+  return freshRead(`/sap/bw/modeling/trfn/${bwSeg(trfnLower)}/m`, trfnAccept());
 }
 
 // ── bwCreateTransformation ────────────────────────────────────────────────────
@@ -90,7 +97,7 @@ export async function bwCreateTransformation(
 
   // Step 2: Lock with CREA — exact Eclipse header set, no SAP session headers
   const csrfToken = await client.getCsrfToken();
-  const lockPath = `/sap/bw/modeling/trfn/${trfnLower}?action=lock`;
+  const lockPath = `/sap/bw/modeling/trfn/${bwSeg(trfnLower)}?action=lock`;
   const lockResponse = await client.rawPost(lockPath, '', {
     'activity_context': 'CREA',
     'Accept': trfnAccept(),
@@ -122,7 +129,7 @@ export async function bwCreateTransformation(
     adtcore:masterSystem="${masterSystem}"
     adtcore:responsible="${responsible}">
     <atom:link
-      href="/sap/bw/modeling/trfn/${trfnLower}/m"
+      href="/sap/bw/modeling/trfn/${bwSeg(trfnLower)}/m"
       rel="self"
       type="application/vnd.sap-bw-modeling.trfn+xml"/>
     <objectVersion>M</objectVersion>
@@ -136,7 +143,7 @@ export async function bwCreateTransformation(
   const copyParams = args.copy_from_transformation
     ? `&copyFromObjectName=${args.copy_from_transformation.toUpperCase()}&copyFromObjectType=TRFN`
     : '';
-  const createPath = `/sap/bw/modeling/trfn/${trfnLower}?lockHandle=${lockHandle}${copyParams}`;
+  const createPath = `/sap/bw/modeling/trfn/${bwSeg(trfnLower)}?lockHandle=${lockHandle}${copyParams}`;
 
   // Session B: eigene Session + CSRF-Token, POST mit lockHandle aus Session A
   const client2 = createClientFromEnv();
@@ -178,6 +185,22 @@ export async function bwCreateTransformation(
 }
 
 /**
+ * Does this error carry the backend's "model serialization failed" message?
+ *
+ * `CL_RSO_RES_TRFN` wraps `get_xml_from_db()` and turns a `CX_RSO_RES_SERIALIZATION_ERR` into
+ * `CX_RSO_RES_INTERNAL`, which reaches the caller as HTTP 500 with the exception text in the
+ * body. That text is the T100 message `RS_RES_MODEL 001` and therefore language-dependent, so
+ * matching one language's wording is not enough — the German text shares no words with the
+ * English one. Both shipped texts are matched, plus the message class in case the body carries
+ * the T100 key. A session in a third language still falls through to the raw 500, which is the
+ * behaviour without this check, so a miss costs nothing.
+ */
+export function isModelSerializationFailure(msg: string): boolean {
+  if (!/HTTP 500/.test(msg)) return false;
+  return /serialization failed|Serialisierung ist fehlgeschlagen|RS_RES_MODEL/i.test(msg);
+}
+
+/**
  * bw_get_transformation — read a Transformation (inactive version).
  * Returns raw XML + status + timestamp.
  * Note: Transformation name is a UUID-like generated key, not human-readable.
@@ -187,7 +210,22 @@ export async function bwGetTransformation(
   transformationName: string,
   format: 'text' | 'raw' = 'text',
 ): Promise<string> {
-  const result = await freshReadInactive(transformationName.toLowerCase());
+  let result: { body: string; headers: Record<string, string> };
+  try {
+    result = await freshReadInactive(transformationName.toLowerCase());
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    if (!isModelSerializationFailure(msg)) throw err;
+    // The serializer cannot build a model for this transformation. Deterministic for a given
+    // database state, so retrying is pointless — but the rules are still readable from the
+    // metadata tables, which is the one route that does not go through the serializer.
+    throw new Error(
+      `Transformation ${transformationName.toUpperCase()} cannot be read through the modeling API: ` +
+        'the backend failed to serialize its model (HTTP 500, RS_RES_MODEL 001). Retrying will not ' +
+        'help. Read it with bw_read_metadata_tables (object_type "TRFN") instead, or open it in ' +
+        'SAP GUI (RSTRAN).',
+    );
+  }
   const status = result.headers['object_status'] ?? result.headers['OBJECT_STATUS'] ?? 'unknown';
   const ts = result.headers['timestamp'] ?? '';
   const xml = result.body;
@@ -883,7 +921,7 @@ function buildStepDirectRule(params: {
             <endUserTexts label="${tgtLabel}"/>
             <inlineType name="${tgtType}" length="${tgtLength}" semanticType="empty"/>
             <localProperties xsi:type="BwCore:LocalCharacteristicProperties"/>
-            <atom:link href="/sap/bw/modeling/iobj/${tgtLower}/a" rel="self" xmlns:atom="http://www.w3.org/2005/Atom"/>
+            <atom:link href="/sap/bw/modeling/iobj/${bwSeg(tgtLower)}/a" rel="self" xmlns:atom="http://www.w3.org/2005/Atom"/>
             <associationType>1</associationType>
             <associationValid>true</associationValid>
           </element>
@@ -1531,7 +1569,7 @@ export async function bwUpdateTransformation(
     });
   } else {
     // Read InfoObject to get label and type info
-    const iObjPath = `/sap/bw/modeling/iobj/${targetInfoObject.toLowerCase()}/m`;
+    const iObjPath = `/sap/bw/modeling/iobj/${bwSeg(targetInfoObject)}/m`;
     const iObjResult = await client.get(iObjPath, MEDIA_TYPES['iobj']);
     const iObjProps = parseInfoObjectProps(iObjResult.body);
     const tgtProps = extractTargetElemProps(originalXml, tgtUpper);
@@ -1991,7 +2029,7 @@ export async function bwSetTransformationExpertRoutine(
 
     // Step 5: Priming GET (mirrors Eclipse), then TLOGO-activate with the same lockHandle.
     await client
-      .get(`/sap/bw/modeling/trfn/${trfnLower}/m?forceCacheUpdate=true`, trfnAccept())
+      .get(`/sap/bw/modeling/trfn/${bwSeg(trfnLower)}/m?forceCacheUpdate=true`, trfnAccept())
       .catch(() => {/* priming only */});
     activationXml = await client.activate('trfn', trfnLower, lockHandle);
   } catch (err) {
@@ -2273,7 +2311,7 @@ async function readActiveHanaRuntime(trfnLower: string): Promise<'true' | 'false
   try {
     const freshReader = createClientFromEnv();
     const { body } = await freshReader.get(
-      `/sap/bw/modeling/trfn/${trfnLower}/a?forceCacheUpdate=true`,
+      `/sap/bw/modeling/trfn/${bwSeg(trfnLower)}/a?forceCacheUpdate=true`,
       trfnAccept()
     );
     const m = body.match(/\bHANARuntime="(true|false)"/);
@@ -2306,7 +2344,7 @@ async function attemptRuntimeSwitch(
 
   try {
     const { body: xml, headers } = await client.get(
-      `/sap/bw/modeling/trfn/${trfnLower}/m?forceCacheUpdate=true`,
+      `/sap/bw/modeling/trfn/${bwSeg(trfnLower)}/m?forceCacheUpdate=true`,
       trfnAccept()
     );
     const timestamp = headers['timestamp'] ?? '';

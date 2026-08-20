@@ -1,5 +1,12 @@
 import { XMLParser } from 'fast-xml-parser';
-import { BwClient, createClientFromEnv, MEDIA_TYPES, resolveMasterSystem } from '../bw-client.js';
+import {
+  BwClient,
+  createClientFromEnv,
+  MEDIA_TYPES,
+  resolveMasterSystem,
+  bwSeg,
+  stripInfoAreaSentinel,
+} from '../bw-client.js';
 
 // Fallback version range used when the discovery document does not advertise a
 // query media type. The exact query version depends on the BW backend SP level,
@@ -468,7 +475,7 @@ function renderQueryText(q: Record<string, unknown>): string {
 export async function bwGetQuery(queryName: string, format: 'text' | 'raw' = 'text'): Promise<string> {
   const client = createClientFromEnv();
 
-  const basePath = `/sap/bw/modeling/query/${queryName.toLowerCase()}`;
+  const basePath = `/sap/bw/modeling/query/${bwSeg(queryName)}`;
   let xmlBody: string;
   let versionNote: string | undefined;
 
@@ -774,7 +781,7 @@ export async function bwGetQuery(queryName: string, format: 'text' | 'raw' = 'te
     infoProvider: (mainComp['@_providerName'] as string) ?? '',
     providerType,
     package: (packageRef?.['@_adtCore:name'] as string) ?? '',
-    infoArea: (entityProps['infoArea'] as string) ?? '',
+    infoArea: stripInfoAreaSentinel((entityProps['infoArea'] as string) ?? ''),
     status: (entityProps['objectStatus'] as string) ?? '',
     responsible: (entityProps['@_adtCore:responsible'] as string) ?? '',
     changedAt: (entityProps['@_adtCore:changedAt'] as string) ?? '',
@@ -857,7 +864,7 @@ export async function bwCreateQuery(
     if (args.infoprovider) {
       iprovUpper = args.infoprovider.toUpperCase();
     } else {
-      const srcGet = await client.get(`/sap/bw/modeling/query/${copyFromLower}/a`, queryAccept());
+      const srcGet = await client.get(`/sap/bw/modeling/query/${bwSeg(copyFromLower)}/a`, queryAccept());
       const mainOpen = srcGet.body.match(/<Qry:mainComponent\b[^>]*>/)?.[0] ?? '';
       const prov = mainOpen.match(/\bproviderName="([^"]+)"/)?.[1];
       if (!prov) {
@@ -901,7 +908,7 @@ export async function bwCreateQuery(
   // from the generic /{type}/{name} lock, so client.lock() cannot be reused.
   const csrfToken = await client.getCsrfToken();
   const lockResponse = await client.rawPost(
-    `/sap/bw/modeling/comp/enq/${nameLower}?action=lock&compuid=${elemuid}`,
+    `/sap/bw/modeling/comp/enq/${bwSeg(nameLower)}?action=lock&compuid=${elemuid}`,
     '',
     {
       'activity_context': 'CREA',
@@ -918,7 +925,7 @@ export async function bwCreateQuery(
   // Helper: unlock on the primary client's enqueue session, tolerating failures.
   const unlock = async () => {
     await client.rawPost(
-      `/sap/bw/modeling/comp/enq/${nameLower}?action=unlock&compuid=${elemuid}`,
+      `/sap/bw/modeling/comp/enq/${bwSeg(nameLower)}?action=unlock&compuid=${elemuid}`,
       '',
       { 'bwmt-level': '50', 'x-csrf-token': await client.getCsrfToken() });
   };
@@ -967,7 +974,7 @@ export async function bwCreateQuery(
     // Copy adds copyFromObjectName={SOURCE_UPPER} before compuid (payloads/query_copy.md).
     const copyParam = copyFromUpper ? `copyFromObjectName=${copyFromUpper}&` : '';
     const createResponse = await client2.rawPost(
-      `/sap/bw/modeling/query/${nameLower}/a?${copyParam}compuid=${elemuid}&lockHandle=${lockHandle}`,
+      `/sap/bw/modeling/query/${bwSeg(nameLower)}/a?${copyParam}compuid=${elemuid}&lockHandle=${lockHandle}`,
       xmlBody,
       {
         'Development-Class': '$TMP',
@@ -997,7 +1004,7 @@ export async function bwCreateQuery(
 
     // Step 7: Verify persistence with a GET (same Accept header as bwGetQuery).
     try {
-      await client.get(`/sap/bw/modeling/query/${nameLower}/a`, queryAccept());
+      await client.get(`/sap/bw/modeling/query/${bwSeg(nameLower)}/a`, queryAccept());
     } catch (verifyErr) {
       throw new Error(
         `Query '${nameUpper}' was not persisted after creation ` +

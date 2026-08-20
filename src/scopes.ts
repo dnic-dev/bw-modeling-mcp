@@ -52,6 +52,7 @@ const READ_TOOLS = new Set([
   'bw_get_push_schema',
   'bw_get_query',
   'bw_get_query_roles',
+  'bw_get_remodeling_request',
   'bw_get_request',
   'bw_get_rkf',
   'bw_get_role_queries',
@@ -64,12 +65,15 @@ const READ_TOOLS = new Set([
   'bw_list_datasources',
   'bw_list_process_chain_last_status',
   'bw_list_process_chain_runs',
+  'bw_list_remodeling_requests',
   'bw_list_remote_entities',
   'bw_list_requests',
   'bw_list_source_systems',
   'bw_preview_datasource',
   'bw_query_data',
+  'bw_read_metadata_tables',
   'bw_search',
+  'bw_system_profile',
   'bw_xref',
 ]);
 

@@ -1,4 +1,11 @@
-import { BwClient, MEDIA_TYPES, createClientFromEnv, freshRead } from '../bw-client.js';
+import {
+  BwClient,
+  MEDIA_TYPES,
+  createClientFromEnv,
+  freshRead,
+  bwSeg,
+  stripInfoAreaSentinel,
+} from '../bw-client.js';
 import { parseInfoObjectProps } from './infoobject.js';
 
 // ── aDSO type presets ────────────────────────────────────────────────────────
@@ -96,7 +103,7 @@ export async function bwUpdateAdsoSettings(
   settings: AdsoSettings
 ): Promise<string> {
   const adsoUpper = adsoName.toUpperCase();
-  const adsoPath = `/sap/bw/modeling/adso/${adsoName.toLowerCase()}/m`;
+  const adsoPath = `/sap/bw/modeling/adso/${bwSeg(adsoName)}/m`;
 
   // 1. Read current XML
   const adsoResult = await freshRead(adsoPath, adsoAccept());
@@ -166,7 +173,7 @@ export async function bwGetAdso(
   adsoName: string,
   format: 'text' | 'raw' = 'text',
 ): Promise<string> {
-  const path = `/sap/bw/modeling/adso/${adsoName.toLowerCase()}/m`;
+  const path = `/sap/bw/modeling/adso/${bwSeg(adsoName)}/m`;
   const result = await freshRead(path, adsoAccept());
   const status = result.headers['object_status'] ?? result.headers['OBJECT_STATUS'] ?? 'unknown';
   const ts = result.headers['timestamp'] ?? '';
@@ -194,7 +201,7 @@ function summarizeAdso(adsoName: string, status: string, xml: string): string {
   const desc = rawDesc
     .replace(/&quot;/g, '"').replace(/&amp;/g, '&')
     .replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&apos;/g, "'");
-  const infoArea = xml.match(/<infoArea>([^<]*)<\/infoArea>/)?.[1] ?? '';
+  const infoArea = stripInfoAreaSentinel(xml.match(/<infoArea>([^<]*)<\/infoArea>/)?.[1] ?? '');
   const pkg = xml.match(/<adtcore:packageRef\b[^>]*\badtcore:name="([^"]*)"/)?.[1] ?? '';
   const objectVersion = xml.match(/<objectVersion>([^<]*)<\/objectVersion>/)?.[1] ?? '';
   const versionMap: Record<string, string> = { M: 'Inactive', A: 'Active' };
@@ -211,7 +218,7 @@ function summarizeAdso(adsoName: string, status: string, xml: string): string {
   lines.push('── General ──');
   lines.push(`aDSO:        ${name}`);
   lines.push(`Description: ${desc}`);
-  lines.push(`InfoArea:    ${infoArea}`);
+  lines.push(`InfoArea:    ${infoArea || '(none)'}`);
   lines.push(`Package:     ${pkg}`);
   lines.push(`Status:      ${status}`);
   lines.push(`Version:     ${versionLabel}`);
@@ -449,7 +456,7 @@ export async function bwUpdateAdsoManageKeys(
   transport?: string
 ): Promise<string> {
   const adsoUpper = adsoName.toUpperCase();
-  const adsoPath = `/sap/bw/modeling/adso/${adsoName.toLowerCase()}/m`;
+  const adsoPath = `/sap/bw/modeling/adso/${bwSeg(adsoName)}/m`;
 
   // 1. Read current XML
   const adsoResult = await freshRead(adsoPath, adsoAccept());
@@ -523,7 +530,7 @@ export async function bwUpdateAdsoFieldProperties(
   const nameUpper = fieldName.trim().toUpperCase();
 
   // 1. GET full XML
-  const adsoPath = `/sap/bw/modeling/adso/${adsoName.toLowerCase()}/m`;
+  const adsoPath = `/sap/bw/modeling/adso/${bwSeg(adsoName)}/m`;
   const adsoResult = await freshRead(adsoPath, adsoAccept());
   const timestamp = adsoResult.headers['timestamp'] ?? adsoResult.headers['TIMESTAMP'];
   const fullXml = adsoResult.body;
@@ -910,7 +917,7 @@ export async function bwUpdateAdsoAddPureField(
   transport?: string
 ): Promise<string> {
   const adsoUpper = adsoName.toUpperCase();
-  const adsoPath = `/sap/bw/modeling/adso/${adsoName.toLowerCase()}/m`;
+  const adsoPath = `/sap/bw/modeling/adso/${bwSeg(adsoName)}/m`;
 
   const adsoResult = await freshRead(adsoPath, adsoAccept());
   const timestamp = adsoResult.headers['timestamp'] ?? adsoResult.headers['TIMESTAMP'];
@@ -1005,7 +1012,7 @@ export async function bwUpdateAdso(
   const adsoUpper = adsoName.toUpperCase();
 
   // Read current aDSO once (full XML + timestamp)
-  const adsoPath = `/sap/bw/modeling/adso/${adsoName.toLowerCase()}/m`;
+  const adsoPath = `/sap/bw/modeling/adso/${bwSeg(adsoName)}/m`;
   const adsoResult = await freshRead(adsoPath, adsoAccept());
   const timestamp = adsoResult.headers['timestamp'] ?? adsoResult.headers['TIMESTAMP'];
 
@@ -1040,7 +1047,7 @@ export async function bwUpdateAdso(
         continue;
       }
       const iObjResult = await iobjReader.get(
-        `/sap/bw/modeling/iobj/${name.toLowerCase()}/m?forceCacheUpdate=true`,
+        `/sap/bw/modeling/iobj/${bwSeg(name)}/m?forceCacheUpdate=true`,
         MEDIA_TYPES['iobj']
       );
       const iObjProps = parseInfoObjectProps(iObjResult.body);

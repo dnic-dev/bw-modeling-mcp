@@ -1,4 +1,11 @@
-import { BwClient, MEDIA_TYPES, resolveMasterSystem } from '../bw-client.js';
+import {
+  BwClient,
+  MEDIA_TYPES,
+  resolveMasterSystem,
+  bwSeg,
+  bwSegUpper,
+  bwEscapeName,
+} from '../bw-client.js';
 
 const BASE = '/sap/bw/modeling/repo/datasourcestructure';
 const BASE_PREFIX = `${BASE}/`;
@@ -319,7 +326,7 @@ export async function bwGetDatasource(
   sourceSystem: string,
   format: 'text' | 'raw' = 'text',
 ): Promise<string> {
-  const url = `/sap/bw/modeling/rsds/${datasourceName}/${sourceSystem.toUpperCase()}/m`;
+  const url = `/sap/bw/modeling/rsds/${encodeURIComponent(bwEscapeName(datasourceName))}/${sourceSystem.toUpperCase()}/m`;
   const { body, headers } = await client.get(url, RSDS_ACCEPT);
 
   if (format === 'raw') return body;
@@ -681,8 +688,8 @@ export async function bwCreateDatasource(
   const masterSystem = await resolveMasterSystem(client);
   const responsible = (process.env.BW_USER ?? '').toUpperCase();
 
-  const lockUrl   = `/sap/bw/modeling/rsds/${dsLower}/${ssUpper}?action=lock`;
-  const unlockUrl = `/sap/bw/modeling/rsds/${dsLower}/${ssUpper}?action=unlock`;
+  const lockUrl   = `/sap/bw/modeling/rsds/${bwSeg(dsLower)}/${ssUpper}?action=lock`;
+  const unlockUrl = `/sap/bw/modeling/rsds/${bwSeg(dsLower)}/${ssUpper}?action=unlock`;
 
   // Step 1: Lock (CREA) — establishes the enqueue session + CSRF on this client.
   const csrf = await client.getCsrfToken();
@@ -698,7 +705,7 @@ export async function bwCreateDatasource(
 
   // Step 2: Create from proposal (with lockHandle). Server materialises the full structure.
   const createUrl =
-    `/sap/bw/modeling/rsds/${dsLower}/${ssUpper}` +
+    `/sap/bw/modeling/rsds/${bwSeg(dsLower)}/${ssUpper}` +
     `?copyFromObjectName=initial&copyFromObjectType=_proposal&lockHandle=${encodeURIComponent(lockHandle)}`;
 
   const postBody = `<?xml version="1.0" encoding="UTF-8"?>
@@ -758,7 +765,7 @@ export async function bwPreviewDatasource(
   sourceSystem: string,
   records: number = 20,
 ): Promise<string> {
-  const structureUrl = `/sap/bw/modeling/rsds/${datasourceName.toLowerCase()}/${sourceSystem.toUpperCase()}/m`;
+  const structureUrl = `/sap/bw/modeling/rsds/${bwSeg(datasourceName)}/${sourceSystem.toUpperCase()}/m`;
   const { body: structureBody } = await client.get(structureUrl, RSDS_ACCEPT);
 
   const segMatch = structureBody.match(/<segment\b[^>]*ID="0001"[^>]*>([\s\S]*?)<\/segment>/);
@@ -782,7 +789,7 @@ export async function bwPreviewDatasource(
   fieldEntries.sort((a, b) => a.position - b.position);
   const fieldNames = fieldEntries.map(f => f.name);
 
-  const url = `/sap/bw/modeling/rsdsint/dataprev/${datasourceName.toUpperCase()}/${sourceSystem.toUpperCase()}?records=${records}&external=true`;
+  const url = `/sap/bw/modeling/rsdsint/dataprev/${bwSegUpper(datasourceName)}/${sourceSystem.toUpperCase()}?records=${records}&external=true`;
   const csrfToken = await client.getCsrfToken();
   const { body: previewBody } = await client.rawPost(url, '', {
     'x-csrf-token': csrfToken,
@@ -868,7 +875,7 @@ export async function bwChangeDatasourceDelta(
   const dsUpper = args.datasourceName.toUpperCase();
   const dsLower = args.datasourceName.toLowerCase();
   const ssUpper = args.sourceSystem.toUpperCase();
-  const mUrl = `/sap/bw/modeling/rsds/${dsUpper}/${ssUpper}/m`;
+  const mUrl = `/sap/bw/modeling/rsds/${bwSegUpper(dsUpper)}/${ssUpper}/m`;
 
   // 1. Read current full body (this exact XML is PUT back with one attribute changed).
   const { body: current } = await client.rawGet(mUrl, { Accept: RSDS_ACCEPT });
@@ -902,8 +909,8 @@ export async function bwChangeDatasourceDelta(
   // Writing requests (lock, PUT, unlock) must carry a fetched CSRF token — rawPost/rawPut
   // do not add one automatically. Reuse the same token across the whole sequence, on the
   // same cookie session (same pattern as bwCreateDatasource).
-  const lockUrl = `/sap/bw/modeling/rsds/${dsLower}/${ssUpper}?action=lock`;
-  const unlockUrl = `/sap/bw/modeling/rsds/${dsLower}/${ssUpper}?action=unlock`;
+  const lockUrl = `/sap/bw/modeling/rsds/${bwSeg(dsLower)}/${ssUpper}?action=lock`;
+  const unlockUrl = `/sap/bw/modeling/rsds/${bwSeg(dsLower)}/${ssUpper}?action=unlock`;
   const csrf = await client.getCsrfToken();
   const lockRes = await client.rawPost(lockUrl, '', { Accept: RSDS_ACCEPT, 'x-csrf-token': csrf });
   const lockHandle = lockRes.body.match(/<LOCK_HANDLE>([^<]+)<\/LOCK_HANDLE>/)?.[1] ?? '';
@@ -984,7 +991,7 @@ export async function bwSetDatasourceFields(
   const dsUpper = args.datasourceName.toUpperCase();
   const dsLower = args.datasourceName.toLowerCase();
   const ssUpper = args.sourceSystem.toUpperCase();
-  const mUrl = `/sap/bw/modeling/rsds/${dsUpper}/${ssUpper}/m`;
+  const mUrl = `/sap/bw/modeling/rsds/${bwSegUpper(dsUpper)}/${ssUpper}/m`;
 
   const hasFields = !!args.fields && args.fields.length > 0;
   if (!hasFields && args.languageField === undefined) {
@@ -1051,8 +1058,8 @@ export async function bwSetDatasourceFields(
   }
 
   // 2. Lock; capture LOCK_HANDLE and the timestamp response header.
-  const lockUrl = `/sap/bw/modeling/rsds/${dsLower}/${ssUpper}?action=lock`;
-  const unlockUrl = `/sap/bw/modeling/rsds/${dsLower}/${ssUpper}?action=unlock`;
+  const lockUrl = `/sap/bw/modeling/rsds/${bwSeg(dsLower)}/${ssUpper}?action=lock`;
+  const unlockUrl = `/sap/bw/modeling/rsds/${bwSeg(dsLower)}/${ssUpper}?action=unlock`;
   const csrf = await client.getCsrfToken();
   const lockRes = await client.rawPost(lockUrl, '', { Accept: RSDS_ACCEPT, 'x-csrf-token': csrf });
   const lockHandle = lockRes.body.match(/<LOCK_HANDLE>([^<]+)<\/LOCK_HANDLE>/)?.[1] ?? '';

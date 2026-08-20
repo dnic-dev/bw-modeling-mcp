@@ -37,6 +37,31 @@ function resolveMediaType(type: string): string {
   return mt;
 }
 
+/**
+ * Escape a BW object name the way the backend does before it puts a name into a URI:
+ * every `/` becomes `$` and every `:` becomes `!` (see `CL_RSEM_MODEL_OBJECT=>ESCAPE_OBJECT_NAME`).
+ * Names without those characters are returned unchanged.
+ *
+ * This matters for namespaced names such as `/NS/OBJECT_NAME`: left as-is they produce a
+ * double slash in the URL path and the resource is never reached.
+ */
+export function bwEscapeName(name: string): string {
+  return name.replace(/\//g, '$').replace(/:/g, '!');
+}
+
+/**
+ * Encode an object name as a lowercase `/sap/bw/modeling/{type}/{name}` path segment.
+ * For a plain ASCII name this is byte-identical to `name.toLowerCase()`.
+ */
+export function bwSeg(name: string): string {
+  return encodeURIComponent(bwEscapeName(name).toLowerCase());
+}
+
+/** Same as `bwSeg`, for the endpoints that address the object in upper case. */
+export function bwSegUpper(name: string): string {
+  return encodeURIComponent(bwEscapeName(name).toUpperCase());
+}
+
 export interface GetResult {
   body: string;
   headers: Record<string, string>;
@@ -306,16 +331,33 @@ export class BwClient {
 
   // ── CSRF token ─────────────────────────────────────────────────────────────
 
+  // Connection-level failures that mean "the socket died", not "the server said no".
+  // A keep-alive socket that the server has already torn down surfaces as one of these on
+  // the next request; the request never reached the backend, so retrying it is safe.
+  private static isTransportError(err: any): boolean {
+    const code = err?.code ?? err?.cause?.code;
+    return (
+      code === 'ECONNRESET' ||
+      code === 'ECONNABORTED' ||
+      code === 'EPIPE' ||
+      code === 'ETIMEDOUT' ||
+      /socket hang up/i.test(String(err?.message ?? ''))
+    );
+  }
+
   private async fetchCsrfToken(): Promise<void> {
-    const response = await this.http.get('/sap/bw/modeling/repo/is/systeminfo', {
-      headers: {
-        'X-CSRF-Token': 'Fetch',
-        Accept: 'application/xml',
-        ...this.authHeaders(),
-        ...this.cookieHeaders(),
-      },
-      responseType: 'text',
-    });
+    // Retry once on a dead socket. The CSRF fetch is a plain GET with no side effects, and
+    // it is the first request after every write — so a connection the server closed while
+    // the previous write was being committed would otherwise abort the whole flow (seen on
+    // a sequence of process-chain writes: several succeed, then the next token fetch dies
+    // with ECONNRESET). A real HTTP error is not retried.
+    let response;
+    try {
+      response = await this.csrfRequest();
+    } catch (err: any) {
+      if (!BwClient.isTransportError(err)) throw err;
+      response = await this.csrfRequest();
+    }
     this.updateCookies(response);
     const token = response.headers['x-csrf-token'] as string | undefined;
     if (!token || token.toLowerCase() === 'fetch') {
@@ -332,6 +374,18 @@ export class BwClient {
     }
     this.csrfToken = token;
     this.csrfTokenFetchedAt = Date.now();
+  }
+
+  private csrfRequest() {
+    return this.http.get('/sap/bw/modeling/repo/is/systeminfo', {
+      headers: {
+        'X-CSRF-Token': 'Fetch',
+        Accept: 'application/xml',
+        ...this.authHeaders(),
+        ...this.cookieHeaders(),
+      },
+      responseType: 'text',
+    });
   }
 
   private async ensureCsrf(): Promise<void> {
@@ -414,7 +468,7 @@ export class BwClient {
           ...extraHeaders,
         };
     const response = await this.http.post(
-      `/sap/bw/modeling/${type.toLowerCase()}/${name.toLowerCase()}?action=lock`,
+      `/sap/bw/modeling/${type.toLowerCase()}/${bwSeg(name)}?action=lock`,
       '',
       {
         headers,
@@ -467,7 +521,7 @@ export class BwClient {
       .map(([k, v]) => `&${k}=${encodeURIComponent(v)}`)
       .join('');
     const path =
-      `/sap/bw/modeling/${type.toLowerCase()}/${name.toLowerCase()}?lockHandle=${lockHandle}${query}`;
+      `/sap/bw/modeling/${type.toLowerCase()}/${bwSeg(name)}?lockHandle=${lockHandle}${query}`;
     const response = await this.http.post(path, body, {
       headers: {
         'Content-Type': `application/xml, ${mediaType}`,
@@ -503,7 +557,7 @@ export class BwClient {
     await this.ensureCsrf();
     const mediaType = resolveMediaType(type);
     const corrNrPrefix = corrNr ? `corrNr=${corrNr}&` : '';
-    const path = `/sap/bw/modeling/${type.toLowerCase()}/${name.toLowerCase()}/m?${corrNrPrefix}lockHandle=${lockHandle}`;
+    const path = `/sap/bw/modeling/${type.toLowerCase()}/${bwSeg(name)}/m?${corrNrPrefix}lockHandle=${lockHandle}`;
     const response = await this.http.put(path, body, {
       headers: {
         'Content-Type': `application/xml, ${mediaType}`,
@@ -531,7 +585,7 @@ export class BwClient {
   async lockForDelete(type: string, name: string, mediaType: string): Promise<string> {
     await this.ensureCsrf();
     const response = await this.http.post(
-      `/sap/bw/modeling/${type.toLowerCase()}/${name.toLowerCase()}/m?action=lock`,
+      `/sap/bw/modeling/${type.toLowerCase()}/${bwSeg(name)}/m?action=lock`,
       '',
       {
         headers: {
@@ -571,7 +625,7 @@ export class BwClient {
     mediaType: string
   ): Promise<string> {
     await this.ensureCsrf();
-    const path = `/sap/bw/modeling/${type.toLowerCase()}/${name.toLowerCase()}/m?lockHandle=${lockHandle}`;
+    const path = `/sap/bw/modeling/${type.toLowerCase()}/${bwSeg(name)}/m?lockHandle=${lockHandle}`;
     const response = await this.http.delete(path, {
       headers: {
         'Content-Type': mediaType,
@@ -601,8 +655,8 @@ export class BwClient {
     // RSDS (DataSource) has a compound key (DataSource + source system) and uses an
     // uppercase two-segment URI. All other types use the single-segment lowercase URI.
     const href = typeLower === 'rsds'
-      ? `/sap/bw/modeling/rsds/${name.toUpperCase()}/${(sourceSystem ?? '').toUpperCase()}/m`
-      : `/sap/bw/modeling/${typeLower}/${name.toLowerCase()}/m`;
+      ? `/sap/bw/modeling/rsds/${bwSegUpper(name)}/${(sourceSystem ?? '').toUpperCase()}/m`
+      : `/sap/bw/modeling/${typeLower}/${bwSeg(name)}/m`;
     const body = `<?xml version="1.0" encoding="UTF-8"?>
 <atom:feed xmlns:atom="http://www.w3.org/2005/Atom" xmlns:bwModel="http://www.sap.com/bw/modeling">
   <atom:entry>
@@ -1046,7 +1100,7 @@ export class BwClient {
     await this.ensureCsrf();
     const mediaType = resolveMediaType(type);
     const response = await this.http.post(
-      `/sap/bw/modeling/${type.toLowerCase()}/${name.toLowerCase()}?action=unlock`,
+      `/sap/bw/modeling/${type.toLowerCase()}/${bwSeg(name)}?action=unlock`,
       '',
       {
         headers: {
@@ -1181,6 +1235,19 @@ export async function resolveMasterSystem(client: BwClient): Promise<string> {
     // Fall through to the host derivation below.
   }
   return new URL(process.env.BW_URL ?? 'http://localhost').hostname.split('.')[0].toUpperCase();
+}
+
+/**
+ * The InfoArea an object reports, with the backend's placeholder for "no InfoArea" removed.
+ *
+ * `NODESNOTCONNECTED` (`RSA_C_DEFAPPL`) is not an InfoArea. `CL_RSO_REPO_OBJECT` substitutes it
+ * whenever an object's InfoArea is empty or names an area that does not exist, so that the
+ * modeling tree still has a node to hang the object under — and the object read then reports
+ * that placeholder as if it were the real assignment. Surfacing it invites a caller to treat it
+ * as an addressable area; an empty string says what the backend actually means.
+ */
+export function stripInfoAreaSentinel(infoArea: string): string {
+  return infoArea.trim().toUpperCase() === 'NODESNOTCONNECTED' ? '' : infoArea;
 }
 
 export function decodeXmlEntities(value: string): string {

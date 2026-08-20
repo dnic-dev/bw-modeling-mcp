@@ -1,4 +1,12 @@
-import { BwClient, MEDIA_TYPES, createClientFromEnv, freshRead, resolveMasterSystem } from '../bw-client.js';
+import {
+  BwClient,
+  MEDIA_TYPES,
+  createClientFromEnv,
+  freshRead,
+  resolveMasterSystem,
+  bwSeg,
+  bwSegUpper,
+} from '../bw-client.js';
 import { bwActivate } from './activation.js';
 
 interface XrefEntry {
@@ -83,7 +91,7 @@ export async function bwGetDtps(
  * (Used internally; exposed via bw_get_dtps in index.ts if needed.)
  */
 export async function bwGetDtpDetails(client: BwClient, dtpName: string): Promise<string> {
-  const path = `/sap/bw/modeling/dtpa/${dtpName.toLowerCase()}/m`;
+  const path = `/sap/bw/modeling/dtpa/${bwSeg(dtpName)}/m`;
   const result = await freshRead(path, MEDIA_TYPES['dtpa']);
   const status = result.headers['object_status'] ?? result.headers['OBJECT_STATUS'] ?? 'unknown';
   return `DTP: ${dtpName.toUpperCase()}\nStatus: ${status}\n\n${result.body}`;
@@ -95,6 +103,7 @@ interface DtpFilterSelection {
   operator: string;
   excluding: boolean;
   low: string;
+  high: string;
 }
 
 interface DtpFilterField {
@@ -176,7 +185,8 @@ function parseDtpXml(xml: string, status: string): DtpInfo {
       const operator = selAttrs.match(/\boperator="([^"]*)"/)?.[1] ?? '';
       const excluding = selAttrs.includes('excluding="true"');
       const low = selBody.match(/<low[^>]*\bvalue="([^"]*)"/)?.[1] ?? '';
-      selections.push({ operator, excluding, low });
+      const high = selBody.match(/<high[^>]*\bvalue="([^"]*)"/)?.[1] ?? '';
+      selections.push({ operator, excluding, low, high });
     }
 
     const hasRoutine = /<routine[\s>]/.test(fieldBody) && !/<routine\s*\/>/.test(fieldBody);
@@ -249,7 +259,7 @@ function parseDtpXml(xml: string, status: string): DtpInfo {
 export async function bwGetDtp(client: BwClient, dtpName: string): Promise<string> {
   // Fresh session: the shared client's buffer serves the stale inactive shadow
   // after this session touched the DTP (forceCacheUpdate alone does not help there).
-  const path = `/sap/bw/modeling/dtpa/${dtpName.toLowerCase()}/m`;
+  const path = `/sap/bw/modeling/dtpa/${bwSeg(dtpName)}/m`;
   const result = await freshRead(path, MEDIA_TYPES['dtpa']);
   const status = result.headers['object_status'] ?? result.headers['OBJECT_STATUS'] ?? 'unknown';
 
@@ -280,9 +290,10 @@ export async function bwGetDtp(client: BwClient, dtpName: string): Promise<strin
       lines.push(`  [${f.selected ? 'selected' : 'inactive'}] ${f.name} (${f.dtaName})`);
       if (f.selections.length > 0) {
         for (const s of f.selections) {
-          const sign = s.excluding ? '≠' : '=';
-          const val = s.low === '' ? "''" : `"${s.low}"`;
-          lines.push(`    → ${s.operator} ${sign} ${val}`);
+          const sign = s.excluding ? 'E' : 'I';
+          const val = s.low === '' ? "'' (BW initial value)" : `"${s.low}"`;
+          const range = s.high === '' ? '' : ` .. "${s.high}"`;
+          lines.push(`    → [${sign}] ${s.operator} ${val}${range}`);
         }
       }
       if (f.hasRoutine) {
@@ -344,7 +355,7 @@ export async function bwUnlockDtp(client: BwClient, dtpName: string): Promise<vo
   const dtpLower = dtpName.toLowerCase();
   const csrf = await client.getCsrfToken();
   await client.rawPost(
-    `/sap/bw/modeling/dtpa/${dtpLower}?action=unlock`,
+    `/sap/bw/modeling/dtpa/${bwSeg(dtpLower)}?action=unlock`,
     '',
     {
       'Content-Type': MEDIA_TYPES['dtpa'],
@@ -352,6 +363,298 @@ export async function bwUnlockDtp(client: BwClient, dtpName: string): Promise<vo
       'x-csrf-token': csrf,
     }
   );
+}
+
+// ── DTP filter selections ─────────────────────────────────────────────────────
+
+/**
+ * One selection line of a DTP filter field, modelled on the ABAP range vocabulary:
+ * sign I/E plus an operator and one or two bounds.
+ *
+ * The operator names are the ones the server itself publishes per field in the
+ * <operators> elements of the DTP document — EQ/BT/CP of a RANGE table map to
+ * Equal/Between/ContainsPattern. See payloads/dtp_filter_selections.md.
+ */
+export interface DtpFilterSelectionInput {
+  operator?: string;
+  sign?: 'I' | 'E';
+  low: string;
+  high?: string;
+}
+
+interface FieldOperator {
+  operator: string;
+  including: boolean;
+  excluding: boolean;
+}
+
+/**
+ * Escape a value for an XML attribute. Filter values and their descriptions reach the
+ * server verbatim, so an unescaped `&` fails the PUT with HTTP 500 and no usable message.
+ */
+function escapeXmlAttr(value: string): string {
+  return value
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;');
+}
+
+/** Field names carry regex metacharacters, e.g. the /BIC/ prefix of custom fields. */
+function escapeRegExp(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\/]/g, '\\$&');
+}
+
+function fieldBlockRegExp(fieldName: string): RegExp {
+  const escaped = escapeRegExp(fieldName);
+  return new RegExp(
+    `<fields\\b[^>]*\\sname="${escaped}"[^>]*(?:/>|>[\\s\\S]*?</fields>)`
+  );
+}
+
+/**
+ * Locate the <fields> block of one filter field. A field name that matches nothing must be
+ * an error, not a no-op: the whole write is a patch on the document, so an unmatched name
+ * produces a PUT that succeeds and changes nothing — indistinguishable from success for the
+ * caller.
+ */
+function extractFieldBlock(xml: string, fieldName: string, dtpName: string): { regex: RegExp; block: string } {
+  const regex = fieldBlockRegExp(fieldName);
+  const block = xml.match(regex)?.[0];
+  if (!block) {
+    const available = [...xml.matchAll(/<fields\b[^>]*\sname="([^"]*)"/g)].map((m) => m[1]);
+    throw new Error(
+      `Filter field '${fieldName}' does not exist in DTP '${dtpName}'. ` +
+      (available.length > 0
+        ? `Available filter fields: ${available.join(', ')}.`
+        : `This DTP has no filter fields.`) +
+      ` Use bw_get_dtp to see the exact field names.`
+    );
+  }
+  return { regex, block };
+}
+
+/** Operators the server accepts for this field, with the allowed signs. */
+function parseFieldOperators(fieldBlock: string): FieldOperator[] {
+  return [...fieldBlock.matchAll(/<operators\b([^>]*)\/>/g)].map((m) => ({
+    operator: m[1].match(/\boperator="([^"]*)"/)?.[1] ?? '',
+    including: /\bincluding="true"/.test(m[1]),
+    excluding: /\bexcluding="true"/.test(m[1]),
+  }));
+}
+
+/**
+ * Validate one selection against the operators the field publishes. Validating against the
+ * document instead of a compiled-in enum keeps the tool honest when a field offers fewer
+ * operators (the comparison operators are including-only on every field seen so far).
+ */
+function validateSelection(
+  sel: DtpFilterSelectionInput,
+  operators: FieldOperator[],
+  fieldName: string
+): { operator: string; excluding: boolean; low: string; high?: string } {
+  const operator = sel.operator ?? 'Equal';
+  const sign = sel.sign ?? 'I';
+  if (sign !== 'I' && sign !== 'E') {
+    throw new Error(`Invalid sign '${sign}' on field '${fieldName}' — use 'I' (include) or 'E' (exclude).`);
+  }
+  const excluding = sign === 'E';
+
+  // Fields without a published operator list are not validated — only the structural rules
+  // below apply, which do not depend on the field.
+  if (operators.length > 0) {
+    const match = operators.find((o) => o.operator === operator);
+    if (!match) {
+      throw new Error(
+        `Operator '${operator}' is not supported for filter field '${fieldName}'. ` +
+        `Supported: ${operators.map((o) => o.operator).join(', ')}.`
+      );
+    }
+    if (excluding && !match.excluding) {
+      throw new Error(
+        `Operator '${operator}' cannot be used excluding (sign 'E') on filter field '${fieldName}'. ` +
+        `Excluding is available for: ${operators.filter((o) => o.excluding).map((o) => o.operator).join(', ') || 'none'}.`
+      );
+    }
+    if (!excluding && !match.including) {
+      throw new Error(
+        `Operator '${operator}' cannot be used including (sign 'I') on filter field '${fieldName}'.`
+      );
+    }
+  }
+
+  const high = sel.high ?? '';
+  if (operator === 'Between') {
+    if (sel.low === '' || high === '') {
+      throw new Error(`Operator 'Between' on filter field '${fieldName}' requires both low and high.`);
+    }
+  } else if (high !== '') {
+    throw new Error(
+      `Only operator 'Between' takes a high value — field '${fieldName}' uses '${operator}'.`
+    );
+  } else if (sel.low === '' && operator !== 'Equal' && operator !== 'NotEqual') {
+    // The empty string is the selection on the BW initial value; only the equality
+    // operators express it.
+    throw new Error(
+      `An empty low value (BW initial value) is only valid with 'Equal' or 'NotEqual' — ` +
+      `field '${fieldName}' uses '${operator}'.`
+    );
+  }
+
+  return { operator, excluding, low: sel.low, high: operator === 'Between' ? high : undefined };
+}
+
+/**
+ * Serialize selections in the form a GET returns: explicit excluding attribute, one
+ * <selection> per value, <low>/<high> carrying value and description. An empty low is a
+ * self-closing <selection> with no bound — the selection on the BW initial value, which is
+ * not the same thing as the literal value '#'.
+ */
+function buildSelectionsXml(
+  selections: { operator: string; excluding: boolean; low: string; high?: string }[]
+): string {
+  return selections
+    .map((s) => {
+      const open = `<selection excluding="${s.excluding}" operator="${s.operator}"`;
+      if (s.low === '' && s.high === undefined) {
+        return `${open}/>`;
+      }
+      const bounds = [`        <low description="${escapeXmlAttr(s.low)}" value="${escapeXmlAttr(s.low)}"/>`];
+      if (s.high !== undefined) {
+        bounds.push(`        <high description="${escapeXmlAttr(s.high)}" value="${escapeXmlAttr(s.high)}"/>`);
+      }
+      return `${open}>\n${bounds.join('\n')}\n      </selection>`;
+    })
+    .join('\n      ');
+}
+
+/** Split a <fields> block into its open tag and its body (self-closing blocks have none). */
+function splitFieldBlock(block: string): { openAttrs: string; body: string } {
+  const selfClosing = block.match(/^<fields\b([^>]*?)\/>$/);
+  if (selfClosing) {
+    return { openAttrs: selfClosing[1].replace(/\s+$/, ''), body: '' };
+  }
+  const m = block.match(/^<fields\b([^>]*)>([\s\S]*)<\/fields>$/);
+  if (!m) {
+    throw new Error(`Unexpected <fields> serialization: ${block.slice(0, 120)}`);
+  }
+  return { openAttrs: m[1], body: m[2] };
+}
+
+/** Existing routine element of a field, or an empty <routine/> when it has none. */
+function extractRoutineElement(body: string): { routine: string; rest: string } {
+  const withCode = body.match(/<routine\b[^>]*>[\s\S]*?<\/routine>/);
+  if (withCode) {
+    return { routine: withCode[0], rest: body.replace(withCode[0], '') };
+  }
+  const empty = body.match(/<routine\s*\/>/);
+  if (empty) {
+    return { routine: '<routine/>', rest: body.replace(empty[0], '') };
+  }
+  return { routine: '<routine/>', rest: body };
+}
+
+function stripSelections(body: string): string {
+  return body
+    .replace(/<selection\b[^>]*\/>\s*/g, '')
+    .replace(/<selection\b[^>]*>[\s\S]*?<\/selection>\s*/g, '');
+}
+
+function setSelectedAttr(openAttrs: string, selected: boolean): string {
+  const withoutSelected = openAttrs.replace(/\s+selected="[^"]*"/, '');
+  return selected ? `${withoutSelected} selected="true"` : withoutSelected;
+}
+
+/**
+ * Replace the value selections of one filter field with the given set (replace semantics —
+ * a single call carries the complete selection of that field).
+ *
+ * The /m deserializer is sequence-sensitive: <routine> first, then the selections, then
+ * <infoObject> (InfoObject-based fields only) and <operators>. An existing routine is kept
+ * untouched, so values and a filter routine can coexist on the same field, which is what the
+ * server itself serializes.
+ */
+export function applyDtpFilterSelections(
+  xml: string,
+  fieldName: string,
+  selections: DtpFilterSelectionInput[],
+  dtpName: string
+): string {
+  const { regex, block } = extractFieldBlock(xml, fieldName, dtpName);
+  const operators = parseFieldOperators(block);
+  const validated = selections.map((s) => validateSelection(s, operators, fieldName));
+
+  const { openAttrs, body } = splitFieldBlock(block);
+  const { routine, rest } = extractRoutineElement(stripSelections(body));
+  const selectionsXml = validated.length > 0 ? `\n      ${buildSelectionsXml(validated)}` : '';
+  const newBlock =
+    `<fields${setSelectedAttr(openAttrs, true)}>\n      ${routine}${selectionsXml}` +
+    `${rest.replace(/^\s*/, '\n      ')}</fields>`;
+
+  // Replacer function, not a plain string: field descriptions and values may contain '$'.
+  return xml.replace(regex, () => newBlock);
+}
+
+/**
+ * Drop the value selections of one filter field. The field is deselected as well unless it
+ * carries a filter routine — the routine, not the value list, is then the active filter.
+ */
+export function clearDtpFilterField(xml: string, fieldName: string, dtpName: string): string {
+  const { regex, block } = extractFieldBlock(xml, fieldName, dtpName);
+  const { openAttrs, body } = splitFieldBlock(block);
+  const hasRoutineCode = /<routine\b[^>]*>[\s\S]*?<\/routine>/.test(body);
+  const cleanedBody = stripSelections(body);
+  const newBlock = body === ''
+    ? `<fields${setSelectedAttr(openAttrs, hasRoutineCode)}/>`
+    : `<fields${setSelectedAttr(openAttrs, hasRoutineCode)}>${cleanedBody}</fields>`;
+  return xml.replace(regex, () => newBlock);
+}
+
+/**
+ * Resolve the two ways of expressing a filter into one selection list: filter_value for the
+ * common case (one or more Equal values, one sign for all of them) and filter_selections for
+ * the full range vocabulary. Passing both is an error rather than a silent precedence rule.
+ */
+export function resolveFilterSelections(args: {
+  filter_field?: string;
+  filter_value?: string;
+  filter_excluding?: boolean;
+  filter_selections?: DtpFilterSelectionInput[];
+}): DtpFilterSelectionInput[] | undefined {
+  const hasValue = args.filter_value !== undefined;
+  const hasSelections = args.filter_selections !== undefined && args.filter_selections.length > 0;
+
+  if (hasValue && hasSelections) {
+    throw new Error(
+      'filter_value and filter_selections are mutually exclusive — use filter_selections for ' +
+      'operators, ranges or mixed signs, filter_value for a plain list of Equal values.'
+    );
+  }
+  if ((hasValue || hasSelections) && !args.filter_field) {
+    throw new Error('filter_value / filter_selections require filter_field.');
+  }
+  if (args.filter_field && !hasValue && !hasSelections) {
+    throw new Error(
+      `filter_field '${args.filter_field}' was given without filter_value or filter_selections. ` +
+      'To remove a filter, use filter_clear_fields.'
+    );
+  }
+  if (hasSelections && args.filter_excluding !== undefined) {
+    throw new Error(
+      'filter_excluding applies to filter_value only — set the sign per entry in filter_selections.'
+    );
+  }
+
+  if (hasSelections) {
+    return args.filter_selections;
+  }
+  if (hasValue) {
+    const sign = args.filter_excluding ? 'E' : 'I';
+    // Preserve the empty string (selection on the BW initial value) — do not filter(Boolean).
+    const values = [...new Set(args.filter_value!.split(',').map((v) => v.trim()))];
+    return values.map((low) => ({ operator: 'Equal', sign, low } as DtpFilterSelectionInput));
+  }
+  return undefined;
 }
 
 // ── bwCreateDtp ───────────────────────────────────────────────────────────────
@@ -368,8 +671,9 @@ export interface CreateDtpArgs {
   description?: string;
   package?: string;
   filter_field?: string;
-  filter_dta_name?: string;
   filter_value?: string;
+  filter_excluding?: boolean;
+  filter_selections?: DtpFilterSelectionInput[];
 }
 
 /**
@@ -394,6 +698,8 @@ export async function bwCreateDtp(
   const tgtType    = args.target_type.toUpperCase();
   const desc       = args.description ?? '';
   const pkg        = args.package ?? '$TMP';
+  // Resolved before the create so an invalid filter fails before any object exists.
+  const filterSelections = resolveFilterSelections(args);
 
   // Source element attributes. For ADSO/TRCS sources tlogo and type coincide and the name is
   // passed through. For a DataSource source (source_type "RSDS") tlogo and type differ
@@ -474,7 +780,7 @@ export async function bwCreateDtp(
   // Step 2: Lock with CREA
   const csrfToken2 = await client.getCsrfToken();
   const lockResponse = await client.rawPost(
-    `/sap/bw/modeling/dtpa/${dtpLower}?action=lock`,
+    `/sap/bw/modeling/dtpa/${bwSeg(dtpLower)}?action=lock`,
     '',
     {
       'activity_context': 'CREA',
@@ -518,7 +824,7 @@ export async function bwCreateDtp(
     const createClient = createClientFromEnv();
     const createCsrf = await createClient.getCsrfToken();
     await createClient.rawPost(
-      `/sap/bw/modeling/dtpa/${dtpLower}?lockHandle=${lockHandle}`,
+      `/sap/bw/modeling/dtpa/${bwSeg(dtpLower)}?lockHandle=${lockHandle}`,
       postBody,
       {
         'Development-Class': pkg,
@@ -531,7 +837,7 @@ export async function bwCreateDtp(
     // Step 4: Explicit unlock
     const csrfToken3 = await client.getCsrfToken();
     await client.rawPost(
-      `/sap/bw/modeling/dtpa/${dtpLower}?action=unlock`,
+      `/sap/bw/modeling/dtpa/${bwSeg(dtpLower)}?action=unlock`,
       '',
       {
         'Content-Type': MEDIA_TYPES['dtpa'],
@@ -541,10 +847,10 @@ export async function bwCreateDtp(
     );
 
     // Step 4b: If description or filter provided, update via Lock → GET → PUT → unlock
-    if (desc || (args.filter_field && args.filter_value)) {
+    if (desc || filterSelections) {
       const descLockCsrf = await client.getCsrfToken();
       const descLockResponse = await client.rawPost(
-        `/sap/bw/modeling/dtpa/${dtpLower}?action=lock`,
+        `/sap/bw/modeling/dtpa/${bwSeg(dtpLower)}?action=lock`,
         '',
         {
           'Accept': MEDIA_TYPES['dtpa'],
@@ -558,7 +864,7 @@ export async function bwCreateDtp(
 
       // GET DTP XML (fresh client) — read timestamp
       const descGetClient = createClientFromEnv();
-      const descGetResponse = await descGetClient.get(`/sap/bw/modeling/dtpa/${dtpLower}/m`, MEDIA_TYPES['dtpa']);
+      const descGetResponse = await descGetClient.get(`/sap/bw/modeling/dtpa/${bwSeg(dtpLower)}/m`, MEDIA_TYPES['dtpa']);
       const descTimestamp = descGetResponse.headers['timestamp'] ?? '';
 
       let descXml = descGetResponse.body;
@@ -572,11 +878,8 @@ export async function bwCreateDtp(
       }
 
       // Inject filter if provided
-      if (args.filter_field && args.filter_value) {
-        const fieldBlockRegex = new RegExp(
-          `(<fields[^>]*\\bname="${args.filter_field}"[^>]*>[\\s\\S]*?)<routine\\/>`
-        );
-        descXml = descXml.replace(fieldBlockRegex, `$1<routine/>\n      <selection excluding="false" operator="Equal">\n        <low description="${args.filter_value}" value="${args.filter_value}"/>\n      </selection>`);
+      if (filterSelections) {
+        descXml = applyDtpFilterSelections(descXml, args.filter_field!, filterSelections, dtpName);
       }
 
       // PUT with fresh client
@@ -586,7 +889,7 @@ export async function bwCreateDtp(
       // Unlock
       const descUnlockCsrf = await client.getCsrfToken();
       await client.rawPost(
-        `/sap/bw/modeling/dtpa/${dtpLower}?action=unlock`,
+        `/sap/bw/modeling/dtpa/${bwSeg(dtpLower)}?action=unlock`,
         '',
         {
           'Content-Type': MEDIA_TYPES['dtpa'],
@@ -673,9 +976,9 @@ export interface UpdateDtpArgs {
   dtp_name: string;
   description?: string;
   filter_field?: string;
-  filter_dta_name?: string;
   filter_value?: string;
   filter_excluding?: boolean;
+  filter_selections?: DtpFilterSelectionInput[];
   filter_clear_fields?: string;
   extraction_mode?: 'full' | 'delta';
   semantic_group_fields?: string;
@@ -718,9 +1021,7 @@ export function applySemanticGroup(xml: string, fields: string, dtpName: string)
 
   const missing: string[] = [];
   for (const field of requested) {
-    // Field names carry regex metacharacters, e.g. the /BIC/ prefix of custom fields.
-    const escaped = field.replace(/[.*+?^${}()|[\]\\/]/g, '\\$&');
-    const re = new RegExp(`(<groupField\\b[^>]*\\bname="${escaped}"[^>]*?)(\\s*/>)`);
+    const re = new RegExp(`(<groupField\\b[^>]*\\bname="${escapeRegExp(field)}"[^>]*?)(\\s*/>)`);
     if (!re.test(sgXml)) {
       missing.push(field);
       continue;
@@ -740,7 +1041,7 @@ export function applySemanticGroup(xml: string, fields: string, dtpName: string)
 }
 
 /**
- * bw_update_dtp — update a DTP (description).
+ * bw_update_dtp — update a DTP (description, filter, extraction mode, semantic group).
  *
  * Flow: Lock → GET (fresh) → PUT (fresh) → bwActivate (handles unlock).
  */
@@ -751,6 +1052,9 @@ export async function bwUpdateDtp(
   const dtpName  = args.dtp_name.toUpperCase();
   const dtpLower = args.dtp_name.toLowerCase();
 
+  // Resolved before the lock so an invalid filter never takes a lock or writes a document.
+  const filterSelections = resolveFilterSelections(args);
+
   // Lock (stateful_enqueue — same pattern as bwUpdateInfoObject)
   const lockHandle = await client.lock('dtpa', dtpLower, {}, 'stateful_enqueue');
 
@@ -759,7 +1063,7 @@ export async function bwUpdateDtp(
   try {
     // GET current DTP XML (fresh client) — read timestamp
     const getClient = createClientFromEnv();
-    const getResponse = await getClient.get(`/sap/bw/modeling/dtpa/${dtpLower}/m`, MEDIA_TYPES['dtpa']);
+    const getResponse = await getClient.get(`/sap/bw/modeling/dtpa/${bwSeg(dtpLower)}/m`, MEDIA_TYPES['dtpa']);
     const timestamp = getResponse.headers['timestamp'] ?? '';
 
     // Apply modifications
@@ -770,56 +1074,14 @@ export async function bwUpdateDtp(
         `$1"${args.description}"`
       );
     }
-    if (args.filter_field && args.filter_value !== undefined) {
-      const excluding = args.filter_excluding ? 'true' : 'false';
-      // Preserve empty string (= '' filter) — do not filter(Boolean); deduplicate via Set
-      const values = [...new Set(args.filter_value.split(',').map((v) => v.trim()))];
-      // Empty string → self-closing <selection> (no <low>); non-empty → <low value="..."/>
-      const selectionsXml = values
-        .map((v) => v === ''
-          ? `<selection excluding="${excluding}" operator="Equal"/>`
-          : `<selection excluding="${excluding}" operator="Equal">\n        <low description="${v}" value="${v}"/>\n      </selection>`)
-        .join('\n      ') + '\n      ';
-      // 1. Mark field as selected
-      putXml = putXml.replace(
-        new RegExp(`(<fields[^>]*\\bname="${args.filter_field}"(?![^>]*\\bselected="true")[^>]*)(>)`),
-        `$1 selected="true"$2`
-      );
-      // 2. Remove any existing <selection> elements
-      putXml = putXml.replace(
-        new RegExp(`(<fields[^>]*\\bname="${args.filter_field}"[^>]*>)(<selection[^\\s/>][^>]*>[\\s\\S]*?<\\/selection>|<selection[^>]*\\/?>)\\s*(?=<(?:infoObject|operators))`,'g'),
-        '$1'
-      );
-      // 3. Remove <routine/> if already present (to avoid duplicates)
-      putXml = putXml.replace(
-        new RegExp(`(<fields[^>]*\\bname="${args.filter_field}"[^>]*>)<routine\\/>`),
-        '$1'
-      );
-      // 4. Insert <routine/> + selections before <infoObject> (InfoObject fields) or <operators> (plain fields)
-      putXml = putXml.replace(
-        new RegExp(`(<fields[^>]*\\bname="${args.filter_field}"[^>]*>)(<(?:infoObject|operators))`),
-        `$1<routine/>\n      ${selectionsXml}$2`
-      );
+    if (filterSelections) {
+      putXml = applyDtpFilterSelections(putXml, args.filter_field!, filterSelections, dtpName);
     }
 
     if (args.filter_clear_fields) {
       const fieldsToClear = args.filter_clear_fields.split(',').map((f) => f.trim()).filter(Boolean);
       for (const fieldName of fieldsToClear) {
-        // Remove selected="true"
-        putXml = putXml.replace(
-          new RegExp(`(<fields[^>]*\\bname="${fieldName}"[^>]*)\\s+selected="true"`),
-          '$1'
-        );
-        // Remove all <selection> elements (self-closing and with body)
-        putXml = putXml.replace(
-          new RegExp(`(<fields[^>]*\\bname="${fieldName}"[^>]*>)([\\s\\S]*?)(<\\/fields>)`, 'g'),
-          (_match, open, body, close) => {
-            const cleaned = body
-              .replace(/<selection\b[^>]*\/>/g, '')
-              .replace(/<selection\b[^>]*>[\s\S]*?<\/selection>/g, '');
-            return open + cleaned + close;
-          }
-        );
+        putXml = clearDtpFilterField(putXml, fieldName, dtpName);
       }
     }
 
@@ -851,6 +1113,19 @@ export async function bwUpdateDtp(
     return JSON.stringify({
       success: true,
       dtp_name: dtpName,
+      // Reported per field so a truncated value set is visible in the result itself:
+      // the selection is replaced as a whole, it is not appended to.
+      filter: filterSelections
+        ? {
+            field: args.filter_field,
+            selections: filterSelections.map((s) => ({
+              sign: s.sign ?? 'I',
+              operator: s.operator ?? 'Equal',
+              low: s.low,
+              ...(s.high !== undefined ? { high: s.high } : {}),
+            })),
+          }
+        : undefined,
       message: `DTP '${dtpName}' updated and activated successfully.`,
     });
   } finally {
@@ -947,6 +1222,45 @@ async function checkRoutineProgramSyntax(
   return messages;
 }
 
+/**
+ * Error/abort messages of an ADT activation response. A generated routine program that fails
+ * to activate is exactly the state in which the following routineReports read cannot succeed,
+ * so the response is inspected instead of discarded. Warnings (type W/I) are not failures.
+ */
+function parseAdtActivationErrors(body: string): string[] {
+  const errors: string[] = [];
+  for (const m of body.matchAll(/<msg\b([^>]*)>([\s\S]*?)<\/msg>/g)) {
+    const type = m[1].match(/\btype="([^"]*)"/)?.[1] ?? '';
+    if (!/^[EAX]$/i.test(type)) continue;
+    const text = m[2].match(/<txt>([\s\S]*?)<\/txt>/)?.[1] ?? m[1];
+    errors.push(decodeXmlEntities(text.trim()));
+  }
+  return errors;
+}
+
+/**
+ * Build the <routine> element of the DTP document from the routine code as supplied by the
+ * caller. The DTP holds exactly the lines between the routine markers, one <code> element per
+ * line, which is what the caller passed in — so this is the fallback when reading the code
+ * back from the generated report fails (see payloads/dtp_filter_selections.md).
+ */
+function buildRoutineElementFromCode(routineCode: string): string {
+  const codeElements = routineCode
+    .split('\n')
+    .map((line) => line.replace(/\r$/, ''))
+    .map((line) => (line ? `<code>${escapeXmlAttr(line)}</code>` : `<code xsi:nil="true"/>`))
+    .join('\n        ');
+  return `<routine>\n        ${codeElements}\n      </routine>`;
+}
+
+function buildGlobalRoutineElementsFromCode(globalCode: string): string {
+  return globalCode
+    .split('\n')
+    .map((line) => line.replace(/\r$/, ''))
+    .map((line) => `    <globalRoutineCode>${escapeXmlAttr(line)}</globalRoutineCode>`)
+    .join('\n');
+}
+
 export interface SetDtpFilterRoutineArgs {
   dtp_name: string;
   field_name: string;
@@ -984,7 +1298,7 @@ export async function bwSetDtpFilterRoutine(
   // Step 1: Lock (no CREA)
   const lockCsrf = await client.getCsrfToken();
   const lockResponse = await client.rawPost(
-    `/sap/bw/modeling/dtpa/${dtpLower}?action=lock`,
+    `/sap/bw/modeling/dtpa/${bwSeg(dtpLower)}?action=lock`,
     '',
     {
       'Accept': MEDIA_TYPES['dtpa'],
@@ -1005,7 +1319,7 @@ export async function bwSetDtpFilterRoutine(
 
     const genCsrf = await client.getCsrfToken();
     const genResponse = await client.rawPost(
-      `/sap/bw/modeling/dtpa/${dtpUpper}/${fieldNameEncoded}/generateRoutineProgram`,
+      `/sap/bw/modeling/dtpa/${bwSegUpper(dtpUpper)}/${fieldNameEncoded}/generateRoutineProgram`,
       routineBody,
       {
         'Content-Type': 'application/vnd.sap.bw.modeling.dtpa.routine.code-v1_0_0+xml',
@@ -1022,197 +1336,243 @@ export async function bwSetDtpFilterRoutine(
     const programName = decodeURIComponent(encodedProgram);
     const adtEncoded = encodeURIComponent(programName).toLowerCase();
 
-    // Step 2b: write the ABAP source into the generated program. The lock, source
-    // PUT and unlock must share one client so the stateful enqueue session cookies
-    // (sap-contextid) are reused; the same client then activates the program.
-    const programClient = createClientFromEnv();
-
-    const skeletonResp = await programClient.rawGet(
-      `/sap/bc/adt/programs/programs/${adtEncoded}/source/main`,
-      { 'Accept': 'text/plain' }
-    );
-    const splicedSource = spliceRoutineSource(skeletonResp.body, args.routine_code, args.global_code);
-
-    const progLockCsrf = await programClient.getCsrfToken();
-    const progLockResp = await programClient.rawPost(
-      `/sap/bc/adt/programs/programs/${adtEncoded}?_action=LOCK&accessMode=MODIFY`,
-      '',
-      {
-        'Accept': 'application/vnd.sap.as+xml;charset=UTF-8;dataname=com.sap.adt.lock.result;q=0.8, application/vnd.sap.as+xml;charset=UTF-8;dataname=com.sap.adt.lock.result2;q=0.9',
-        'X-sap-adt-sessiontype': 'stateful',
-        'x-csrf-token': progLockCsrf,
-      }
-    );
-    const progLockHandle = progLockResp.body.match(/<LOCK_HANDLE>([^<]+)<\/LOCK_HANDLE>/)?.[1] ?? '';
-    if (!progLockHandle) {
-      throw new Error(`No <LOCK_HANDLE> in program lock response:\n${progLockResp.body}`);
-    }
-
-    // The generated program's EU (ADT) enqueue lock must be released on success AND on
-    // any error before activation, otherwise it leaks and can only be cleared via SM12.
-    let syntaxErrors: AbapCheckMessage[] = [];
-    try {
-      const putSrcCsrf = await programClient.getCsrfToken();
-      await programClient.rawPut(
-        `/sap/bc/adt/programs/programs/${adtEncoded}/source/main?lockHandle=${progLockHandle}`,
-        splicedSource,
-        { 'Content-Type': 'text/plain; charset=utf-8', 'x-csrf-token': putSrcCsrf }
-      );
-
-      // Gate: syntax-check the just-written inactive version before activating. A broken
-      // routine (e.g. i_r_request->get_dtp( ), which does not exist on the request
-      // interface) is caught here instead of being silently reported as "activated".
-      const checkMessages = await checkRoutineProgramSyntax(programClient, adtEncoded);
-      syntaxErrors = checkMessages.filter((m) => m.type === 'E');
-    } finally {
-      const unlockCsrf = await programClient.getCsrfToken();
-      await programClient.rawPost(
-        `/sap/bc/adt/programs/programs/${adtEncoded}?_action=UNLOCK&lockHandle=${progLockHandle}`,
-        '',
-        { 'x-csrf-token': unlockCsrf }
-      ).catch(() => {/* lock may already be gone; never mask the real error/result */});
-    }
-
-    if (syntaxErrors.length > 0) {
-      // Abort before touching the DTP: the routine is broken. Best-effort remove the
-      // orphaned generated program, then leave the DTP exactly as it was.
+    // A generated report is now registered on the field. Its name is derived from the DTP and
+    // the field and therefore stable, so a registration left behind by a failed attempt is the
+    // one every later attempt reads again — which is how a single failure can block a field
+    // permanently. The registration is removed in the finally block, on every path.
+    let reportDeleted = false;
+    const deleteRoutineReport = async () => {
+      if (reportDeleted) return;
+      reportDeleted = true;
       await client.rawDelete(
-        `/sap/bw/modeling/dtpa/${dtpUpper}/${fieldNameEncoded}/routineReports/${encodedProgram}`,
-        { 'Content-Type': MEDIA_TYPES['dtpa'], 'Accept': MEDIA_TYPES['dtpa'] }
-      ).catch(() => {/* orphan cleanup is best-effort */});
+        `/sap/bw/modeling/dtpa/${bwSegUpper(dtpUpper)}/${fieldNameEncoded}/routineReports/${encodedProgram}`,
+        {
+          'Content-Type': MEDIA_TYPES['dtpa'],
+          'Accept': MEDIA_TYPES['dtpa'],
+        }
+      );
+    };
+
+    try {
+      // Step 2b: write the ABAP source into the generated program. The lock, source
+      // PUT and unlock must share one client so the stateful enqueue session cookies
+      // (sap-contextid) are reused; the same client then activates the program.
+      const programClient = createClientFromEnv();
+
+      const skeletonResp = await programClient.rawGet(
+        `/sap/bc/adt/programs/programs/${adtEncoded}/source/main`,
+        { 'Accept': 'text/plain' }
+      );
+      const splicedSource = spliceRoutineSource(skeletonResp.body, args.routine_code, args.global_code);
+
+      const progLockCsrf = await programClient.getCsrfToken();
+      const progLockResp = await programClient.rawPost(
+        `/sap/bc/adt/programs/programs/${adtEncoded}?_action=LOCK&accessMode=MODIFY`,
+        '',
+        {
+          'Accept': 'application/vnd.sap.as+xml;charset=UTF-8;dataname=com.sap.adt.lock.result;q=0.8, application/vnd.sap.as+xml;charset=UTF-8;dataname=com.sap.adt.lock.result2;q=0.9',
+          'X-sap-adt-sessiontype': 'stateful',
+          'x-csrf-token': progLockCsrf,
+        }
+      );
+      const progLockHandle = progLockResp.body.match(/<LOCK_HANDLE>([^<]+)<\/LOCK_HANDLE>/)?.[1] ?? '';
+      if (!progLockHandle) {
+        throw new Error(`No <LOCK_HANDLE> in program lock response:\n${progLockResp.body}`);
+      }
+
+      // The generated program's EU (ADT) enqueue lock must be released on success AND on
+      // any error before activation, otherwise it leaks and can only be cleared via SM12.
+      let syntaxErrors: AbapCheckMessage[] = [];
+      try {
+        const putSrcCsrf = await programClient.getCsrfToken();
+        await programClient.rawPut(
+          `/sap/bc/adt/programs/programs/${adtEncoded}/source/main?lockHandle=${progLockHandle}`,
+          splicedSource,
+          { 'Content-Type': 'text/plain; charset=utf-8', 'x-csrf-token': putSrcCsrf }
+        );
+
+        // Gate: syntax-check the just-written inactive version before activating. A broken
+        // routine (e.g. i_r_request->get_dtp( ), which does not exist on the request
+        // interface) is caught here instead of being silently reported as "activated".
+        const checkMessages = await checkRoutineProgramSyntax(programClient, adtEncoded);
+        syntaxErrors = checkMessages.filter((m) => m.type === 'E');
+      } finally {
+        const unlockCsrf = await programClient.getCsrfToken();
+        await programClient.rawPost(
+          `/sap/bc/adt/programs/programs/${adtEncoded}?_action=UNLOCK&lockHandle=${progLockHandle}`,
+          '',
+          { 'x-csrf-token': unlockCsrf }
+        ).catch(() => {/* lock may already be gone; never mask the real error/result */});
+      }
+
+      if (syntaxErrors.length > 0) {
+        // Abort before touching the DTP, and keep the report registration: the program now
+        // holds an inactive version, and deleting the registration in that state leaves an
+        // ADT object the next source write is rejected for with HTTP 404 "does not exist"
+        // (verified against a BW/4HANA system). Keeping it is the resumable state — the next
+        // call writes over the same program and activates it.
+        reportDeleted = true;
+        return JSON.stringify({
+          success: false,
+          dtp_name: dtpUpper,
+          field_name: fieldName,
+          program_name: programName,
+          message:
+            `Filter routine for field '${fieldName}' has ${syntaxErrors.length} ABAP syntax error(s) and was NOT activated. ` +
+            `The DTP was left unchanged. Fix the routine code and call the tool again.`,
+          syntax_errors: syntaxErrors.map((m) => ({
+            line: m.line,
+            column: m.column,
+            text: m.text,
+          })),
+        }, null, 2);
+      }
+
+      // Step 3: ADT activate the ABAP program (reuse programClient after the unlock)
+      const adtCsrf = await programClient.getCsrfToken();
+      const adtBody =
+        `<?xml version="1.0" encoding="UTF-8"?>\n` +
+        `<adtcore:objectReferences xmlns:adtcore="http://www.sap.com/adt/core">\n` +
+        `  <adtcore:objectReference adtcore:uri="/sap/bc/adt/programs/programs/${adtEncoded}"\n` +
+        `                           adtcore:name="${programName.toUpperCase()}"/>\n` +
+        `</adtcore:objectReferences>`;
+      const adtActivationResp = await programClient.rawPost(
+        '/sap/bc/adt/activation?method=activate&preauditRequested=true',
+        adtBody,
+        {
+          'Content-Type': 'application/xml',
+          'Accept': 'application/xml',
+          'x-csrf-token': adtCsrf,
+        }
+      );
+      const adtActivationErrors = parseAdtActivationErrors(adtActivationResp.body);
+      if (adtActivationErrors.length > 0) {
+        return JSON.stringify({
+          success: false,
+          dtp_name: dtpUpper,
+          field_name: fieldName,
+          program_name: programName,
+          message:
+            `The generated routine program failed to activate, so the filter routine was NOT set. ` +
+            `The DTP was left unchanged.`,
+          activation_messages: adtActivationErrors,
+        }, null, 2);
+      }
+
+      // Step 4: GET routineReports (read back routine code as XML). The read only returns the
+      // lines that were just written, so a failure here is not a reason to abort after the ABAP
+      // program has already been written and activated — the routine element is then built from
+      // the supplied code instead (see payloads/dtp_filter_selections.md).
+      let routineXml = '';
+      let readBackError = '';
+      try {
+        const routineGetClient = createClientFromEnv();
+        const routineGetResponse = await routineGetClient.get(
+          `/sap/bw/modeling/dtpa/${bwSegUpper(dtpUpper)}/${fieldNameEncoded}/routineReports/${encodedProgram}`,
+          MEDIA_TYPES['dtpa']
+        );
+        routineXml = routineGetResponse.body;
+      } catch (error) {
+        readBackError = error instanceof Error ? error.message : String(error);
+      }
+
+      // Step 5: DELETE routineReports (mandatory cleanup)
+      await deleteRoutineReport();
+
+      // Step 6: GET current DTP XML (fresh client, read timestamp)
+      const dtpGetClient = createClientFromEnv();
+      const dtpGetResponse = await dtpGetClient.get(
+        `/sap/bw/modeling/dtpa/${bwSeg(dtpLower)}/m`,
+        MEDIA_TYPES['dtpa']
+      );
+      const timestamp = dtpGetResponse.headers['timestamp'] ?? '';
+
+      // Step 7: Convert routineReports XML → DTP PUT format
+      // Extract code lines from <code>...</code>
+      const codeSection = routineXml.match(/<code>([\s\S]*?)<\/code>/)?.[1] ?? '';
+      const extractedCodeLines = [...codeSection.matchAll(/<line>([\s\S]*?)<\/line>/g)].map(m => m[1]);
+
+      // Extract global lines from <globalCode>...</globalCode>
+      const globalSection = routineXml.match(/<globalCode>([\s\S]*?)<\/globalCode>/)?.[1] ?? '';
+      const extractedGlobalLines = [...globalSection.matchAll(/<line>([\s\S]*?)<\/line>/g)].map(m => m[1]);
+
+      const usedReadBack = extractedCodeLines.length > 0;
+
+      // <line> → <code>, empty lines → <code xsi:nil="true"/>
+      const codeElements = extractedCodeLines
+        .map(line => (line ? `<code>${line}</code>` : `<code xsi:nil="true"/>`))
+        .join('\n        ');
+
+      const routineInjection = usedReadBack
+        ? `<routine>\n        ${codeElements}\n      </routine>`
+        : buildRoutineElementFromCode(args.routine_code);
+
+      // <globalCode><line> → <globalRoutineCode>
+      const globalElements = usedReadBack
+        ? extractedGlobalLines
+            .map(line => `    <globalRoutineCode>${line}</globalRoutineCode>`)
+            .join('\n')
+        : (args.global_code ? buildGlobalRoutineElementsFromCode(args.global_code) : '');
+
+      // Step 8: Inject into DTP XML
+      let putXml = dtpGetResponse.body;
+
+      // The /m deserializer is sequence-sensitive: <routine> must be the FIRST child
+      // of the target <fields> element. Operate on the whole field block so the
+      // routine lands before <selection>/<infoObject>/<operators>. Existing value
+      // selections are kept — routine and values coexist on a field.
+      const { regex: fieldsBlockRegex, block: fieldsBlock } = extractFieldBlock(putXml, fieldName, dtpUpper);
+      const { openAttrs, body } = splitFieldBlock(fieldsBlock);
+      const { rest } = extractRoutineElement(body);
+      const newBlock =
+        `<fields${setSelectedAttr(openAttrs, true)}>\n      ${routineInjection}` +
+        `${rest.replace(/^\s*/, '\n      ')}</fields>`;
+      putXml = putXml.replace(fieldsBlockRegex, () => newBlock);
+
+      // Fix 2: Remove all existing <globalRoutineCode> elements before inserting new ones
+      putXml = putXml.replace(/<globalRoutineCode>[^<]*<\/globalRoutineCode>\s*/g, '');
+
+      // Append globalRoutineCode elements before </filter>
+      if (globalElements) {
+        putXml = putXml.replace('</filter>', `${globalElements}\n  </filter>`);
+      }
+
+      // PUT with fresh client
+      const putClient = createClientFromEnv();
+      await putClient.put('dtpa', dtpUpper, lockHandle, putXml, timestamp);
+
+      // Step 9: Activate — surface any activation error instead of claiming success.
+      const activationResult = await bwActivate(client, 'dtpa', dtpUpper, lockHandle);
+      const activation = JSON.parse(activationResult) as { success?: boolean; messages?: unknown };
+      if (activation.success === false) {
+        return JSON.stringify({
+          success: false,
+          dtp_name: dtpUpper,
+          field_name: fieldName,
+          program_name: programName,
+          message: `Filter routine source was syntactically valid, but DTP activation failed.`,
+          activation_messages: activation.messages ?? [],
+        }, null, 2);
+      }
+
       return JSON.stringify({
-        success: false,
+        success: true,
         dtp_name: dtpUpper,
         field_name: fieldName,
-        program_name: programName,
+        routine_source: usedReadBack ? 'server_readback' : 'supplied_code',
+        ...(readBackError ? { read_back_warning: readBackError } : {}),
         message:
-          `Filter routine for field '${fieldName}' has ${syntaxErrors.length} ABAP syntax error(s) and was NOT activated. ` +
-          `The DTP was left unchanged. Fix the routine code and call the tool again.`,
-        syntax_errors: syntaxErrors.map((m) => ({
-          line: m.line,
-          column: m.column,
-          text: m.text,
-        })),
-      }, null, 2);
+          `Filter routine for field '${fieldName}' on DTP '${dtpUpper}' set and activated successfully.` +
+          (usedReadBack
+            ? ''
+            : ` Reading the code back from the generated report failed, so the routine was written ` +
+              `from the supplied code — verify it with bw_get_dtp.`),
+      });
+    } finally {
+      // The generated report registration is removed on every path: it is named after the DTP
+      // and the field, so one left behind blocks every later attempt on that field.
+      await deleteRoutineReport().catch(() => {/* cleanup is best-effort */});
     }
-
-    // Step 3: ADT activate the ABAP program (reuse programClient after the unlock)
-    const adtCsrf = await programClient.getCsrfToken();
-    const adtBody =
-      `<?xml version="1.0" encoding="UTF-8"?>\n` +
-      `<adtcore:objectReferences xmlns:adtcore="http://www.sap.com/adt/core">\n` +
-      `  <adtcore:objectReference adtcore:uri="/sap/bc/adt/programs/programs/${adtEncoded}"\n` +
-      `                           adtcore:name="${programName.toUpperCase()}"/>\n` +
-      `</adtcore:objectReferences>`;
-    await programClient.rawPost(
-      '/sap/bc/adt/activation?method=activate&preauditRequested=true',
-      adtBody,
-      {
-        'Content-Type': 'application/xml',
-        'Accept': 'application/xml',
-        'x-csrf-token': adtCsrf,
-      }
-    );
-
-    // Step 4: GET routineReports (read back routine code as XML)
-    const routineGetClient = createClientFromEnv();
-    const routineGetResponse = await routineGetClient.get(
-      `/sap/bw/modeling/dtpa/${dtpUpper}/${fieldNameEncoded}/routineReports/${encodedProgram}`,
-      MEDIA_TYPES['dtpa']
-    );
-    const routineXml = routineGetResponse.body;
-
-    // Step 5: DELETE routineReports (mandatory cleanup)
-    await client.rawDelete(
-      `/sap/bw/modeling/dtpa/${dtpUpper}/${fieldNameEncoded}/routineReports/${encodedProgram}`,
-      {
-        'Content-Type': MEDIA_TYPES['dtpa'],
-        'Accept': MEDIA_TYPES['dtpa'],
-      }
-    );
-
-    // Step 6: GET current DTP XML (fresh client, read timestamp)
-    const dtpGetClient = createClientFromEnv();
-    const dtpGetResponse = await dtpGetClient.get(
-      `/sap/bw/modeling/dtpa/${dtpLower}/m`,
-      MEDIA_TYPES['dtpa']
-    );
-    const timestamp = dtpGetResponse.headers['timestamp'] ?? '';
-
-    // Step 7: Convert routineReports XML → DTP PUT format
-    // Extract code lines from <code>...</code>
-    const codeSection = routineXml.match(/<code>([\s\S]*?)<\/code>/)?.[1] ?? '';
-    const extractedCodeLines = [...codeSection.matchAll(/<line>([\s\S]*?)<\/line>/g)].map(m => m[1]);
-
-    // Extract global lines from <globalCode>...</globalCode>
-    const globalSection = routineXml.match(/<globalCode>([\s\S]*?)<\/globalCode>/)?.[1] ?? '';
-    const extractedGlobalLines = [...globalSection.matchAll(/<line>([\s\S]*?)<\/line>/g)].map(m => m[1]);
-
-    // <line> → <code>, empty lines → <code xsi:nil="true"/>
-    const codeElements = extractedCodeLines
-      .map(line => (line ? `<code>${line}</code>` : `<code xsi:nil="true"/>`))
-      .join('\n        ');
-
-    const routineInjection = `<routine>\n        ${codeElements}\n      </routine>`;
-
-    // <globalCode><line> → <globalRoutineCode>
-    const globalElements = extractedGlobalLines
-      .map(line => `    <globalRoutineCode>${line}</globalRoutineCode>`)
-      .join('\n');
-
-    // Step 8: Inject into DTP XML
-    let putXml = dtpGetResponse.body;
-
-    // The /m deserializer is sequence-sensitive: <routine> must be the FIRST child
-    // of the target <fields> element. Operate on the whole field block so the
-    // routine lands before <selection>/<infoObject>/<operators>.
-    const fieldsBlockRegex = new RegExp(`<fields\\b[^>]*\\bname="${fieldName}"[^>]*>[\\s\\S]*?<\\/fields>`);
-    const fieldsBlock = putXml.match(fieldsBlockRegex)?.[0];
-    if (!fieldsBlock) {
-      throw new Error(`Filter field '${fieldName}' not found in DTP body`);
-    }
-    let newBlock = fieldsBlock
-      .replace(/<routine\s*\/>/, '')
-      .replace(/<routine>[\s\S]*?<\/routine>/, '');
-    newBlock = newBlock.replace(/<fields\b([^>]*)>/, (_m, attrs) => {
-      const a = /\bselected="/.test(attrs) ? attrs.replace(/\bselected="[^"]*"/, 'selected="true"') : `${attrs} selected="true"`;
-      return `<fields${a}>`;
-    });
-    newBlock = newBlock.replace(/(<fields\b[^>]*>)/, `$1\n      ${routineInjection}`);
-    putXml = putXml.replace(fieldsBlockRegex, newBlock);
-
-    // Fix 2: Remove all existing <globalRoutineCode> elements before inserting new ones
-    putXml = putXml.replace(/<globalRoutineCode>[^<]*<\/globalRoutineCode>\s*/g, '');
-
-    // Append globalRoutineCode elements before </filter>
-    if (globalElements) {
-      putXml = putXml.replace('</filter>', `${globalElements}\n  </filter>`);
-    }
-
-    // PUT with fresh client
-    const putClient = createClientFromEnv();
-    await putClient.put('dtpa', dtpUpper, lockHandle, putXml, timestamp);
-
-    // Step 9: Activate — surface any activation error instead of claiming success.
-    const activationResult = await bwActivate(client, 'dtpa', dtpUpper, lockHandle);
-    const activation = JSON.parse(activationResult) as { success?: boolean; messages?: unknown };
-    if (activation.success === false) {
-      return JSON.stringify({
-        success: false,
-        dtp_name: dtpUpper,
-        field_name: fieldName,
-        program_name: programName,
-        message: `Filter routine source was syntactically valid, but DTP activation failed.`,
-        activation_messages: activation.messages ?? [],
-      }, null, 2);
-    }
-
-    return JSON.stringify({
-      success: true,
-      dtp_name: dtpUpper,
-      field_name: fieldName,
-      message: `Filter routine for field '${fieldName}' on DTP '${dtpUpper}' set and activated successfully.`,
-    });
   } finally {
     // Best-effort release of the DTP enqueue lock — never mask the operation result/error.
     await bwUnlockDtp(client, dtpLower).catch(() => {/* lock may already be released */});
