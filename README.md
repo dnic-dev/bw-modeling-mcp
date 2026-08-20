@@ -57,9 +57,12 @@ Until now almost every call against a BW 7.5 system failed with HTTP 406, becaus
 
 - **📘 [docs/BW75-SUPPORT.md](docs/BW75-SUPPORT.md)** — root cause, the ABAP code, the SE24 setup steps, and an honest list of what BW 7.5 ships no REST resource for at all
 - **`bw_system_profile`** — one call and the agent knows what it is working on: BW/4HANA or classic BW, which REST endpoint groups the system publishes, and whether the three preconditions hold (`Accept`-header handling, ADT DataPreview access, query reporting). It can then take the route that works on this release — reading a transformation from the metadata tables where there is no REST resource for one — instead of discovering the release through failed calls
-- **`bw_read_metadata_tables`** — reads straight from the metadata tables where there is no REST resource: transformations including their routine source, DTPs, and the classic providers `ODSO`, `CUBE` and `MPRO`
-- **Process chains too** — steps with their variant parameters and the dependencies between them, resolved into the order the chain actually runs. RSPC keeps no edge list, only the event each step waits for and the events it raises, so that order has to be computed; the tables return the rows in none
-- **Load history** of an InfoCube or DataStore object — request, status, update mode, start, user, duration, records and source
+- **`bw_read_metadata_tables`** — reads straight from the metadata tables what the system publishes no REST resource for:
+  - **Transformations** — field mappings with their rule types, and the source of the start, end, expert and field routines
+  - **DTPs** — path, resolved transformation, extraction mode and error handling
+  - **Classic providers** — `ODSO`, `CUBE` and `MPRO`
+  - **Process chains** — steps with their variant parameters and the dependencies between them, resolved into the order the chain actually runs. RSPC keeps no edge list, only the event each step waits for and the events it raises, so that order has to be computed; the tables return the rows in none
+  - **Load history** of an InfoCube or DataStore object — request, status, update mode, start, user, duration, records and source
 
 **🔗 Process chains, edited in place**
 
