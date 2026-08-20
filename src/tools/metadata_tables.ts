@@ -297,6 +297,16 @@ const ERROR_HANDLING: Record<string, string> = {
   _: 'deactivated',
 };
 
+/**
+ * The TLOGO type of one end of a DTP path, as RSTRAN spells it. RSBKDTP carries both its own
+ * token (SRCTP/TGTTP) and the TLOGO (SRCTLOGO/TGTTLOGO); only the latter is comparable to
+ * RSTRAN. Falling back to the former is a last resort, so it is capped at the width of
+ * RSTRAN's CHAR(4) type columns — an over-long literal terminates the DataPreview service.
+ */
+function tlogoOf(tlogo: string | undefined, fallback: string | undefined): string {
+  return (tlogo || '').trim() || (fallback || '').trim().slice(0, 4);
+}
+
 async function readDtp(client: BwClient, dtpName: string): Promise<string> {
   const name = sqlLiteral(dtpName.trim().toUpperCase());
   const scope = `dtp = '${name}' AND objvers = 'A'`;
@@ -325,12 +335,19 @@ async function readDtp(client: BwClient, dtpName: string): Promise<string> {
    * The DTP stores its path (source and target), not the transformation — BW resolves that
    * at runtime from the objects on both ends. Deriving it the same way keeps the output
    * comparable to the REST tool, which shows it under "overview".
+   *
+   * The comparison runs on RSBKDTP's TLOGO columns, not on SRCTP/TGTTP. Those two are the
+   * DTP's own CHAR(6) vocabulary (a DataSource is `DTASRC` there) while RSTRAN types are
+   * TLOGO in CHAR(4) (`RSDS`). Comparing the former against the latter both misses every
+   * DataSource-fed DTP and, because the literal is longer than the column, terminates the
+   * DataPreview service with a truncation dump rather than returning no rows.
    */
   const transformations = await queryTable(
     client,
     `SELECT tranid, sourcetype, sourcename, targettype, targetname FROM rstran ` +
-      `WHERE objvers = 'A' AND sourcetype = '${sqlLiteral(header.SRCTP)}' ` +
-      `AND sourcename = '${sqlLiteral(header.SRC)}' AND targettype = '${sqlLiteral(header.TGTTP)}' ` +
+      `WHERE objvers = 'A' AND sourcetype = '${sqlLiteral(tlogoOf(header.SRCTLOGO, header.SRCTP))}' ` +
+      `AND sourcename = '${sqlLiteral(header.SRC)}' ` +
+      `AND targettype = '${sqlLiteral(tlogoOf(header.TGTTLOGO, header.TGTTP))}' ` +
       `AND targetname = '${sqlLiteral(header.TGT)}'`,
     10,
   );
