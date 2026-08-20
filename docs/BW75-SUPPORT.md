@@ -4,9 +4,11 @@ Out of the box, almost every tool fails against a BW 7.5 system with **HTTP 406*
 single case-sensitive line in the 7.5 REST framework, and it can be neutralised with one small ABAP
 enhancement — no modification of SAP standard.
 
-With that enhancement in place, **every REST endpoint that exists on 7.5 becomes reachable**. What
-remains out of reach are the objects for which SAP never shipped a REST resource on 7.5 at all
-(see [What is still unavailable](#what-is-still-unavailable)).
+With that enhancement in place, **every REST endpoint that exists on 7.5 becomes reachable**. For the
+objects SAP never shipped a REST resource for — transformations, DTPs, process chains and the
+classic providers — `bw_read_metadata_tables` reads the metadata tables instead, so they are
+readable but not writable (see [No REST resource — but reachable another way](#no-rest-resource--but-reachable-another-way)).
+What stays out of reach altogether is listed under [What is still unavailable](#what-is-still-unavailable).
 
 Verified end-to-end on a BW 7.5 system (SAP_BASIS 750).
 
