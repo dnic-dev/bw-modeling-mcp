@@ -2667,12 +2667,15 @@ const TOOL_DEFINITIONS = [
     {
       name: 'bw_system_profile',
       description:
-        'Report what the connected BW system is and which tool groups work on it. ' +
+        'Find out what the connected BW system is and which of this server\'s tools will work on it. ' +
         'Distinguishes SAP BW/4HANA from classic SAP BW (7.5) via the system\'s own b4hanamode flag, ' +
-        'lists which REST endpoint groups the system publishes, and verifies two preconditions: ' +
-        'whether Accept-header handling works (a broken one makes almost every call fail with HTTP 406 on BW 7.5) ' +
-        'and whether the ADT DataPreview service is reachable for this user. ' +
-        'Call this first when connecting to an unknown system, or when tools fail with 404 or 406.',
+        'lists which REST endpoint groups the system publishes, and verifies three preconditions: ' +
+        'Accept-header handling (a broken one makes almost every call fail with HTTP 406 on BW 7.5), ' +
+        'access to the ADT DataPreview service, and whether the BICS reporting resource is implemented. ' +
+        'Call it before planning work on a system whose release you do not already know: the answer says which tool ' +
+        'groups are available and which route to take where they are not — on classic BW, for instance, ' +
+        'transformations, DTPs and the classic providers have no REST resource and are read with ' +
+        'bw_read_metadata_tables instead. One call beats inferring the release from failed ones.',
       inputSchema: {
         type: 'object',
         properties: {},
