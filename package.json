@@ -10,8 +10,11 @@
   "files": [
     "dist/",
     "README.md",
-    "LICENSE",
-    "CHANGELOG.md"
+    "TOOLS.md",
+    "ARCHITECTURE.md",
+    "WHATS_NEW.md",
+    "CHANGELOG.md",
+    "LICENSE"
   ],
   "engines": {
     "node": ">=22.0.0"
