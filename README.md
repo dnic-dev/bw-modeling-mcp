@@ -1,6 +1,6 @@
 # bw-modeling-mcp
 
-A Model Context Protocol (MCP) server that enables AI assistants like Claude to work directly inside SAP BW/4HANA systems — reading, creating and modifying BW modeling objects via the same internal SAP APIs that Eclipse BWMT and the BW/4HANA Cockpit use: the **BW Modeling REST API** (`/sap/bw/modeling/`) for objects, queries and live data, the **ADT API** (`/sap/bc/adt/`) for ABAP/AMDP routine source, the **BW/4HANA manage API** for the request monitor and runtime, and the **Push API** (`/sap/bw4/`) for data loads.
+A Model Context Protocol (MCP) server that enables AI assistants like Claude to work directly inside SAP BW/4HANA systems — reading, creating and modifying BW modeling objects via the same internal SAP APIs that Eclipse BWMT and the BW/4HANA Cockpit use: the **BW Modeling REST API** (`/sap/bw/modeling/`) for objects, queries and live data, the **ADT API** (`/sap/bc/adt/`) for the ABAP and AMDP routines BW generates, the **BW/4HANA manage API** for the request monitor and runtime, and the **Push API** (`/sap/bw4/`) for data loads.
 
 **This is not a simulation.** Every tool call connects to a live BW system — write operations produce real changes.
 
@@ -278,9 +278,11 @@ An overview by area. Every tool in detail — parameters, behaviour, and the seq
 
 ## Combining with an ADT MCP Server
 
-For tasks involving ABAP or SQLScript (AMDP) logic inside Transformations, **bw-modeling-mcp works best alongside an ADT MCP server** such as [vibing-steampunk](https://github.com/oisee/vibing-steampunk) or [ARC-1](https://github.com/arc-mcp/arc-1).
+**bw-modeling-mcp works best alongside an ADT MCP server** such as [vibing-steampunk](https://github.com/oisee/vibing-steampunk) or [ARC-1](https://github.com/arc-mcp/arc-1). The two do not overlap as much as it may look.
 
-The BW MCP server handles the BW modeling structure — creating the Transformation, setting up routines, activating objects. The ADT MCP server handles reading and writing the actual ABAP class source code that backs the routine. Together, they cover the full development cycle from BW object creation to ABAP logic implementation.
+This server owns the BW object and, with it, the body of the ABAP that BW generated for that object: the class behind a transformation routine, the program behind a DTP filter routine. Write those through `bw_set_transformation_routine`, `bw_set_transformation_expert_routine` and `bw_set_dtp_filter_routine` rather than through ADT — they do not only replace the source, they save the transformation master back afterwards, which is what re-registers the code in the transportable metadata. A class-only edit survives until the next regeneration or transport and is then gone.
+
+The ADT MCP server covers ABAP as a subject in its own right: your own reports, classes, function modules and DDIC tables, repository search and navigation, arbitrary table reads, debugging, ATC, unit tests, dumps and transports. Together they cover the full cycle from BW object to ABAP logic.
 
 ---
 
@@ -401,9 +403,13 @@ accepts can still fail to activate, so a successful write proves less than it ap
 because the whole document travels, a read that came from a stale session buffer will silently
 write old values back — the tools read fresh for exactly this reason.
 
-The other three need none of it. The **ADT API** (`/sap/bc/adt/`) carries ABAP and AMDP routine
-source, the DataPreview service behind `bw_read_metadata_tables`, transport checks and
-activation runs. The **BW/4HANA manage API** (`/sap/bc/http/sap/bw4/`) answers the request
+The other three need none of it. The **ADT API** (`/sap/bc/adt/`) is used narrowly and always for
+an object BW generated itself: the body of a transformation routine (its generated class), the
+body of a DTP filter routine (its generated program), the DataPreview service behind
+`bw_read_metadata_tables`, plus transport checks and activation runs. Everything else ABAP —
+writing your own reports, classes or DDIC tables, searching the repository, reading arbitrary
+tables, debugging — is the job of an ABAP ADT MCP server alongside this one, see
+[Combining with an ADT MCP Server](#combining-with-an-adt-mcp-server). The **BW/4HANA manage API** (`/sap/bc/http/sap/bw4/`) answers the request
 monitor, the remodeling monitor and runtime operations. The **Push API** (`/sap/bw4/v1/push/`)
 takes a JSON record array straight into a write-interface aDSO.
 
