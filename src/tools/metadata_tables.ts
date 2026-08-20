@@ -707,9 +707,251 @@ async function readCube(client: BwClient, cubeName: string): Promise<string> {
   return out.join('\n');
 }
 
+/**
+ * Split values into quoted IN-list fragments that keep the statement inside the length the
+ * DataPreview service accepts.
+ *
+ * That service parses at most 255 characters of statement; beyond it the text is cut and the
+ * parser complains about an unterminated literal rather than about the length. `budget` is the
+ * room left for the list once the rest of the statement is counted.
+ */
+export function inListBatches(values: string[], budget: number): string[] {
+  const batches: string[] = [];
+  let current: string[] = [];
+  let length = 0;
+  for (const v of values) {
+    const piece = `'${sqlLiteral(v)}'`;
+    const added = piece.length + (current.length > 0 ? 2 : 0);
+    if (current.length > 0 && length + added > budget) {
+      batches.push(current.join(', '));
+      current = [];
+      length = 0;
+    }
+    current.push(piece);
+    length += piece.length + (current.length > 1 ? 2 : 0);
+  }
+  if (current.length > 0) batches.push(current.join(', '));
+  return batches;
+}
+
+// ── Process chain (RSPC) ────────────────────────────────────────────────────
+
+interface ChainStep {
+  type: string;
+  variante: string;
+  /** One RSPCCHAIN row per inbound link — a collector has several. */
+  rows: Row[];
+}
+
+/** The event a step waits for or raises, as one comparable key. */
+function eventKey(name: string | undefined, param: string | undefined): string {
+  return `${(name ?? '').trim()}|${(param ?? '').trim()}`;
+}
+
+export interface ChainTopology {
+  steps: Map<string, ChainStep>;
+  /** Step key → the steps that must run before it, with the condition on the link. */
+  predecessors: Map<string, { key: string; condition: string }[]>;
+  /** Step keys in execution order: roots first, a collector after the branches it joins. */
+  ordered: string[];
+}
+
+/**
+ * Resolve RSPCCHAIN rows into steps, edges and an execution order.
+ *
+ * The table carries no edge list. Each row names the event the step waits for
+ * (EVENT_START/EVENTP_START) and the events it raises when it ends green or red; an edge runs
+ * from whoever raises an event to whoever waits for it. BACKLINK_* is a cache and is empty on
+ * every chain seen so far, so the events are what gets matched.
+ *
+ * Exported for testing — and because the row order the table returns is not the order the chain
+ * runs in, which is the whole point of computing this.
+ */
+export function buildChainTopology(rows: Row[]): ChainTopology {
+  const steps = new Map<string, ChainStep>();
+  const producer = new Map<string, { key: string; condition: string }>();
+  for (const r of rows) {
+    const key = `${r.TYPE}|${r.VARIANTE}`;
+    const step = steps.get(key) ?? { type: r.TYPE, variante: r.VARIANTE, rows: [] };
+    step.rows.push(r);
+    steps.set(key, step);
+
+    // GREEN_EQ_RED means the successor runs whatever the outcome — one link, not two.
+    const bothWays = r.GREEN_EQ_RED === 'X';
+    if (r.EVENTP_GREEN) {
+      producer.set(eventKey(r.EVENT_GREEN, r.EVENTP_GREEN), {
+        key,
+        condition: bothWays ? 'always' : 'on success',
+      });
+    }
+    if (r.EVENTP_RED) {
+      producer.set(eventKey(r.EVENT_RED, r.EVENTP_RED), { key, condition: 'on error' });
+    }
+  }
+
+  const predecessors = new Map<string, { key: string; condition: string }[]>();
+  const successors = new Map<string, string[]>();
+  for (const [key, step] of steps) {
+    const preds: { key: string; condition: string }[] = [];
+    for (const r of step.rows) {
+      if (!r.EVENTP_START) continue;
+      const from = producer.get(eventKey(r.EVENT_START, r.EVENTP_START));
+      if (!from || from.key === key) continue;
+      preds.push(from);
+      successors.set(from.key, [...(successors.get(from.key) ?? []), key]);
+    }
+    predecessors.set(key, preds);
+  }
+
+  // Breadth-first from the steps nothing feeds, holding a step back while any predecessor is
+  // still unplaced so a collector lands after the branches it joins. The queue guard stops the
+  // hold from looping forever on a cycle.
+  const ordered: string[] = [];
+  const placed = new Set<string>();
+  const roots = [...steps.keys()].filter((k) => (predecessors.get(k) ?? []).length === 0);
+  const queue = roots.length > 0 ? [...roots] : [...steps.keys()].slice(0, 1);
+  let held = 0;
+  while (queue.length > 0) {
+    const key = queue.shift() as string;
+    if (placed.has(key)) continue;
+    const preds = predecessors.get(key) ?? [];
+    if (preds.some((p) => !placed.has(p.key)) && held < queue.length + 1) {
+      queue.push(key);
+      held += 1;
+      continue;
+    }
+    held = 0;
+    placed.add(key);
+    ordered.push(key);
+    for (const next of successors.get(key) ?? []) if (!placed.has(next)) queue.push(next);
+  }
+  // Anything the walk never reached still belongs in the output.
+  for (const key of steps.keys()) if (!placed.has(key)) ordered.push(key);
+
+  return { steps, predecessors, ordered };
+}
+
+/**
+ * Read a process chain from its tables.
+ *
+ * A step is identified by TYPE plus VARIANTE. A collector appears as several rows sharing that
+ * pair and differing in LNR, one per incoming link, which is how a chain expresses "wait for
+ * all of these". buildChainTopology turns that into steps, edges and an execution order.
+ */
+async function readProcessChain(client: BwClient, chainName: string): Promise<string> {
+  const name = sqlLiteral(chainName.trim().toUpperCase());
+  const scope = `chain_id = '${name}' AND objvers = 'A'`;
+
+  const [[head], texts, rows] = await Promise.all([
+    queryTable(
+      client,
+      `SELECT chain_id, objstat, activfl, tstpnm, timestmp, batchuser, keep_logs ` +
+        `FROM rspcchainattr WHERE ${scope}`,
+      1,
+    ),
+    queryTable(client, `SELECT langu, txtlg FROM rspcchaint WHERE ${scope}`, 20),
+    queryTable(
+      client,
+      `SELECT type, variante, lnr, event_start, eventp_start, event_green, eventp_green, ` +
+        `event_red, eventp_red, green_eq_red FROM rspcchain WHERE ${scope}`,
+      2000,
+    ),
+  ]);
+
+  if (rows.length === 0) {
+    return `Process chain ${chainName.toUpperCase()} not found (no active version in RSPCCHAIN).`;
+  }
+
+  const { steps, predecessors, ordered } = buildChainTopology(rows);
+
+  // ── Variant parameters and descriptions, in batches the statement can carry ──
+  const variantNames = [...new Set([...steps.values()].map((s) => s.variante))].filter(Boolean);
+  const params = new Map<string, Row[]>();
+  const variantTexts = new Map<string, string>();
+  for (const list of inListBatches(variantNames, 150)) {
+    try {
+      const [pRows, tRows] = await Promise.all([
+        queryTable(
+          client,
+          `SELECT type, variante, fnam, low, high FROM rspcvariant ` +
+            `WHERE objvers = 'A' AND variante IN (${list})`,
+          2000,
+        ),
+        queryTable(
+          client,
+          `SELECT type, variante, txtlg FROM rspcvariantt WHERE objvers = 'A' AND variante IN (${list})`,
+          500,
+        ),
+      ]);
+      for (const r of pRows) {
+        const k = `${r.TYPE}|${r.VARIANTE}`;
+        params.set(k, [...(params.get(k) ?? []), r]);
+      }
+      for (const r of tRows) {
+        const k = `${r.TYPE}|${r.VARIANTE}`;
+        if (r.TXTLG && !variantTexts.has(k)) variantTexts.set(k, r.TXTLG);
+      }
+    } catch {
+      // Parameters are detail — the step list above stands without them.
+    }
+  }
+
+  // ── Render ───────────────────────────────────────────────────────────────
+  const out: string[] = [];
+  out.push(`Process Chain: ${head?.CHAIN_ID ?? chainName.toUpperCase()}`);
+  out.push('Source: metadata tables (read-only — this system publishes no REST resource for RSPC)');
+  const text = texts.find((t) => t.TXTLG)?.TXTLG;
+  if (text) out.push(`Description: ${text}`);
+  if (head) {
+    out.push(`Status:      ${head.ACTIVFL === 'X' ? 'active' : 'inactive'}${head.OBJSTAT ? ` (${head.OBJSTAT})` : ''}`);
+    if (head.BATCHUSER) out.push(`Batch user:  ${head.BATCHUSER}`);
+    if (head.KEEP_LOGS) out.push(`Keep logs:   ${head.KEEP_LOGS} days`);
+  }
+
+  out.push('');
+  out.push(`── Steps (${steps.size}, in execution order) ──`);
+  const label = (key: string) => {
+    const st = steps.get(key);
+    return st ? `${st.type} ${st.variante}` : key;
+  };
+  for (const key of ordered) {
+    const step = steps.get(key) as ChainStep;
+    const desc = variantTexts.get(key);
+    out.push('');
+    out.push(`  ${step.type}  ${step.variante}${desc ? `  — ${desc}` : ''}`);
+    const preds = predecessors.get(key) ?? [];
+    if (preds.length === 0) {
+      out.push('      Runs:     at the start of the chain');
+    } else {
+      for (const p of preds) out.push(`      After:    ${label(p.key)}  (${p.condition})`);
+    }
+    const values = (params.get(key) ?? []).filter((r) => r.LOW || r.HIGH);
+    if (values.length > 0) {
+      const rendered = values
+        .map((r) => `${r.FNAM} = ${r.LOW}${r.HIGH ? `..${r.HIGH}` : ''}`)
+        .join(', ');
+      out.push(`      Variant:  ${rendered}`);
+    }
+  }
+
+  const unreachable = ordered.filter(
+    (k) => (predecessors.get(k) ?? []).length === 0 && steps.get(k)?.type !== 'TRIGGER',
+  );
+  if (unreachable.length > 0) {
+    out.push('');
+    out.push(
+      `NOTE: ${unreachable.length} step(s) have no predecessor and are not the TRIGGER — ` +
+      `they are unreachable from the start unless another chain raises their start event: ` +
+      `${unreachable.map(label).join(', ')}.`,
+    );
+  }
+
+  return out.join('\n');
+}
+
 // ── Dispatcher ──────────────────────────────────────────────────────────────
 
-const SUPPORTED = ['TRFN', 'DTPA', 'ODSO', 'CUBE', 'MPRO'];
+const SUPPORTED = ['TRFN', 'DTPA', 'ODSO', 'CUBE', 'MPRO', 'RSPC'];
 
 /**
  * Width of the key column each type is looked up by. A name wider than its column does not
@@ -724,6 +966,7 @@ const NAME_WIDTHS: Record<string, number> = {
   ODSO: 30,
   CUBE: 30,
   MPRO: 30,
+  RSPC: 30,
 };
 
 /**
@@ -760,6 +1003,8 @@ export async function bwReadMetadataTables(
     case 'CUBE':
     case 'MPRO':
       return readCube(client, objectName.trim());
+    case 'RSPC':
+      return readProcessChain(client, objectName.trim());
     default:
       return (
         `Object type "${objectType}" is not supported yet. Supported: ${SUPPORTED.join(', ')}.`

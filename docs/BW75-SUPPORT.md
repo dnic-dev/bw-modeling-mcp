@@ -240,6 +240,7 @@ and it needs ADT authorization for the calling user.
 |---|---|---|
 | Transformations | `trfn` | `bw_read_metadata_tables` `TRFN` — field mappings with their rule types, and the source code of the start, end, expert and field routines |
 | DTPs | `dtpa` | `bw_read_metadata_tables` `DTPA` — path, resolved transformation, extraction mode and error handling. Filter selections and the semantic group are not readable: they live in a serialised ABAP object, not in relational columns |
+| Process chains | `rspc` | `bw_read_metadata_tables` `RSPC` — steps with their variant parameters and dependencies, in execution order. Note that `bw_search` by this object type still dumps server-side |
 | Classic DSO, InfoCube, MultiProvider | `odso` and friends | `bw_read_metadata_tables` `ODSO` / `CUBE` / `MPRO` — key and data fields, dimensions, part providers |
 | Load status of a cube or DSO | `/sap/bw4/*` | `bw_read_metadata_tables` on the provider — the Load History section reads `RSSTATMANPART`, enriched from `RSBKREQUEST`: request, status, update mode, start, user, duration, records and source |
 | Data flow graph | `dmod` | `bw_xref` on the object — the same edges, one object at a time instead of a graph |
@@ -248,7 +249,6 @@ and it needs ADT authorization for the calling user.
 
 | Area | Endpoint | Note |
 |---|---|---|
-| Process chains | `rspc` | search by this object type dumps server-side |
 | Planning functions and sequences | `plcr`, `plsq`, `plse` | only `alvl` is available |
 | Transport operations | `cto/*` | not published by discovery |
 | Query **data** | `comp/reporting` | the collection is published, but the handler answers "Reporting resource not implemented" — query *definitions* read fine |

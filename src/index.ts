@@ -2647,14 +2647,15 @@ const TOOL_DEFINITIONS = [
         'for which no release ships a REST resource. ' +
         'Use bw_system_profile to see which endpoints a system publishes. ' +
         'Supported object_type: TRFN (transformation incl. start/end/expert and field routine source code), ' +
-        'DTPA (data transfer process), ODSO (classic DataStore Object), CUBE (InfoCube) and MPRO (MultiProvider). ' +
+        'DTPA (data transfer process), ODSO (classic DataStore Object), CUBE (InfoCube), MPRO (MultiProvider) ' +
+        'and RSPC (process chain: steps with their variant parameters, resolved into execution order). ' +
         'Requires ADT authorization for the calling user. Prefer bw_get_transformation where the REST endpoint exists.',
       inputSchema: {
         type: 'object',
         properties: {
           object_type: {
             type: 'string',
-            description: 'Object type to read. Supported: TRFN, DTPA, ODSO, CUBE, MPRO.',
+            description: 'Object type to read. Supported: TRFN, DTPA, ODSO, CUBE, MPRO, RSPC.',
           },
           object_name: {
             type: 'string',
