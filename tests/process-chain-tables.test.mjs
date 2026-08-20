@@ -99,3 +99,33 @@ test('a single name over budget still produces one batch rather than none', () =
 test('quotes in a value are escaped into the list', () => {
   assert.equal(inListBatches(["IT'S"], 150)[0], "'IT''S'");
 });
+
+// ── Variant values ─────────────────────────────────────────────────────────
+import { renderVariantValue } from '../dist/tools/metadata_tables.js';
+
+const variant = (low, high = '', opt = 'EQ', sign = 'I') => ({ LOW: low, HIGH: high, OPT: opt, SIGN: sign });
+
+test('a plain value comes back as it is', () => {
+  assert.equal(renderVariantValue(variant('MULTIPART')), 'MULTIPART');
+});
+
+test('BT joins the pair as a range', () => {
+  assert.equal(renderVariantValue(variant('202401', '202412', 'BT')), '202401..202412');
+});
+
+test('a filled HIGH on any other operator continues the value, it does not bound it', () => {
+  // RSPCVARIANT-LOW is 45 characters wide; a longer value spills into HIGH.
+  const low = '/application/RemoteService/execute/a51cb656-d';
+  const high = '8d7-49f1-aa4d-c8519b1573b0/uploadImport/';
+  assert.equal(renderVariantValue(variant(low, high)), low + high);
+  assert.doesNotMatch(renderVariantValue(variant(low, high)), /\.\./);
+});
+
+test('ABAP padding around a number is dropped', () => {
+  assert.equal(renderVariantValue(variant('                    2.00')), '2.00');
+  assert.equal(renderVariantValue(variant('       300')), '300');
+});
+
+test('an excluding selection says so', () => {
+  assert.equal(renderVariantValue(variant('X', '', 'EQ', 'E')), 'NOT X');
+});

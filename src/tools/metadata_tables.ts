@@ -832,6 +832,22 @@ export function buildChainTopology(rows: Row[]): ChainTopology {
 }
 
 /**
+ * One variant parameter of a process chain step, as text.
+ *
+ * RSPCVARIANT-LOW is 45 characters wide and HIGH doubles as two different things. With
+ * OPT = 'BT' the pair is a genuine range; with any other operator a filled HIGH is the
+ * continuation of a value too long for LOW, and the two have to be joined without a
+ * separator — rendering that as a range puts ".." in the middle of a URL. Values arrive
+ * padded out of ABAP, so numbers come with leading blanks that mean nothing here.
+ */
+export function renderVariantValue(row: Row): string {
+  const low = (row.LOW ?? '').trim();
+  const high = (row.HIGH ?? '').trim();
+  const value = !high ? low : row.OPT === 'BT' ? `${low}..${high}` : `${low}${high}`;
+  return row.SIGN === 'E' ? `NOT ${value}` : value;
+}
+
+/**
  * Read a process chain from its tables.
  *
  * A step is identified by TYPE plus VARIANTE. A collector appears as several rows sharing that
@@ -868,12 +884,12 @@ async function readProcessChain(client: BwClient, chainName: string): Promise<st
   const variantNames = [...new Set([...steps.values()].map((s) => s.variante))].filter(Boolean);
   const params = new Map<string, Row[]>();
   const variantTexts = new Map<string, string>();
-  for (const list of inListBatches(variantNames, 150)) {
+  for (const list of inListBatches(variantNames, 130)) {
     try {
       const [pRows, tRows] = await Promise.all([
         queryTable(
           client,
-          `SELECT type, variante, fnam, low, high FROM rspcvariant ` +
+          `SELECT type, variante, fnam, sign, opt, low, high FROM rspcvariant ` +
             `WHERE objvers = 'A' AND variante IN (${list})`,
           2000,
         ),
@@ -927,9 +943,7 @@ async function readProcessChain(client: BwClient, chainName: string): Promise<st
     }
     const values = (params.get(key) ?? []).filter((r) => r.LOW || r.HIGH);
     if (values.length > 0) {
-      const rendered = values
-        .map((r) => `${r.FNAM} = ${r.LOW}${r.HIGH ? `..${r.HIGH}` : ''}`)
-        .join(', ');
+      const rendered = values.map((r) => `${r.FNAM} = ${renderVariantValue(r)}`).join(', ');
       out.push(`      Variant:  ${rendered}`);
     }
   }
