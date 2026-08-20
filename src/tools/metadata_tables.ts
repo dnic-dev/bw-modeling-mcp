@@ -87,6 +87,145 @@ function toDisplayName(field: string): string {
   return m ? `$${m[1]}$${m[2]}` : field;
 }
 
+// ── Load history (RSSTATMANPART / RSBKREQUEST) ──────────────────────────────
+
+/**
+ * RSSTATMANPART-STATUS, from domain RSSTATUS. The values are SAP icon codes, which say
+ * nothing on their own — the raw code is kept alongside the text so a status this map
+ * does not know is still visible rather than swallowed.
+ */
+const REQUEST_STATUS: Record<string, string> = {
+  '@08@': 'green  (ended successfully)',
+  '@09@': 'yellow (incomplete)',
+  '@0A@': 'red    (incorrect processing)',
+};
+
+/**
+ * RSSTATMANPART-UPDMODE, from domain RSUPDMODE. Deliberately separate from the DTP's own
+ * UPDATE_MODES: RSBKDTP-UPDMODE is domain RSBKUPDMODE and has a different value set.
+ */
+const REQUEST_UPDATE_MODES: Record<string, string> = {
+  C: 'Delta init',
+  D: 'Delta',
+  F: 'Full',
+  I: 'Opening balance',
+  R: 'Repeat',
+};
+
+/** `20190111125226` and `20190111125226.6875150` alike become `2019-01-11 12:52:26`. */
+export function formatStamp(date: string | undefined, time?: string): string {
+  const d = (date ?? '').trim();
+  if (!d || /^0+$/.test(d)) return '';
+  const digits = d.replace(/\..*$/, '');
+  const day = digits.slice(0, 8);
+  const clock = (time ?? digits.slice(8, 14)).padEnd(6, '0');
+  if (day.length < 8) return d;
+  return `${day.slice(0, 4)}-${day.slice(4, 6)}-${day.slice(6, 8)} ` +
+    `${clock.slice(0, 2)}:${clock.slice(2, 4)}:${clock.slice(4, 6)}`;
+}
+
+/** Seconds between two RSBKREQUEST timestamps, which carry fractions after the dot. */
+export function durationSeconds(start: string | undefined, finish: string | undefined): string {
+  const toSec = (v: string | undefined): number | undefined => {
+    const m = (v ?? '').trim().match(/^(\d{4})(\d{2})(\d{2})(\d{2})(\d{2})(\d{2})(?:\.(\d+))?$/);
+    if (!m) return undefined;
+    const ms = Date.UTC(+m[1], +m[2] - 1, +m[3], +m[4], +m[5], +m[6]);
+    return ms / 1000 + (m[7] ? Number(`0.${m[7]}`) : 0);
+  };
+  const a = toSec(start);
+  const b = toSec(finish);
+  if (a === undefined || b === undefined || b < a) return '';
+  const secs = b - a;
+  return secs < 60 ? `${secs.toFixed(1)} s` : `${Math.floor(secs / 60)}m ${(secs % 60).toFixed(0)}s`;
+}
+
+/**
+ * The load history of one data target, as the request management ("Manage") view shows it.
+ *
+ * RSSTATMANPART is the per-target request status and covers every load path — DTP as well
+ * as InfoPackage — for InfoCubes, DataStore objects and InfoObject master data and texts
+ * alike. RSBKREQUEST adds what only a DTP run knows (who started it, and how long it took)
+ * and is joined on RSBKREQUEST-REQUEST = RSSTATMANPART-RNR; a request loaded by an
+ * InfoPackage simply has no counterpart there and is reported without that detail.
+ *
+ * Best effort: a target whose history cannot be read yields no section rather than failing
+ * the whole object read.
+ */
+async function loadHistorySection(client: BwClient, dataTarget: string, limit = 10): Promise<string[]> {
+  const name = sqlLiteral(dataTarget.trim().toUpperCase());
+  let requests: Row[];
+  let total: Row[];
+  try {
+    [requests, total] = await Promise.all([
+      queryTable(
+        client,
+        `SELECT rnr, status, updmode, datum_anf, zeit_anf, anz_recs, insert_recs, ` +
+          `source_dta, source_dta_type, stornoflag, archivflag FROM rsstatmanpart ` +
+          `WHERE dta = '${name}' ORDER BY datum_anf DESCENDING, zeit_anf DESCENDING`,
+        limit,
+      ),
+      queryTable(client, `SELECT count(*) AS cnt FROM rsstatmanpart WHERE dta = '${name}'`, 1),
+    ]);
+  } catch {
+    return [];
+  }
+
+  const out: string[] = [''];
+  if (requests.length === 0) {
+    out.push('── Load History ──');
+    out.push('  no requests (never loaded, or the history has been deleted)');
+    return out;
+  }
+
+  const count = Number(total[0]?.CNT ?? requests.length);
+  const shown =
+    count > requests.length
+      ? `${requests.length} most recent of ${count} requests`
+      : `${count} request${count === 1 ? '' : 's'}`;
+  out.push(`── Load History (${shown}, newest first) ──`);
+
+  // Only DTP requests appear here; an InfoPackage load has no RSBKREQUEST row.
+  let runs = new Map<string, Row>();
+  try {
+    const rows = await queryTable(
+      client,
+      `SELECT request, uname, tstmp_start, tstmp_finish, linesread, linestransferred ` +
+        `FROM rsbkrequest WHERE tgt = '${name}' ORDER BY requid DESCENDING`,
+      Math.max(limit * 2, 20),
+    );
+    runs = new Map(rows.filter((r) => r.REQUEST).map((r) => [r.REQUEST, r]));
+  } catch {
+    // Enrichment is optional — the status rows above already carry the essentials.
+  }
+
+  for (const r of requests) {
+    const status = REQUEST_STATUS[r.STATUS] ?? `unknown (${r.STATUS})`;
+    const mode = REQUEST_UPDATE_MODES[r.UPDMODE] ?? r.UPDMODE ?? '';
+    const flags = [
+      r.STORNOFLAG === 'X' ? 'CANCELLED' : '',
+      r.ARCHIVFLAG === 'X' ? 'archived' : '',
+    ].filter(Boolean);
+    out.push('');
+    out.push(`  ${r.RNR}${flags.length ? `   [${flags.join(', ')}]` : ''}`);
+    out.push(`      Status:   ${status}  [${r.STATUS}]`);
+    out.push(`      Mode:     ${mode}${r.UPDMODE ? ` (${r.UPDMODE})` : ''}`);
+    const run = runs.get(r.RNR);
+    const started = formatStamp(r.DATUM_ANF, r.ZEIT_ANF);
+    const by = run?.UNAME ? `  by ${run.UNAME}` : '';
+    const took = run ? durationSeconds(run.TSTMP_START, run.TSTMP_FINISH) : '';
+    out.push(`      Started:  ${started}${by}${took ? `  (${took})` : ''}`);
+    out.push(`      Records:  ${r.ANZ_RECS ?? '?'} transferred / ${r.INSERT_RECS ?? '?'} added`);
+    if (r.SOURCE_DTA) {
+      // A DataSource source is stored as name plus logical system, padded apart; and the
+      // status table spells that type DTASRC where every other table says RSDS.
+      const src = r.SOURCE_DTA.replace(/\s+/g, ' ').trim();
+      const srcType = r.SOURCE_DTA_TYPE === 'DTASRC' ? 'RSDS' : r.SOURCE_DTA_TYPE || '';
+      out.push(`      Source:   ${srcType} ${src}`.trimEnd());
+    }
+  }
+  return out;
+}
+
 // ── Transformation (TRFN) ───────────────────────────────────────────────────
 
 /**
@@ -477,6 +616,7 @@ async function readOdso(client: BwClient, odsoName: string): Promise<string> {
 
   out.push('');
   out.push(`Last changed: ${head.TIMESTMP} by ${head.TSTPNM}`);
+  out.push(...(await loadHistorySection(client, odsoName)));
   return out.join('\n');
 }
 
@@ -561,12 +701,30 @@ async function readCube(client: BwClient, cubeName: string): Promise<string> {
   out.push('');
   out.push(`── InfoObjects (${fields.length}) ──`);
   out.push(`  ${fields.map((f) => toDisplayName(f.IOBJNM)).join(', ') || '(none)'}`);
+
+  // A MultiProvider holds no data of its own — its parts do, and each is readable here.
+  if (head.CUBETYPE !== 'M') out.push(...(await loadHistorySection(client, cubeName)));
   return out.join('\n');
 }
 
 // ── Dispatcher ──────────────────────────────────────────────────────────────
 
 const SUPPORTED = ['TRFN', 'DTPA', 'ODSO', 'CUBE', 'MPRO'];
+
+/**
+ * Width of the key column each type is looked up by. A name wider than its column does not
+ * come back empty: the DataPreview service terminates with a truncation dump ("a value was
+ * lost while copying"), which reaches the caller as an opaque HTTP 500. Checking the length
+ * first turns that into a statement about the name.
+ */
+const NAME_WIDTHS: Record<string, number> = {
+  TRFN: 32,
+  DTPA: 30,
+  DTP: 30,
+  ODSO: 30,
+  CUBE: 30,
+  MPRO: 30,
+};
 
 /**
  * bw_read_metadata_tables — read an object definition from the BW metadata tables.
@@ -580,7 +738,16 @@ export async function bwReadMetadataTables(
   objectName: string,
 ): Promise<string> {
   const type = objectType.trim().toUpperCase();
-  if (!objectName?.trim()) return 'object_name is required.';
+  const name = objectName?.trim() ?? '';
+  if (!name) return 'object_name is required.';
+
+  const width = NAME_WIDTHS[type];
+  if (width && name.length > width) {
+    return (
+      `"${name}" is ${name.length} characters, but an object name of type ${type} is at most ${width}. ` +
+      `No object can carry this name — check the value that was passed.`
+    );
+  }
 
   switch (type) {
     case 'TRFN':

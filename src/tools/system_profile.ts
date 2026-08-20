@@ -9,7 +9,7 @@ const ENDPOINT_GROUPS: { group: string; collections: string[] }[] = [
   { group: 'Modeling — providers', collections: ['adso', 'infoobject', 'hcpr', 'infoprov'] },
   { group: 'Modeling — sources', collections: ['rsds', 'trcs', 'lsys', 'dest'] },
   { group: 'Data flow', collections: ['trfn', 'dtpa'] },
-  { group: 'Queries', collections: ['query', 'rkf', 'ckf', 'structure', 'filter', 'variable'] },
+  { group: 'Queries — modeling', collections: ['query', 'rkf', 'ckf', 'structure', 'filter', 'variable'] },
   { group: 'Planning', collections: ['alvl', 'plcr', 'plsq', 'plse'] },
   { group: 'Process chains', collections: ['rspc'] },
   { group: 'Repository & search', collections: ['area', 'activation'] },
@@ -105,6 +105,35 @@ async function probeDataPreview(client: BwClient): Promise<Check> {
 }
 
 /**
+ * Is the BICS reporting resource implemented, not merely published?
+ *
+ * Discovery lists the `query` collection on classic BW as well, so the endpoint list alone
+ * suggests that reading data works — but on BW 7.5 the handler answers every call with
+ * "Reporting resource not implemented". Reading query definitions is unaffected; only
+ * bw_query_data and bw_get_filter_values depend on this. Probing a query name that cannot
+ * exist separates the cases: a system that implements the resource complains about the
+ * query, one that does not complains about the resource.
+ */
+async function probeReporting(client: BwClient): Promise<Check> {
+  try {
+    await client.rawGet('/sap/bw/modeling/comp/reporting?compid=ZZ_PROBE_DOES_NOT_EXIST', {
+      Accept: 'application/xml',
+    });
+    return { ok: true, detail: 'implemented' };
+  } catch (e) {
+    const msg = String((e as Error).message);
+    if (/not implemented/i.test(msg)) {
+      return {
+        ok: false,
+        detail: 'NOT implemented — query definitions are readable, query data is not',
+      };
+    }
+    // Anything else means the handler ran and objected to the probe name, not to itself.
+    return { ok: true, detail: 'implemented (probe query does not exist, as expected)' };
+  }
+}
+
+/**
  * bw_system_profile — report what the connected system is and which tool groups work on it.
  *
  * Answers three questions in one call:
@@ -150,9 +179,17 @@ export async function bwSystemProfile(client: BwClient): Promise<string> {
   out.push(`Header handling:  ${negotiation.ok ? 'OK' : 'BROKEN'} — ${negotiation.detail}`);
   const dataPreview = await probeDataPreview(client);
   out.push(`ADT DataPreview:  ${dataPreview.ok ? 'OK' : 'UNAVAILABLE'} — ${dataPreview.detail}`);
+  const reporting = collections.has('query')
+    ? await probeReporting(client)
+    : { ok: false, detail: 'no query endpoint on this system' };
+  out.push(`Query reporting:  ${reporting.ok ? 'OK' : 'UNAVAILABLE'} — ${reporting.detail}`);
 
   out.push('');
   out.push('── What this means ──');
+  if (!reporting.ok && collections.has('query')) {
+    out.push('Query definitions can be read, but bw_query_data and bw_get_filter_values cannot');
+    out.push('return anything on this system — the BICS reporting resource is not implemented here.');
+  }
   if (isBw4) {
     out.push('Full tool coverage: reading, creating and modifying BW objects, plus runtime and monitoring.');
   } else {

@@ -243,7 +243,8 @@ header:
 | Planning functions and sequences | `plcr`, `plsq`, `plse` | only `alvl` is available |
 | Transport operations | `cto/*` | not published by discovery |
 | Data flow graph | `dmod` | the DataFlow workspace in discovery is empty |
-| Requests, monitoring, process variants, push | `/sap/bw4/*` | the BW/4HANA manage API does not exist on 7.5 |
+| Query **data** | `comp/reporting` | the collection is published, but the handler answers "Reporting resource not implemented" — query *definitions* read fine |
+| Requests, monitoring, process variants, push | `/sap/bw4/*` | the BW/4HANA manage API does not exist on 7.5; `bw_read_metadata_tables` reports the load history of a cube or DSO from `RSSTATMANPART` instead |
 | Classic DSO, InfoCube, MultiProvider | `odso` and friends | see below |
 
 This is systematic rather than accidental: the BW Modeling Tools for 7.5 never supported editing
