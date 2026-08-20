@@ -1,4 +1,5 @@
-import { BwClient } from '../bw-client.js';
+import { BwClient, createClientFromEnv } from '../bw-client.js';
+import { queryTable } from './metadata_tables.js';
 
 // The remodeling monitor is a Fiori app on top of an OData V2 service; there is no
 // /sap/bw/modeling equivalent, so these tools talk to the OData service directly.
@@ -12,8 +13,23 @@ const LOG_OBJECT = 'RSCNV';
 /** Upper bound on per-step log reads, so a restarted request cannot fan out unboundedly. */
 const MAX_LOG_HANDLES = 12;
 
-const JSON_HEADERS = { Accept: 'application/json' };
-const XML_HEADERS = { Accept: 'application/xml' };
+// The monitor status is served from a gateway/CDS buffer that lags behind: a finished run
+// keeps reporting Running for minutes. Suppressing the cache is one half of the fix, a
+// fresh session (freshClient) the other.
+const NO_CACHE = { 'Cache-Control': 'no-cache', Pragma: 'no-cache' };
+const JSON_HEADERS = { Accept: 'application/json', ...NO_CACHE };
+const XML_HEADERS = { Accept: 'application/xml', ...NO_CACHE };
+
+/** Runtime tables that hold the truth while the OData header status still lags. */
+const HEAD_TABLE = 'rscnvcnvhd2';
+const STEP_TABLE = 'rscnvstep';
+const JOB_TABLE = 'tbtco';
+
+/** The step row that spans the whole run, as opposed to the numbered monitor steps. */
+const RUN_STEP = 'RUN';
+
+/** TBTCO job status codes that mean the job is no longer running. */
+const JOB_FINISHED: Record<string, string> = { F: 'finished', A: 'aborted' };
 
 const REQUEST_STATUS: Record<string, string> = {
   N: 'Not scheduled',
@@ -86,6 +102,46 @@ function statusLabel(entry: MonitorEntry): string {
   return text ? `${text} (${code})` : code;
 }
 
+/** Label for a status code that did not come from the service (no translated text available). */
+function labelForCode(code: string): string {
+  const text = REQUEST_STATUS[code] ?? '';
+  return text ? `${text} (${code})` : code;
+}
+
+/**
+ * A separate session for the status read. The shared client carries a stale gateway/CDS
+ * buffer that keeps reporting Running after the run has finished — the same reason
+ * bw_activate reads trfn/dtpa in a fresh session. Falls back to the shared client when
+ * no fresh session can be built, so a status read never fails over this.
+ */
+function freshClient(client: BwClient): BwClient {
+  try {
+    return createClientFromEnv();
+  } catch {
+    return client;
+  }
+}
+
+/** Escape an ABAP SQL string literal. */
+function sqlLit(value: string): string {
+  return value.replace(/'/g, "''");
+}
+
+/** TIMESTAMPL (`YYYYMMDDHHMMSS.ffffff`, UTC) → ISO 8601, or '' when unset. */
+function timestampl(value?: string): string {
+  const m = /^(\d{4})(\d{2})(\d{2})(\d{2})(\d{2})(\d{2})/.exec((value ?? '').trim());
+  if (!m || m[1] === '0000') return '';
+  return `${m[1]}-${m[2]}-${m[3]}T${m[4]}:${m[5]}:${m[6]}Z`;
+}
+
+/** TBTCO keeps date and time apart, in server local time — not UTC. */
+function jobEndTime(date?: string, time?: string): string {
+  const d = (date ?? '').trim();
+  const t = (time ?? '').trim().padStart(6, '0');
+  if (!/^\d{8}$/.test(d) || d === '00000000') return '';
+  return `${d.slice(0, 4)}-${d.slice(4, 6)}-${d.slice(6, 8)} ${t.slice(0, 2)}:${t.slice(2, 4)}:${t.slice(4, 6)}`;
+}
+
 /**
  * The entity has a four-part key and `requestName` carries a colon, which has to
  * stay percent-encoded inside the OData key literal.
@@ -122,7 +178,7 @@ async function fetchRequests(
   status: string,
   top: number,
   remodelingRule?: string,
-): Promise<MonitorEntry[]> {
+): Promise<{ entries: MonitorEntry[]; total: number }> {
   const conditions: string[] = [];
   if (infoProvider) conditions.push(`infoProvider eq '${infoProvider.toUpperCase()}'`);
   if (remodelingRule) conditions.push(`remodelingRule eq '${remodelingRule}'`);
@@ -140,10 +196,14 @@ async function fetchRequests(
     `?$top=${top}` +
     `&$orderby=${encodeURIComponent('last_run_timestamp desc')}` +
     (conditions.length ? `&$filter=${encodeURIComponent(conditions.join(' and '))}` : '') +
-    `&$expand=${encodeURIComponent('to_status,to_createdBy')}`;
+    `&$expand=${encodeURIComponent('to_status,to_createdBy')}` +
+    // Needed to tell a complete list from one that top cut short.
+    `&$inlinecount=allpages`;
 
   const { body } = await client.rawGet(query, JSON_HEADERS);
-  return parseCollection<MonitorEntry>(body);
+  const entries = parseCollection<MonitorEntry>(body);
+  const count = Number((JSON.parse(body) as { d?: { __count?: string } }).d?.__count);
+  return { entries, total: Number.isFinite(count) ? count : entries.length };
 }
 
 /**
@@ -167,7 +227,7 @@ async function resolveRequest(
     return parseEntity<MonitorEntry>(body);
   }
 
-  const matches = await fetchRequests(client, infoProvider, ALL_STATUS, 20, remodelingRule);
+  const { entries: matches } = await fetchRequests(client, infoProvider, ALL_STATUS, 20, remodelingRule);
   if (matches.length === 0) {
     throw new Error(
       `no remodeling request found for InfoProvider ${infoProvider.toUpperCase()} ` +
@@ -190,7 +250,108 @@ function requireKey(entry: MonitorEntry): {
   return { requestNumber, requestName, remodelingRule, infoProvider };
 }
 
+// ── Status verification ─────────────────────────────────────────────────────
+
+interface StatusVerification {
+  /** Authoritative status code, when the database knows better than the service. */
+  status?: string;
+  /** Where the corrected status came from. */
+  source?: string;
+  /** Warning to surface when the run is demonstrably over but the header still says R. */
+  note?: string;
+}
+
+/**
+ * Cross-check a Running header status against the runtime tables.
+ *
+ * The OData header is buffered and can report Running long after the run finished — a
+ * caller polling it waits forever. Failures are not fatal: an unverifiable status simply
+ * stays as the service reported it.
+ */
+async function verifyRunningStatus(
+  client: BwClient,
+  requestNumber: string,
+): Promise<StatusVerification> {
+  const id = sqlLit(requestNumber);
+
+  const head = await queryTable(
+    client,
+    `SELECT status, jobname, jobcount FROM ${HEAD_TABLE} WHERE id = '${id}'`,
+    1,
+  );
+  const headStatus = (head[0]?.STATUS ?? '').trim();
+  if (headStatus && headStatus !== 'R') {
+    return { status: headStatus, source: HEAD_TABLE.toUpperCase() };
+  }
+
+  // The RUN step spans the whole run: a non-running status with a filled ENDTIME is final.
+  const run = await queryTable(
+    client,
+    `SELECT status, endtime FROM ${STEP_TABLE} WHERE id = '${id}' AND stepnm = '${RUN_STEP}'`,
+    1,
+  );
+  const runStatus = (run[0]?.STATUS ?? '').trim();
+  const runEnd = timestampl(run[0]?.ENDTIME);
+  if (runStatus && runStatus !== 'R' && runEnd) {
+    return { status: runStatus, source: `${STEP_TABLE.toUpperCase()} (step ${RUN_STEP}, ended ${runEnd})` };
+  }
+
+  // Last resort: the batch job itself. If it is done, the header is merely lagging —
+  // report that rather than claiming the remodeling is still running.
+  const jobName = (head[0]?.JOBNAME ?? '').trim();
+  const jobCount = (head[0]?.JOBCOUNT ?? '').trim();
+  if (!jobName) return {};
+
+  const job = await queryTable(
+    client,
+    `SELECT status, enddate, endtime FROM ${JOB_TABLE} WHERE jobname = '${sqlLit(jobName)}'` +
+      (jobCount ? ` AND jobcount = '${sqlLit(jobCount)}'` : ''),
+    1,
+  );
+  const jobStatus = (job[0]?.STATUS ?? '').trim();
+  const finished = JOB_FINISHED[jobStatus];
+  if (!finished) return {};
+
+  const ended = jobEndTime(job[0]?.ENDDATE, job[0]?.ENDTIME);
+  return {
+    note:
+      `batch job ${jobName} ${finished}` +
+      (ended ? ` at ${ended} server time` : '') +
+      ` (${JOB_TABLE.toUpperCase()} status ${jobStatus}) — the monitor status has not caught up yet`,
+  };
+}
+
 // ── Read ────────────────────────────────────────────────────────────────────
+
+/**
+ * Correct Running entries in one query. A per-entry job check would cost one round trip
+ * per row, so the list settles for the header table — bw_get_remodeling_request does the
+ * full cross-check for a single request.
+ */
+async function correctRunningEntries(
+  client: BwClient,
+  entries: MonitorEntry[],
+): Promise<Map<string, string>> {
+  const running = entries
+    .filter((e) => e.status === 'R' && e.requestNumber)
+    .map((e) => e.requestNumber as string);
+  if (running.length === 0) return new Map();
+
+  const ids = running.map((id) => `'${sqlLit(id)}'`).join(', ');
+  const rows = await queryTable(
+    client,
+    `SELECT id, status FROM ${HEAD_TABLE} WHERE id IN ( ${ids} )`,
+    running.length,
+  );
+
+  const corrections = new Map<string, string>();
+  for (const row of rows) {
+    const id = (row.ID ?? '').trim();
+    const dbStatus = (row.STATUS ?? '').trim();
+    if (id && dbStatus && dbStatus !== 'R') corrections.set(id, dbStatus);
+  }
+  return corrections;
+}
 
 export async function bwListRemodelingRequests(
   client: BwClient,
@@ -198,11 +359,30 @@ export async function bwListRemodelingRequests(
   status: string = ALL_STATUS,
   top: number = 20,
 ): Promise<string> {
-  const entries = await fetchRequests(client, infoProvider, status, top);
+  const reader = freshClient(client);
+  const { entries, total } = await fetchRequests(reader, infoProvider, status, top);
+
+  let corrections = new Map<string, string>();
+  let correctionError = '';
+  try {
+    corrections = await correctRunningEntries(reader, entries);
+  } catch (e) {
+    correctionError = e instanceof Error ? e.message : String(e);
+  }
 
   const lines: string[] = [];
   const scope = infoProvider ? ` of ${infoProvider.toUpperCase()}` : '';
-  lines.push(`Remodeling requests${scope} — ${entries.length} shown`);
+  const truncated = total > entries.length;
+  lines.push(
+    `Remodeling requests${scope} — ` +
+      (truncated ? `${entries.length} of ${total} shown` : `${entries.length} shown`),
+  );
+  if (truncated) {
+    lines.push(
+      `(list truncated by top=${top} — raise top or filter by status; ` +
+        `an open request may be among the ${total - entries.length} not shown)`,
+    );
+  }
   lines.push('');
 
   if (entries.length === 0) {
@@ -211,13 +391,21 @@ export async function bwListRemodelingRequests(
   }
 
   for (const entry of entries) {
+    const corrected = corrections.get(entry.requestNumber ?? '');
     lines.push(`Rule: ${entry.remodelingRule ?? ''}`);
     lines.push(`  InfoProvider: ${entry.infoProvider ?? ''}`);
-    lines.push(`  Status:       ${statusLabel(entry)}`);
+    lines.push(
+      `  Status:       ${corrected ? labelForCode(corrected) : statusLabel(entry)}` +
+        (corrected ? ` — corrected from ${labelForCode('R')}, monitor buffer lags` : ''),
+    );
     lines.push(`  Last Run:     ${edmDate(entry.last_run_timestamp)}`);
     lines.push(`  Created By:   ${entry.to_createdBy?.fullName ?? entry.createdBy ?? ''}`);
     lines.push(`  Request:      ${entry.requestNumber ?? ''}`);
     lines.push('');
+  }
+
+  if (correctionError) {
+    lines.push(`(running entries not cross-checked against ${HEAD_TABLE.toUpperCase()}: ${correctionError})`);
   }
 
   return lines.join('\n').trimEnd();
@@ -297,14 +485,29 @@ export async function bwGetRemodelingRequest(
   includeLog: boolean = true,
   format: 'text' | 'raw' = 'text',
 ): Promise<string> {
-  const entry = await resolveRequest(client, infoProvider, remodelingRule, requestNumber);
+  const reader = freshClient(client);
+  const entry = await resolveRequest(reader, infoProvider, remodelingRule, requestNumber);
   const key = requireKey(entry);
 
-  const { body: stepsBody } = await client.rawGet(
+  const { body: stepsBody } = await reader.rawGet(
     `${ODATA}/${entityKey(key)}/to_steps`,
     JSON_HEADERS,
   );
   const steps = parseCollection<MonitorStep>(stepsBody);
+
+  // Never report "running" on the service's word alone — that is the state that hangs.
+  let verification: StatusVerification = {};
+  if (entry.status === 'R') {
+    try {
+      verification = await verifyRunningStatus(reader, key.requestNumber);
+    } catch (e) {
+      verification = {
+        note: `status could not be verified against the runtime tables: ${
+          e instanceof Error ? e.message : String(e)
+        }`,
+      };
+    }
+  }
 
   // A missing or unreadable log must not fail the status read — the header and the
   // step list are the parts the caller always needs.
@@ -313,7 +516,7 @@ export async function bwGetRemodelingRequest(
   let logError = '';
   if (includeLog) {
     try {
-      const log = await fetchLogMessages(client, key.requestNumber, entry.last_run_timestamp ?? '');
+      const log = await fetchLogMessages(reader, key.requestNumber, entry.last_run_timestamp ?? '');
       messages = log.messages;
       truncated = log.truncated;
     } catch (e) {
@@ -323,7 +526,14 @@ export async function bwGetRemodelingRequest(
 
   if (format === 'raw') {
     return JSON.stringify(
-      { request: entry, steps, messages, truncatedLogHandles: truncated, logError: logError || undefined },
+      {
+        request: entry,
+        steps,
+        messages,
+        truncatedLogHandles: truncated,
+        statusVerification: verification.status || verification.note ? verification : undefined,
+        logError: logError || undefined,
+      },
       null,
       2,
     );
@@ -331,7 +541,17 @@ export async function bwGetRemodelingRequest(
 
   const lines: string[] = [];
   lines.push(`Remodeling request ${key.remodelingRule} on ${key.infoProvider}`);
-  lines.push(`  Status:       ${statusLabel(entry)}`);
+  lines.push(
+    `  Status:       ${verification.status ? labelForCode(verification.status) : statusLabel(entry)}`,
+  );
+  if (verification.status) {
+    lines.push(
+      `                (corrected from ${labelForCode('R')} reported by the monitor; ` +
+        `source: ${verification.source})`,
+    );
+  } else if (verification.note) {
+    lines.push(`                (warning: ${verification.note})`);
+  }
   lines.push(`  Object Type:  ${entry.tlogo ?? ''}`);
   lines.push(`  InfoArea:     ${entry.infoArea ?? ''}`);
   lines.push(`  Last Run:     ${edmDate(entry.last_run_timestamp)}`);
