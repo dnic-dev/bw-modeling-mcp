@@ -2648,7 +2648,9 @@ const TOOL_DEFINITIONS = [
         'Use bw_system_profile to see which endpoints a system publishes. ' +
         'Supported object_type: TRFN (transformation incl. start/end/expert and field routine source code), ' +
         'DTPA (data transfer process), ODSO (classic DataStore Object), CUBE (InfoCube), MPRO (MultiProvider) ' +
-        'and RSPC (process chain: steps with their variant parameters, resolved into execution order). ' +
+        'and RSPC (process chain: steps with their variant parameters, in execution order — every step follows its ' +
+        'predecessors, but branches that run in parallel have no order among themselves, so read the "After" line ' +
+        'of each step for the actual dependency). ' +
         'Requires ADT authorization for the calling user. Prefer bw_get_transformation where the REST endpoint exists.',
       inputSchema: {
         type: 'object',
