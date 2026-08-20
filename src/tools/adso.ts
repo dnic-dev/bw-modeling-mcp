@@ -380,16 +380,67 @@ function summarizeAdso(adsoName: string, status: string, xml: string): string {
 }
 
 /**
+ * The field groups ("Feldgruppen") an aDSO declares, as group name → the exact value an
+ * element's `dimension` attribute must carry to join that group.
+ *
+ * A group is declared by a `<dimension name="X"/>` block; a field joins it through
+ * `dimension="#///X\u00a7"` on its `<element>`. That value ends in a SECTION SIGN, which is
+ * why it is never built from caller input: where the aDSO already has a field in the group,
+ * its attribute is copied verbatim, and only otherwise is the canonical form composed.
+ * A field with no `dimension` attribute at all sits in the catch-all group.
+ */
+export function adsoFieldGroups(adsoXml: string): Map<string, string> {
+  const groups = new Map<string, string>();
+  for (const m of adsoXml.matchAll(/<dimension\b[^>]*\bname="([^"]+)"/g)) {
+    groups.set(m[1], `#///${m[1]}\u00a7`);
+  }
+  // Prefer a value the document itself uses — it is authoritative about the terminator.
+  for (const m of adsoXml.matchAll(/<element\b[^>]*\bdimension="([^"]+)"/g)) {
+    const value = m[1];
+    const name = value.replace(/^#\/\/\//, '').replace(/\u00a7$/, '');
+    if (name) groups.set(name, value);
+  }
+  return groups;
+}
+
+/**
+ * Translate a caller-supplied group name into the attribute value for this aDSO.
+ *
+ * Accepts the bare name ("__KEYFIGURES"), and tolerates the decorated form should a caller
+ * paste one straight out of the XML. An undeclared group is an error rather than a silent
+ * fall back to the catch-all: the field would land somewhere the caller did not ask for and
+ * the save would still report success.
+ */
+export function resolveFieldGroup(adsoXml: string, requested: string, adsoUpper: string): string {
+  const name = requested.trim().replace(/^#\/\/\//, '').replace(/\u00a7$/, '').toUpperCase();
+  if (!name) throw new Error('dimension must be a field group name, e.g. "__KEYFIGURES".');
+  const groups = adsoFieldGroups(adsoXml);
+  const value = groups.get(name);
+  if (value) return value;
+  const known = [...groups.keys()].sort();
+  throw new Error(
+    `aDSO ${adsoUpper} has no field group "${name}". ` +
+    (known.length
+      ? `Declared groups: ${known.join(', ')}.`
+      : 'It declares no field groups at all — every field sits in the catch-all group.'),
+  );
+}
+
+/**
  * Build the <element> XML snippet to inject into an aDSO.
  * Based on the recorded PUT payload pattern from adso_workflow.md Block 3b.
  */
-function buildAdsoElement(iObjName: string, props: ReturnType<typeof parseInfoObjectProps>): string {
+function buildAdsoElement(
+  iObjName: string,
+  props: ReturnType<typeof parseInfoObjectProps>,
+  dimension = '#///ALL§',
+): string {
   const { conversionRoutine, label, dataType, length } = props;
   const name = iObjName.toUpperCase();
   const convAttr = conversionRoutine ? ` conversionRoutine="${conversionRoutine}"` : '';
   return `  <element xsi:type="adso:AdsoElement" name="${name}" keep="false"
     aggregationBehavior="NONE" infoObjectName="${name}"${convAttr}
-    dimension="#///ALL§" sidDeterminationMode="S">
+    dimension="${dimension}" sidDeterminationMode="S">
     <endUserTexts label="${label}"/>
     <inlineType name="${dataType}" length="${length}" globalElementName="${name}"/>
     <associationType>1</associationType>
@@ -510,6 +561,8 @@ export interface FieldProperties {
   // null = remove the reference. Mutually exclusive with fixedUnit/fixedCurrency (those are removed when set).
   unitCurrencyField?: string | null;
   description?: string;               // <localProperties><descriptions label="..."/>
+  /** Field group to move the field into; must be one the aDSO declares. */
+  dimension?: string;
   transport?: string;
 }
 
@@ -573,6 +626,10 @@ export async function bwUpdateAdsoFieldProperties(
   }
 
   // ── Apply properties ──────────────────────────────────────────────────────
+  if (properties.dimension !== undefined) {
+    replaceAttr('dimension', resolveFieldGroup(fullXml, properties.dimension, adsoUpper));
+  }
+
   if (properties.sidDeterminationMode !== undefined) {
     replaceAttr('sidDeterminationMode', properties.sidDeterminationMode);
   }
@@ -666,6 +723,8 @@ export interface FieldDef {
   length?: number;
   aggregationBehavior?: string;
   isKey?: boolean;
+  /** Field group to place the field in; must be one the aDSO declares. */
+  dimension?: string;
 }
 
 // Keyfigure types: LocalKeyfigureProperties, aggregationBehavior, <semantics> tag
@@ -719,7 +778,7 @@ const SEMANTIC_TYPE: Record<string, string> = {
   'QUAN': 'quantity',
 };
 
-function buildPureFieldElement(field: FieldDef): string {
+function buildPureFieldElement(field: FieldDef, dimension = '#///GROUP1§'): string {
   const name = field.name.trim().toUpperCase();
   const apiType = TYPE_NAME_MAP[field.dataType] ?? field.dataType;
   const isKeyfigure = KEYFIGURE_TYPES.has(apiType);
@@ -780,7 +839,7 @@ function buildPureFieldElement(field: FieldDef): string {
 
   return (
     `  <element xsi:type="adso:AdsoElement" name="${name}"${aggrAttr}${convAttr}\n` +
-    `    dimension="#///GROUP1§" sidDeterminationMode="N">\n` +
+    `    dimension="${dimension}" sidDeterminationMode="N">\n` +
     `    <inlineType ${inlineAttrs.join(' ')}/>\n` +
     `    <localProperties xsi:type="${localPropsType}">\n` +
     `      <descriptions label="${field.label}"/>\n` +
@@ -928,6 +987,13 @@ export async function bwUpdateAdsoAddPureField(
   const processed: string[] = [];
   const skipped: string[] = [];
 
+  // Resolved up front so an unknown group name fails before anything is written.
+  const groups = new Map<string, string>();
+  for (const field of fields) {
+    if (field.dimension === undefined) continue;
+    groups.set(field.name, resolveFieldGroup(xml, field.dimension, adsoUpper));
+  }
+
   for (const field of fields) {
     const name = field.name.trim().toUpperCase();
     if (xml.includes(`name="${name}"`)) {
@@ -944,7 +1010,7 @@ export async function bwUpdateAdsoAddPureField(
         );
       }
     }
-    elementBlocks.push(buildPureFieldElement(field));
+    elementBlocks.push(buildPureFieldElement(field, groups.get(field.name)));
     if (field.isKey) {
       keyElements.push(`  <keyElement>#///${name}</keyElement>`);
     }
@@ -1003,7 +1069,8 @@ export async function bwUpdateAdso(
   adsoName: string,
   infoObjectName: string,
   action: 'add_field' | 'remove_field' = 'add_field',
-  transport?: string
+  transport?: string,
+  dimension?: string
 ): Promise<string> {
   const names = infoObjectName
     .split(',')
@@ -1040,6 +1107,10 @@ export async function bwUpdateAdso(
     // add_field — read each InfoObject and inject. One fresh reader session for the
     // whole call: an InfoObject created/edited earlier through the shared client
     // could otherwise be served from a stale session buffer.
+    // Resolved once against the document as read: a group is a property of the aDSO, and
+    // an unknown name must stop the call before any field is injected.
+    const group =
+      dimension !== undefined ? resolveFieldGroup(updatedXml, dimension, adsoUpper) : undefined;
     const iobjReader = createClientFromEnv();
     for (const name of names) {
       if (updatedXml.includes(`infoObjectName="${name}"`)) {
@@ -1051,7 +1122,7 @@ export async function bwUpdateAdso(
         MEDIA_TYPES['iobj']
       );
       const iObjProps = parseInfoObjectProps(iObjResult.body);
-      updatedXml = injectElement(updatedXml, buildAdsoElement(name, iObjProps));
+      updatedXml = injectElement(updatedXml, buildAdsoElement(name, iObjProps, group));
       processed.push(name);
     }
 

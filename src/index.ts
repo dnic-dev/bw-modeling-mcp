@@ -312,7 +312,8 @@ const TOOL_DEFINITIONS = [
         'action "add_pure_field": add one or more pure (non-InfoObject) fields — pass fields array with name, label, data_type, optional length/precision/scale/aggregation_behavior/is_key. ' +
         'action "update_settings": change aDSO type preset and/or individual boolean flags — no infoobject_name needed. ' +
         'action "manage_keys": replace the complete key field list — pass key_fields array (empty = no key fields). ' +
-        'action "update_field_properties": modify sidDeterminationMode, aggregationBehavior, fixedCurrency/Unit, a unit/currency field reference (unit_currency_field), or descriptions of a single field — pass field_name and properties. ' +
+        'action "update_field_properties": modify sidDeterminationMode, aggregationBehavior, fixedCurrency/Unit, a unit/currency field reference (unit_currency_field), the field group (dimension), or descriptions of a single field — pass field_name and properties. ' +
+        'Field groups: pass "dimension" on add_field/add_pure_field to place new fields in the right group straight away — a field added without it lands in the catch-all group and moving it afterwards costs a second activation. ' +
         'Returns a lock_handle that must be passed to bw_activate to complete the operation. ' +
         'Sequence: bw_update_adso → bw_activate (adso) → bw_activate (trfn) → bw_activate (each dtpa).',
       inputSchema: {
@@ -345,6 +346,7 @@ const TOOL_DEFINITIONS = [
                 scale: { type: 'number', description: 'Decimal places. Required for CURR/QUAN (> 0 — BW rejects scale 0) and used for DEC. Emitted as the XML scale attribute.' },
                 aggregation_behavior: { type: 'string', enum: ['SUM', 'MIN', 'MAX', 'AVG', 'LAST', 'NONE'], description: 'Aggregation (default SUM for numeric types). Use NONE for no aggregation.' },
                 is_key: { type: 'boolean', description: 'If true, also injects a <keyElement> entry.' },
+                dimension: { type: 'string', description: 'Field group ("Feldgruppe") to place the field in, given as the bare group name — e.g. "__KEYFIGURES" for the key figure group or "ALL" for the catch-all. Must be a group the aDSO declares; an unknown name is rejected with the declared groups listed rather than silently falling back. Read the current assignment from the DIM column of bw_get_adso.' },
               },
               required: ['name', 'label', 'data_type'],
             },
@@ -388,6 +390,10 @@ const TOOL_DEFINITIONS = [
                 type: 'string',
                 description: 'Description label for pure fields (sets <localProperties><descriptions label="..."/>).',
               },
+              dimension: {
+                type: 'string',
+                description: 'Field group ("Feldgruppe") to place the field in, given as the bare group name — e.g. "__KEYFIGURES" for the key figure group or "ALL" for the catch-all. Must be a group the aDSO declares; an unknown name is rejected with the declared groups listed rather than silently falling back. Read the current assignment from the DIM column of bw_get_adso. Moves the field between groups without touching any other property.',
+              },
             },
           },
           key_fields: {
@@ -411,6 +417,10 @@ const TOOL_DEFINITIONS = [
               write_interface: { type: 'boolean', description: 'Enable or disable write interface (pushMode).' },
               label: { type: 'string', description: 'aDSO description text.' },
             },
+          },
+          dimension: {
+            type: 'string',
+            description: 'Field group ("Feldgruppe") to place the field in, given as the bare group name — e.g. "__KEYFIGURES" for the key figure group or "ALL" for the catch-all. Must be a group the aDSO declares; an unknown name is rejected with the declared groups listed rather than silently falling back. Read the current assignment from the DIM column of bw_get_adso. Applies to every field added by this call (action "add_field").',
           },
           transport: {
             type: 'string',
@@ -4592,6 +4602,7 @@ async function handleToolCall(
             scale: f['scale'] as number | undefined,
             aggregationBehavior: f['aggregation_behavior'] as string | undefined,
             isKey: f['is_key'] as boolean | undefined,
+            dimension: f['dimension'] as string | undefined,
           }));
           text = await bwUpdateAdsoAddPureField(client, args?.adso_name as string, fieldDefs, args?.transport as string | undefined);
         } else if (args?.action === 'update_field_properties') {
@@ -4604,6 +4615,7 @@ async function handleToolCall(
           if ('fixed_unit' in p) fp.fixedUnit = p['fixed_unit'] as string | null;
           if ('unit_currency_field' in p) fp.unitCurrencyField = p['unit_currency_field'] as string | null;
           if (p['description'] !== undefined) fp.description = p['description'] as string;
+          if (p['dimension'] !== undefined) fp.dimension = p['dimension'] as string;
           fp.transport = args?.transport as string | undefined;
           text = await bwUpdateAdsoFieldProperties(
             client,
@@ -4617,7 +4629,8 @@ async function handleToolCall(
             args?.adso_name as string,
             args?.infoobject_name as string,
             (args?.action as 'add_field' | 'remove_field') ?? 'add_field',
-            args?.transport as string | undefined
+            args?.transport as string | undefined,
+            args?.dimension as string | undefined
           );
         }
         break;

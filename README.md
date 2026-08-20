@@ -102,6 +102,7 @@ Until now almost every call against a BW 7.5 system failed with HTTP 406, becaus
 - Remove fields
 - Manage key fields
 - Update field properties (aggregation, data type, length, etc.)
+- Place fields in a field group — on creation, so a key figure lands in the key figure group without a second activation, or afterwards to move an existing field between groups
 - Update aDSO settings (type preset, flags, description)
 - Write-interface aDSO support (`pushMode`)
 
@@ -392,6 +393,8 @@ Modify an existing aDSO. Actions:
 - `update_field_properties` — change aggregation, data type, length, etc.
 - `update_settings` — change aDSO type preset, flags, or description
 
+
+Field groups: `dimension` takes the bare group name — `"__KEYFIGURES"`, `"DATA"`, whatever the aDSO declares — on `add_field` and `add_pure_field` to create the field in that group directly, and under `properties` on `update_field_properties` to move an existing one. Group names are defined per aDSO; an unknown name is rejected with the declared groups listed. The current assignment is the `DIM` column of `bw_get_adso`.
 ### `bw_get_infoobject`
 Read an InfoObject definition (Characteristic or Key Figure).
 
