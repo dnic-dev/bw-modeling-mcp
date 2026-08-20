@@ -384,18 +384,33 @@ Add `.mcp.json` to your project root:
 
 ## How it works
 
-The server connects to the SAP BW Modeling REST API (`/sap/bw/modeling/`) — the same internal API used by Eclipse BWMT. All write operations follow the BW locking protocol:
+The server talks to four SAP APIs, and only one of them needs a protocol worth describing.
+
+**The BW Modeling REST API** (`/sap/bw/modeling/`) is a full-document API: there is no way to
+change one attribute of an object. Every write therefore runs the same six steps.
 
 1. **Lock** — acquires an exclusive lock and returns a `lockHandle`
 2. **Read** — fetches the current complete XML of the object
-3. **Modify** — applies changes to the XML
-4. **PUT** — sends the full modified XML back (never partial updates)
-5. **Activate** — promotes the inactive version to active
+3. **Modify** — applies the change to that XML
+4. **PUT** — sends the whole document back, never a fragment
+5. **Activate** — promotes the inactive version to the active one
 6. **Unlock** — releases the lock
 
-Session cookies and CSRF tokens are managed automatically.
+Two consequences are worth knowing. Saving and activating are separate: a document the server
+accepts can still fail to activate, so a successful write proves less than it appears to. And
+because the whole document travels, a read that came from a stale session buffer will silently
+write old values back — the tools read fresh for exactly this reason.
 
-See [ARCHITECTURE.md](ARCHITECTURE.md) for the full technical architecture and complete API reference.
+The other three need none of it. The **ADT API** (`/sap/bc/adt/`) carries ABAP and AMDP routine
+source, the DataPreview service behind `bw_read_metadata_tables`, transport checks and
+activation runs. The **BW/4HANA manage API** (`/sap/bc/http/sap/bw4/`) answers the request
+monitor, the remodeling monitor and runtime operations. The **Push API** (`/sap/bw4/v1/push/`)
+takes a JSON record array straight into a write-interface aDSO.
+
+Session cookies and CSRF tokens are handled for all four.
+
+See [ARCHITECTURE.md](ARCHITECTURE.md) for the full technical architecture and the complete
+endpoint reference.
 
 ---
 
