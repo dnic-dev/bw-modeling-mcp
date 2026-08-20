@@ -57,7 +57,9 @@ Until now almost every call against a BW 7.5 system failed with HTTP 406, becaus
 
 - **📘 [docs/BW75-SUPPORT.md](docs/BW75-SUPPORT.md)** — root cause, the ABAP code, the SE24 setup steps, and an honest list of what BW 7.5 ships no REST resource for at all
 - **`bw_system_profile`** — one call and the agent knows what it is working on: BW/4HANA or classic BW, which REST endpoint groups the system publishes, and whether the three preconditions hold (`Accept`-header handling, ADT DataPreview access, query reporting). It can then take the route that works on this release — reading a transformation from the metadata tables where there is no REST resource for one — instead of discovering the release through failed calls
-- **`bw_read_metadata_tables`** — reads straight from the metadata tables where there is no REST resource: transformations (including routine source), DTPs, process chains, and the classic providers `ODSO`, `CUBE` and `MPRO`. A chain comes back in the order it runs, not the order the tables return. InfoCubes and DataStore objects also report their **load history** — request, status, update mode, start time, who ran it, how long it took, records transferred and added, and the source. On classic BW that is the only way to see load status at all, because the manage API behind `bw_list_requests` does not exist there
+- **`bw_read_metadata_tables`** — reads straight from the metadata tables where there is no REST resource: transformations including their routine source, DTPs, and the classic providers `ODSO`, `CUBE` and `MPRO`
+- **Process chains too** — steps with their variant parameters and the dependencies between them, resolved into the order the chain actually runs. RSPC keeps no edge list, only the event each step waits for and the events it raises, so that order has to be computed; the tables return the rows in none
+- **Load history** of an InfoCube or DataStore object — request, status, update mode, start, user, duration, records and source
 
 **🔗 Process chains, edited in place**
 
