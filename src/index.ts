@@ -1462,8 +1462,12 @@ const TOOL_DEFINITIONS = [
         'and creator. Remodeling changes the structure of an existing InfoProvider (e.g. adding, ' +
         'deleting or reassigning a field of an aDSO) and converts the data it already holds. ' +
         'Read-only. ' +
-        'A remodeling rule is created in the BW Modeling Tools (Eclipse); this tool family ' +
-        'monitors and runs the resulting requests, it does not create rules.',
+        'Rules are not created by this tool family — BW creates one automatically when an ' +
+        'aDSO holding data is activated after a change that cannot be applied to the existing ' +
+        'data in place (changing the key definition, deleting a field, changing a data type). ' +
+        'Merely appending a field does not trigger one: the column is added and old records ' +
+        'keep the initial value. The activation reports "remodeling rule <ID> created instead ' +
+        'of the activation"; that ID is the remodeling_rule of the resulting request.',
       inputSchema: {
         type: 'object',
         properties: {
@@ -1476,12 +1480,15 @@ const TOOL_DEFINITIONS = [
           status: {
             type: 'string',
             description:
-              'Comma-separated status codes to include (default all): N not scheduled, ' +
-              'S scheduled, R running, C completed, E error.',
+              'Optional comma-separated status codes to include: N not scheduled, S scheduled, ' +
+              'R running, C completed, E error. Omit to list every request regardless of status.',
           },
           top: {
             type: 'number',
-            description: 'Upper cap on the number of requests to return (default 20).',
+            description:
+              'Upper cap on the number of requests to return (default 20). When the cap cuts ' +
+              'the list short, the output says so and reports the total — do not read a ' +
+              'truncated list as the complete set of open requests.',
           },
         },
       },
@@ -1492,7 +1499,12 @@ const TOOL_DEFINITIONS = [
         'Full status of one remodeling request: header, the five processing steps ' +
         '(CHECK, SAVE, CONVERT, ACTIVATE, CLEANUP) with their individual status, and the ' +
         'application log messages. Read-only. ' +
-        'This is the tool to diagnose a failed remodeling — the log carries the reason.',
+        'This is the tool to diagnose a failed remodeling — the log carries the reason. ' +
+        'A "running" status is never reported on the monitor service alone: it is buffered and ' +
+        'keeps reporting Running after a run has finished, so the status is cross-checked ' +
+        'against the runtime tables and the batch job. A corrected status names its source; ' +
+        'if the run is demonstrably over but the header still lags, the output warns about it. ' +
+        'Poll this tool to wait for a run to finish.',
       inputSchema: {
         type: 'object',
         properties: {

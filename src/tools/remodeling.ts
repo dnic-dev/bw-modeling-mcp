@@ -35,11 +35,18 @@ const REQUEST_STATUS: Record<string, string> = {
   N: 'Not scheduled',
   S: 'Scheduled',
   R: 'Running',
-  C: 'Completed',
+  // Wording follows the service's own texts, so a corrected status and a service-reported
+  // one read identically.
+  C: 'Complete',
   E: 'Error',
 };
 
-const ALL_STATUS = Object.keys(REQUEST_STATUS).join(',');
+/**
+ * No status filter by default. Enumerating the known codes would silently drop a request
+ * whose status is not among them — and because $inlinecount is filtered too, the result
+ * would look complete. An unfiltered read cannot hide a request.
+ */
+const NO_STATUS_FILTER = '';
 
 /** Empty-date sentinel the backend uses for unset job dates. */
 const EMPTY_DATE = "datetime'9999-03-23T23:00:00'";
@@ -128,14 +135,14 @@ function sqlLit(value: string): string {
 }
 
 /** TIMESTAMPL (`YYYYMMDDHHMMSS.ffffff`, UTC) → ISO 8601, or '' when unset. */
-function timestampl(value?: string): string {
+export function timestampl(value?: string): string {
   const m = /^(\d{4})(\d{2})(\d{2})(\d{2})(\d{2})(\d{2})/.exec((value ?? '').trim());
   if (!m || m[1] === '0000') return '';
   return `${m[1]}-${m[2]}-${m[3]}T${m[4]}:${m[5]}:${m[6]}Z`;
 }
 
 /** TBTCO keeps date and time apart, in server local time — not UTC. */
-function jobEndTime(date?: string, time?: string): string {
+export function jobEndTime(date?: string, time?: string): string {
   const d = (date ?? '').trim();
   const t = (time ?? '').trim().padStart(6, '0');
   if (!/^\d{8}$/.test(d) || d === '00000000') return '';
@@ -227,7 +234,13 @@ async function resolveRequest(
     return parseEntity<MonitorEntry>(body);
   }
 
-  const { entries: matches } = await fetchRequests(client, infoProvider, ALL_STATUS, 20, remodelingRule);
+  const { entries: matches } = await fetchRequests(
+    client,
+    infoProvider,
+    NO_STATUS_FILTER,
+    20,
+    remodelingRule,
+  );
   if (matches.length === 0) {
     throw new Error(
       `no remodeling request found for InfoProvider ${infoProvider.toUpperCase()} ` +
@@ -252,13 +265,62 @@ function requireKey(entry: MonitorEntry): {
 
 // ── Status verification ─────────────────────────────────────────────────────
 
-interface StatusVerification {
+export interface StatusVerification {
   /** Authoritative status code, when the database knows better than the service. */
   status?: string;
   /** Where the corrected status came from. */
   source?: string;
   /** Warning to surface when the run is demonstrably over but the header still says R. */
   note?: string;
+  /**
+   * Step list read from the runtime table. The service buffers the steps as well, so a
+   * corrected header status must not be shown above steps that still claim to be running.
+   */
+  steps?: MonitorStep[];
+}
+
+/** What the runtime tables say about a run whose header status still reads R. */
+export interface RuntimeState {
+  headStatus: string;
+  runStatus: string;
+  /** ISO 8601 end of the RUN step, '' when unset. */
+  runEnd: string;
+  jobName: string;
+  jobStatus: string;
+  /** Server-local end of the batch job, '' when unset. */
+  jobEnd: string;
+}
+
+/**
+ * Decide what a Running header status really means, in order of authority: the header
+ * table, then the overall RUN step, then the batch job. The job only ever produces a
+ * warning — it proves the run is over but not how it ended.
+ */
+export function interpretRuntimeState(state: RuntimeState): StatusVerification {
+  if (state.headStatus && state.headStatus !== 'R') {
+    return { status: state.headStatus, source: HEAD_TABLE.toUpperCase() };
+  }
+
+  // The RUN step spans the whole run: a non-running status with a filled ENDTIME is final.
+  if (state.runStatus && state.runStatus !== 'R' && state.runEnd) {
+    return {
+      status: state.runStatus,
+      source: `${STEP_TABLE.toUpperCase()} (step ${RUN_STEP}, ended ${state.runEnd})`,
+    };
+  }
+
+  const finished = JOB_FINISHED[state.jobStatus];
+  if (state.jobName && finished) {
+    return {
+      note:
+        `batch job ${state.jobName} ${finished}` +
+        (state.jobEnd ? ` at ${state.jobEnd} server time` : '') +
+        ` (${JOB_TABLE.toUpperCase()} status ${state.jobStatus}) — ` +
+        `the monitor status has not caught up yet`,
+    };
+  }
+
+  return {};
 }
 
 /**
@@ -280,45 +342,56 @@ async function verifyRunningStatus(
     1,
   );
   const headStatus = (head[0]?.STATUS ?? '').trim();
-  if (headStatus && headStatus !== 'R') {
-    return { status: headStatus, source: HEAD_TABLE.toUpperCase() };
-  }
-
-  // The RUN step spans the whole run: a non-running status with a filled ENDTIME is final.
-  const run = await queryTable(
-    client,
-    `SELECT status, endtime FROM ${STEP_TABLE} WHERE id = '${id}' AND stepnm = '${RUN_STEP}'`,
-    1,
-  );
-  const runStatus = (run[0]?.STATUS ?? '').trim();
-  const runEnd = timestampl(run[0]?.ENDTIME);
-  if (runStatus && runStatus !== 'R' && runEnd) {
-    return { status: runStatus, source: `${STEP_TABLE.toUpperCase()} (step ${RUN_STEP}, ended ${runEnd})` };
-  }
-
-  // Last resort: the batch job itself. If it is done, the header is merely lagging —
-  // report that rather than claiming the remodeling is still running.
   const jobName = (head[0]?.JOBNAME ?? '').trim();
   const jobCount = (head[0]?.JOBCOUNT ?? '').trim();
-  if (!jobName) return {};
 
-  const job = await queryTable(
+  // One read covers both the overall RUN row and the numbered monitor steps.
+  const stepRows = await queryTable(
     client,
-    `SELECT status, enddate, endtime FROM ${JOB_TABLE} WHERE jobname = '${sqlLit(jobName)}'` +
-      (jobCount ? ` AND jobcount = '${sqlLit(jobCount)}'` : ''),
-    1,
+    `SELECT stepnm, stepno, status, endtime FROM ${STEP_TABLE} WHERE id = '${id}'`,
+    60,
   );
-  const jobStatus = (job[0]?.STATUS ?? '').trim();
-  const finished = JOB_FINISHED[jobStatus];
-  if (!finished) return {};
+  const runRow = stepRows.find((r) => (r.STEPNM ?? '').trim() === RUN_STEP);
+  const monitorSteps: MonitorStep[] = stepRows
+    // Internal sub-steps all carry step number 000; only the numbered ones are shown.
+    .filter((r) => (r.STEPNO ?? '').trim() !== '000')
+    .map((r) => ({
+      stepNumber: (r.STEPNO ?? '').trim(),
+      stepName: (r.STEPNM ?? '').trim(),
+      status: (r.STATUS ?? '').trim(),
+    }))
+    .sort((a, b) => (a.stepNumber ?? '').localeCompare(b.stepNumber ?? ''));
 
-  const ended = jobEndTime(job[0]?.ENDDATE, job[0]?.ENDTIME);
-  return {
-    note:
-      `batch job ${jobName} ${finished}` +
-      (ended ? ` at ${ended} server time` : '') +
-      ` (${JOB_TABLE.toUpperCase()} status ${jobStatus}) — the monitor status has not caught up yet`,
-  };
+  const runStatus = (runRow?.STATUS ?? '').trim();
+  const runEnd = timestampl(runRow?.ENDTIME);
+
+  // The batch job is only needed when neither the header nor the RUN step settled it.
+  let jobStatus = '';
+  let jobEnd = '';
+  const undecided = (!headStatus || headStatus === 'R') && !(runStatus && runStatus !== 'R' && runEnd);
+  if (undecided && jobName) {
+    const job = await queryTable(
+      client,
+      `SELECT status, enddate, endtime FROM ${JOB_TABLE} WHERE jobname = '${sqlLit(jobName)}'` +
+        (jobCount ? ` AND jobcount = '${sqlLit(jobCount)}'` : ''),
+      1,
+    );
+    jobStatus = (job[0]?.STATUS ?? '').trim();
+    jobEnd = jobEndTime(job[0]?.ENDDATE, job[0]?.ENDTIME);
+  }
+
+  const verdict = interpretRuntimeState({
+    headStatus,
+    runStatus,
+    runEnd,
+    jobName,
+    jobStatus,
+    jobEnd,
+  });
+
+  // Only replace the step list when the header status was actually corrected — otherwise
+  // the service's own steps (with their translated texts) stay in place.
+  return verdict.status && monitorSteps.length ? { ...verdict, steps: monitorSteps } : verdict;
 }
 
 // ── Read ────────────────────────────────────────────────────────────────────
@@ -356,7 +429,7 @@ async function correctRunningEntries(
 export async function bwListRemodelingRequests(
   client: BwClient,
   infoProvider?: string,
-  status: string = ALL_STATUS,
+  status: string = NO_STATUS_FILTER,
   top: number = 20,
 ): Promise<string> {
   const reader = freshClient(client);
@@ -528,7 +601,8 @@ export async function bwGetRemodelingRequest(
     return JSON.stringify(
       {
         request: entry,
-        steps,
+        steps: verification.steps ?? steps,
+        serviceSteps: verification.steps ? steps : undefined,
         messages,
         truncatedLogHandles: truncated,
         statusVerification: verification.status || verification.note ? verification : undefined,
@@ -559,8 +633,13 @@ export async function bwGetRemodelingRequest(
   lines.push(`  Request:      ${key.requestNumber}`);
   lines.push('');
 
-  lines.push(`Steps (${steps.length}):`);
-  for (const step of steps) {
+  // The service returns the steps unordered, and its step list is buffered just like the
+  // header — a corrected status brings its own step list along.
+  const shownSteps = [...(verification.steps ?? steps)].sort((a, b) =>
+    (a.stepNumber ?? '').localeCompare(b.stepNumber ?? ''),
+  );
+  lines.push(`Steps (${shownSteps.length}):`);
+  for (const step of shownSteps) {
     const label = step.stepStatusText ?? REQUEST_STATUS[step.status ?? ''] ?? step.status ?? '';
     lines.push(`  ${step.stepNumber ?? ''} ${step.stepName ?? ''} — ${label} (${step.status ?? ''})`);
   }
