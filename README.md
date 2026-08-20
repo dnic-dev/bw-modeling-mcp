@@ -61,7 +61,7 @@ Until now almost every call against a BW 7.5 system failed with HTTP 406, becaus
   - **Transformations** — field mappings with their rule types, and the source of the start, end, expert and field routines
   - **DTPs** — path, resolved transformation, extraction mode and error handling
   - **Classic providers** — `ODSO`, `CUBE` and `MPRO`
-  - **Process chains** — steps with their variant parameters and the dependencies between them, resolved into the order the chain actually runs. RSPC keeps no edge list, only the event each step waits for and the events it raises, so that order has to be computed; the tables return the rows in none
+  - **Process chains** — steps with their variant parameters and the dependencies between them, resolved into the order the chain actually runs. The tables state neither: they return the steps in no particular order, and a dependency exists only implicitly, wherever one step raises the event another one waits for
   - **Load history** of an InfoCube or DataStore object — request, status, update mode, start, user, duration, records and source
 
 **🔗 Process chains, edited in place**
