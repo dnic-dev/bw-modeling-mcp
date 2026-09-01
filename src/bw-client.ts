@@ -270,6 +270,30 @@ export class BwClient {
     return {};
   }
 
+  /**
+   * Same proxy transport config passed to the main `this.http` in the constructor —
+   * needed by every "fresh axios instance" helper (rawPost/rawPut/rawDelete) too,
+   * otherwise those bypass the Cloud Connector tunnel and axios tries to resolve the
+   * virtual destination host itself (e.g. "ad4"), failing with ENOTFOUND.
+   */
+  private proxyConfig() {
+    return this.opts.proxy
+      ? { host: this.opts.proxy.host, port: this.opts.proxy.port, protocol: 'http' as const }
+      : undefined;
+  }
+
+  /**
+   * The Proxy-Authorization (+ optional SCC location) header the constructor's
+   * interceptor adds to `this.http`. The raw*() helpers build their own axios
+   * instance without that interceptor, so they merge this in explicitly.
+   */
+  private proxyHeaders(): Record<string, string> {
+    if (!this.opts.proxy) return {};
+    const headers: Record<string, string> = { 'Proxy-Authorization': `Bearer ${this.opts.proxy.token}` };
+    if (this.opts.proxy.locationId) headers['SAP-Connectivity-SCC-Location_ID'] = this.opts.proxy.locationId;
+    return headers;
+  }
+
   // ── Session info (debug) ──────────────────────────────────────────────────
 
   /** Returns a snapshot of the current session cookies — for debug assertions only. */
@@ -775,6 +799,7 @@ export class BwClient {
   ): Promise<{ body: string; headers: Record<string, string> }> {
     const freshHttp = axios.create({
       baseURL: this.http.defaults.baseURL,
+      proxy: this.proxyConfig(),
       httpsAgent: new https.Agent({ rejectUnauthorized: false }),
       validateStatus: () => true,
       // Wipe every axios default-header bucket so nothing leaks through
@@ -785,6 +810,7 @@ export class BwClient {
     const response = await freshHttp.post(url, body, {
       headers: {
         ...this.authHeaders(),
+        ...this.proxyHeaders(),
         ...(cookieHdr ? { Cookie: cookieHdr } : {}),
         ...headers,
       },
@@ -840,6 +866,7 @@ export class BwClient {
   ): Promise<{ body: string; headers: Record<string, string> }> {
     const freshHttp = axios.create({
       baseURL: this.http.defaults.baseURL,
+      proxy: this.proxyConfig(),
       httpsAgent: new https.Agent({ rejectUnauthorized: false }),
       validateStatus: () => true,
       headers: { common: {}, get: {}, post: {}, put: {}, patch: {}, delete: {}, head: {} } as any,
@@ -849,6 +876,7 @@ export class BwClient {
     const response = await freshHttp.put(url, body, {
       headers: {
         ...this.authHeaders(),
+        ...this.proxyHeaders(),
         ...(cookieHdr ? { Cookie: cookieHdr } : {}),
         ...headers,
       },
@@ -875,6 +903,7 @@ export class BwClient {
     const csrfToken = await this.getCsrfToken();
     const freshHttp = axios.create({
       baseURL: this.http.defaults.baseURL,
+      proxy: this.proxyConfig(),
       httpsAgent: new https.Agent({ rejectUnauthorized: false }),
       validateStatus: () => true,
       headers: { common: {}, get: {}, post: {}, put: {}, patch: {}, delete: {}, head: {} } as any,
@@ -883,6 +912,7 @@ export class BwClient {
     const response = await freshHttp.delete(url, {
       headers: {
         ...this.authHeaders(),
+        ...this.proxyHeaders(),
         ...(cookieHdr ? { Cookie: cookieHdr } : {}),
         'x-csrf-token': csrfToken,
         ...headers,
