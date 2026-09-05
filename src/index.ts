@@ -5036,11 +5036,12 @@ async function handleToolCall(
         break;
 
       case 'bw_get_push_schema':
-        text = await bwGetPushSchema(args?.adso_name as string);
+        text = await bwGetPushSchema(client, args?.adso_name as string);
         break;
 
       case 'bw_push_data':
         text = await bwPushData(
+          client,
           args?.adso_name as string,
           args?.records as object[],
           (args?.mode as string) ?? 'one_step'

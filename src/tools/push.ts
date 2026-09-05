@@ -1,99 +1,65 @@
-import axios from 'axios';
-import https from 'https';
+import type { BwClient } from '../bw-client.js';
 
-const httpsAgent = new https.Agent({ rejectUnauthorized: false });
-
-function getEnv(key: string): string {
-  const val = process.env[key];
-  if (!val) throw new Error(`Environment variable ${key} is not set`);
-  return val;
-}
-
-function buildAuth(): string {
-  const user = getEnv('BW_USER');
-  const pass = getEnv('BW_PASSWORD');
-  return 'Basic ' + Buffer.from(`${user}:${pass}`).toString('base64');
-}
-
+/**
+ * The push interface is an ordinary BW REST endpoint and must travel the same
+ * transport as every other call. Building a private axios instance here bypassed
+ * the BTP destination, the Cloud Connector proxy and principal propagation, so
+ * both tools were dead on any centrally hosted deployment.
+ */
 function pushBase(adsoName: string): string {
-  const baseUrl = getEnv('BW_URL').replace(/\/$/, '');
-  return `${baseUrl}/sap/bw4/v1/push/dataStores/${encodeURIComponent(adsoName.toLowerCase())}`;
+  return `/sap/bw4/v1/push/dataStores/${encodeURIComponent(adsoName.toLowerCase())}`;
 }
 
 /**
  * bw_push_data — push records into an aDSO write-interface inbound table.
  *
  * Flow (One Step):
- *   1. GET /requests with x-csrf-token: Fetch → extract token + session cookies
- *   2. POST /dataSend with JSON array body → expect HTTP 204
+ *   1. GET /requests with x-csrf-token: Fetch → token; the client keeps the session cookies
+ *   2. POST /dataSend with JSON array body
  */
 export async function bwPushData(
+  client: BwClient,
   adsoName: string,
   records: object[],
   mode: string = 'one_step'
 ): Promise<string> {
   const base = pushBase(adsoName);
-  const auth = buildAuth();
 
-  // Step 1: fetch CSRF token and session cookies
-  const csrfRes = await axios.get(`${base}/requests`, {
-    httpsAgent,
-    headers: {
-      'Authorization': auth,
-      'x-csrf-token': 'Fetch',
-    },
-    validateStatus: () => true,
+  // This endpoint issues its own CSRF token, so the token is taken from the fetch
+  // response rather than from the client's session-wide one.
+  const { headers: csrfHeaders } = await client.rawGet(`${base}/requests`, {
+    'x-csrf-token': 'Fetch',
   });
 
-  const csrfToken = csrfRes.headers['x-csrf-token'];
+  const csrfToken = csrfHeaders['x-csrf-token'];
   if (!csrfToken || csrfToken.toLowerCase() === 'required') {
-    throw new Error(`Failed to fetch CSRF token. HTTP ${csrfRes.status}: ${csrfRes.data}`);
+    throw new Error(
+      `Failed to fetch a CSRF token for the push interface of ${adsoName.toUpperCase()}.`
+    );
   }
 
-  // Extract session cookies from set-cookie header
-  const rawCookies: string[] = Array.isArray(csrfRes.headers['set-cookie'])
-    ? csrfRes.headers['set-cookie']
-    : csrfRes.headers['set-cookie'] ? [csrfRes.headers['set-cookie']] : [];
+  const sendUrl = mode === 'messaging' ? `${base}/dataSend?request=MESSAGING` : `${base}/dataSend`;
 
-  const cookieParts = rawCookies
-    .map((c) => c.split(';')[0].trim())
-    .filter(Boolean);
-  const cookieHeader = cookieParts.join('; ');
-
-  // Step 2: POST dataSend
-  const sendUrl = mode === 'messaging'
-    ? `${base}/dataSend?request=MESSAGING`
-    : `${base}/dataSend`;
-
-  const sendRes = await axios.post(sendUrl, records, {
-    httpsAgent,
-    headers: {
-      'Authorization': auth,
+  // Success is HTTP 204; rawPost throws on anything from 400 up, so reaching the
+  // next line means the records were accepted.
+  try {
+    await client.rawPost(sendUrl, JSON.stringify(records), {
       'Content-Type': 'application/json',
       'x-csrf-token': csrfToken,
-      ...(cookieHeader ? { 'Cookie': cookieHeader } : {}),
-    },
-    validateStatus: () => true,
-  });
-
-  if (sendRes.status === 204) {
-    return JSON.stringify({
-      success: true,
-      message: `${records.length} record(s) pushed to aDSO ${adsoName.toUpperCase()} (mode: ${mode}).`,
-      adso_name: adsoName.toUpperCase(),
-      record_count: records.length,
-      mode,
     });
+  } catch (err) {
+    throw new Error(
+      `Push to ${adsoName.toUpperCase()} failed: ${(err as Error).message}`
+    );
   }
 
-  // Error — include response body for diagnosis
-  const errorBody = typeof sendRes.data === 'string'
-    ? sendRes.data
-    : JSON.stringify(sendRes.data);
-
-  throw new Error(
-    `Push to ${adsoName.toUpperCase()} failed (HTTP ${sendRes.status}): ${errorBody}`
-  );
+  return JSON.stringify({
+    success: true,
+    message: `${records.length} record(s) pushed to aDSO ${adsoName.toUpperCase()} (mode: ${mode}).`,
+    adso_name: adsoName.toUpperCase(),
+    record_count: records.length,
+    mode,
+  });
 }
 
 /**
@@ -102,24 +68,22 @@ export async function bwPushData(
  * Returns the field list, types, and required fields so the caller knows
  * what to include in bw_push_data records.
  */
-export async function bwGetPushSchema(adsoName: string): Promise<string> {
-  const base = pushBase(adsoName);
-  const auth = buildAuth();
-
-  const res = await axios.get(base, {
-    httpsAgent,
-    headers: {
-      'Authorization': auth,
-      'Accept': 'application/json',
-    },
-    validateStatus: () => true,
-  });
-
-  if (res.status !== 200) {
+export async function bwGetPushSchema(client: BwClient, adsoName: string): Promise<string> {
+  let body: string;
+  try {
+    ({ body } = await client.rawGet(pushBase(adsoName), { Accept: 'application/json' }));
+  } catch (err) {
     throw new Error(
-      `Failed to fetch push schema for ${adsoName.toUpperCase()} (HTTP ${res.status}): ${JSON.stringify(res.data)}`
+      `Failed to fetch push schema for ${adsoName.toUpperCase()}: ${(err as Error).message}`
     );
   }
 
-  return `Push schema for aDSO ${adsoName.toUpperCase()}:\n\n${JSON.stringify(res.data, null, 2)}`;
+  let rendered = body;
+  try {
+    rendered = JSON.stringify(JSON.parse(body), null, 2);
+  } catch {
+    // Not JSON — hand back whatever the server sent so the caller can see it.
+  }
+
+  return `Push schema for aDSO ${adsoName.toUpperCase()}:\n\n${rendered}`;
 }
