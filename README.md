@@ -6,6 +6,18 @@ A Model Context Protocol (MCP) server that enables AI assistants like Claude to 
 
 ---
 
+## System Compatibility
+
+| System | Support |
+|---|---|
+| SAP BW/4HANA (all versions) | ✅ Full support |
+| SAP BW Bridge (SAP BTP ABAP stack) | ✅ Via cookie authentication (`BW_COOKIE_FILE`) |
+| SAP BW on HANA (7.5) | ⚠️ Modeling reads after a small ABAP enhancement — see [BW 7.5 Support](docs/BW75-SUPPORT.md) |
+
+<p><em><sub>On SAP BW 7.5 the REST framework looks up the <code>Accept</code> header case-sensitively while the kernel delivers header names in lower case, so almost every call fails with HTTP 406. A ~20-line post-exit enhancement (no modification) resolves this and makes all REST endpoints that exist on 7.5 reachable. Objects for which BW 7.5 ships no REST resource at all — transformations, DTPs, process chains, classic DSOs, InfoCubes — are readable through <code>bw_read_metadata_tables</code>, which goes to their metadata tables instead, but they cannot be written; Eclipse opens the embedded SAP GUI for those as well. Details, ABAP code and setup steps: <a href="docs/BW75-SUPPORT.md">docs/BW75-SUPPORT.md</a>.</sub></em></p>
+
+---
+
 ## ☁️ Running on SAP BTP Cloud Foundry
 
 ![Central MCP server for AI-assisted SAP BW/4HANA modeling: MCP-capable AI clients connect via OAuth to bw-modeling-mcp with role-based access control, which reaches on-premise, private cloud and BW Bridge systems via principal propagation](docs/btp-hosting.png)
@@ -51,13 +63,7 @@ A two-part blog series about this project (both available in German and English)
 
 ## 🆕 What's New — v1.4.1
 
-A maintenance release: three defects around **global end routines**, and the two connectivity fixes that BTP deployments have been running behind a Cloud Connector.
-
-**🔁 End routines**
-
-- Adding a routine no longer leaves its generated class inactive. The class was activated while the ADT lock was still held, which the backend refuses — and the transformation had already been written by then, so the call failed with a routine rule whose class had never been activated ([#21](https://github.com/dnic-dev/bw-modeling-mcp/issues/21))
-- The generated AMDP end-routine skeleton names plain fields correctly. It applied the InfoObject naming rule to every target element, so a field-based provider produced `"/BIC/FIELD_NAME"` for an ordinary column and the transformation would not activate ([#21](https://github.com/dnic-dev/bw-modeling-mcp/issues/21))
-- **`bw_set_transformation_routine_fields` now proves what it stored.** Asked for a subset of the target fields, the backend answers 200 and quietly keeps the full list; the tool reported the count it had computed itself, so a silent no-op looked like success. It reads the transformation back and reports the stored state ([#21](https://github.com/dnic-dev/bw-modeling-mcp/issues/21))
+A maintenance release: the two connectivity fixes that BTP deployments have been running behind a Cloud Connector, instance identity in the handshake, and a set of end-routine defects.
 
 **🔌 Connectivity**
 
@@ -67,6 +73,10 @@ A maintenance release: three defects around **global end routines**, and the two
 **🏷️ Instance identity**
 
 - `BW_MCP_SERVER_NAME` names the instance in the handshake, and `BW_MCP_SYSTEM_LABEL` puts the connected system on the first line of the instructions the server now sends — so several instances stay apart in clients that only show an opaque connector id. `serverInfo.version` follows `package.json` again. Both variables are optional; without them the handshake is unchanged ([#26](https://github.com/dnic-dev/bw-modeling-mcp/issues/26))
+
+**🔁 End routines**
+
+- Adding a routine no longer leaves its generated class inactive, the generated AMDP skeleton names plain fields correctly on field-based providers, and `bw_set_transformation_routine_fields` reads the transformation back instead of reporting a field list it never stored ([#21](https://github.com/dnic-dev/bw-modeling-mcp/issues/21))
 
 ---
 
@@ -257,18 +267,6 @@ An overview by area. Every tool in detail — parameters, behaviour, and the seq
 This server owns the BW object and, with it, the body of the ABAP that BW generated for that object: the class behind a transformation routine, the program behind a DTP filter routine. Write those through `bw_set_transformation_routine`, `bw_set_transformation_expert_routine` and `bw_set_dtp_filter_routine` rather than through ADT — they do not only replace the source, they save the transformation master back afterwards, which is what re-registers the code in the transportable metadata. A class-only edit survives until the next regeneration or transport and is then gone.
 
 The ADT MCP server covers ABAP as a subject in its own right: your own reports, classes, function modules and DDIC tables, repository search and navigation, arbitrary table reads, debugging, ATC, unit tests, dumps and transports. Together they cover the full cycle from BW object to ABAP logic.
-
----
-
-## System Compatibility
-
-| System | Support |
-|---|---|
-| SAP BW/4HANA (all versions) | ✅ Full support |
-| SAP BW Bridge (SAP BTP ABAP stack) | ✅ Via cookie authentication (`BW_COOKIE_FILE`) |
-| SAP BW on HANA (7.5) | ⚠️ Modeling reads after a small ABAP enhancement — see [BW 7.5 Support](docs/BW75-SUPPORT.md) |
-
-<p><em><sub>On SAP BW 7.5 the REST framework looks up the <code>Accept</code> header case-sensitively while the kernel delivers header names in lower case, so almost every call fails with HTTP 406. A ~20-line post-exit enhancement (no modification) resolves this and makes all REST endpoints that exist on 7.5 reachable. Objects for which BW 7.5 ships no REST resource at all — transformations, DTPs, process chains, classic DSOs, InfoCubes — are readable through <code>bw_read_metadata_tables</code>, which goes to their metadata tables instead, but they cannot be written; Eclipse opens the embedded SAP GUI for those as well. Details, ABAP code and setup steps: <a href="docs/BW75-SUPPORT.md">docs/BW75-SUPPORT.md</a>.</sub></em></p>
 
 ---
 
