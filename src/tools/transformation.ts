@@ -1645,16 +1645,28 @@ function ioBwNameToHanaSqlColumn(name: string): string {
  * a HANA SQLScript SELECT statement for a GLOBAL_END / GLOBAL_EXPERT skeleton.
  * Appends RECORD and SQL__PROCEDURE__SOURCE__RECORD at the end.
  */
-function buildHanaEndSelect(xml: string): string {
+export function buildHanaEndSelect(xml: string): string {
   const tgtSegMatch = xml.match(/<target\b[^>]*>[\s\S]*?<segment[^>]*>([\s\S]*?)<\/segment>/);
   if (!tgtSegMatch) return 'outTab = SELECT * FROM :inTab;';
 
-  // Collect fields with their posit for ordering
-  const elemRegex = /<element\b[^>]*\bposit="(\d+)"[^>]*\bname="([^"]+)"[^>]*/g;
+  // Collect fields with their posit for ordering. Only an InfoObject-backed element carries the
+  // /BIC/ (or leading-zero) column naming — a pure aDSO field is its own column name, so running
+  // the InfoObject mapping over it yields "/BIC/FIELD_NAME" and the generated AMDP fails to
+  // activate with "invalid column name". The XML tells the two apart by the infoObjectName
+  // attribute, which only InfoObject-backed elements have.
+  const elemRegex = /<element\b([^>]*)>/g;
   const fields: { posit: number; col: string }[] = [];
   let em: RegExpExecArray | null;
   while ((em = elemRegex.exec(tgtSegMatch[1])) !== null) {
-    fields.push({ posit: parseInt(em[1], 10), col: ioBwNameToHanaSqlColumn(em[2]) });
+    const attrs = em[1];
+    const posit = /\bposit="(\d+)"/.exec(attrs)?.[1];
+    const name = /\bname="([^"]+)"/.exec(attrs)?.[1];
+    if (posit === undefined || name === undefined) continue;
+    const isInfoObject = /\binfoObjectName="/.test(attrs);
+    fields.push({
+      posit: parseInt(posit, 10),
+      col: isInfoObject ? ioBwNameToHanaSqlColumn(name) : name,
+    });
   }
   fields.sort((a, b) => a.posit - b.posit);
 
@@ -1857,13 +1869,17 @@ export async function bwSetTransformationRoutine(
         );
       }
 
+      // Write under the ADT lock, then release it BEFORE activating — the same order Eclipse
+      // uses. Activating while the lock is still held is rejected with HTTP 403 "… bearbeitet
+      // bereits …", and by then the transformation PUT above has already gone through, so the
+      // caller is left with a routine rule whose generated class was never activated.
       const adtLock = await client.adtLockClass(classEncoded);
       try {
         await client.adtPutSource(classEncoded, adtLock, updatedSource);
-        await client.adtActivate(classEncoded, classNameM);
       } finally {
         await client.adtUnlockClass(classEncoded, adtLock).catch(() => {/* ignore */});
       }
+      await client.adtActivate(classEncoded, classNameM);
     }
   }
 
@@ -2090,6 +2106,65 @@ export async function bwSetTransformationExpertRoutine(
  * 7. Lock with caller's client, PUT with a separate createClientFromEnv() client.
  *    Do NOT activate. Return lock_handle.
  */
+/**
+ * Read the END rule out of a Transformation document: is it there, and how many target
+ * fields does it carry? Kept free of I/O so the parsing can be tested without a backend.
+ */
+export function readEndRoutineTargets(xml: string): {
+  endRoutinePresent: boolean;
+  targetCount: number;
+} {
+  const rule = /<rule\b[^>]*\broutinetype="END"[^>]*>[\s\S]*?<\/rule>/.exec(xml);
+  if (!rule) return { endRoutinePresent: false, targetCount: 0 };
+  return {
+    endRoutinePresent: true,
+    targetCount: (rule[0].match(/<target\b[^>]*>/g) ?? []).length,
+  };
+}
+
+/**
+ * Confirm from the stored document that the END routine still exists and writes the number of
+ * target fields that was just requested. Reads through freshReadInactive so the answer comes
+ * from a new session rather than the writing session's model buffer, which would still show
+ * what the caller sent instead of what the backend kept.
+ */
+async function verifyEndRoutineTargets(
+  trfnLower: string,
+  expectedCount: number,
+): Promise<{ ok: boolean; detail: string; storedCount: number; endRoutinePresent: boolean }> {
+  let stored: { endRoutinePresent: boolean; targetCount: number };
+  try {
+    const { body } = await freshReadInactive(trfnLower);
+    stored = readEndRoutineTargets(body);
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    return {
+      ok: false,
+      detail: `reading it back failed (${msg.split('\n')[0]}).`,
+      storedCount: 0,
+      endRoutinePresent: false,
+    };
+  }
+
+  if (!stored.endRoutinePresent) {
+    return {
+      ok: false,
+      detail: 'the END routine is gone from the stored document.',
+      storedCount: 0,
+      endRoutinePresent: false,
+    };
+  }
+  if (stored.targetCount !== expectedCount) {
+    return {
+      ok: false,
+      detail: `it stores ${stored.targetCount} target field(s) instead of ${expectedCount}.`,
+      storedCount: stored.targetCount,
+      endRoutinePresent: true,
+    };
+  }
+  return { ok: true, detail: '', storedCount: stored.targetCount, endRoutinePresent: true };
+}
+
 export async function bwSetTransformationRoutineFields(
   client: BwClient,
   transformationName: string,
@@ -2196,12 +2271,35 @@ export async function bwSetTransformationRoutineFields(
     throw err;
   }
 
+  // An accepted PUT does not prove the routine survived it: the backend answers 200 and can
+  // still drop the whole END rule when it cannot map part of the document. Reporting success
+  // from the locally computed field list would hand the caller a damaged transformation with a
+  // green result, so read the stored state back and let that decide the outcome.
+  const verdict = await verifyEndRoutineTargets(trfnLower, selectedFields.length);
+
+  if (!verdict.ok) {
+    return JSON.stringify({
+      success: false,
+      message:
+        `END routine field list of transformation ${trfnUpper} was NOT stored as requested: ` +
+        `${verdict.detail} The write was accepted by the backend, so the transformation may be ` +
+        `left in an inconsistent state — inspect it with bw_get_transformation (or ` +
+        `bw_read_metadata_tables, which bypasses the serializer) before activating it.`,
+      stored_target_fields: verdict.storedCount,
+      requested_target_fields: selectedFields.length,
+      end_routine_present: verdict.endRoutinePresent,
+      lock_handle: lockHandle,
+      transformation_name: trfnUpper,
+      object_type: 'trfn',
+    }, null, 2);
+  }
+
   return JSON.stringify({
     success: true,
     message:
       `END routine field list updated for transformation ${trfnUpper}. ` +
-      `${selectedFields.length} of ${allTargetFields.length} target fields selected. ` +
-      `Call bw_activate to activate.`,
+      `${selectedFields.length} of ${allTargetFields.length} target fields selected, ` +
+      `confirmed by reading the transformation back. Call bw_activate to activate.`,
     selected_fields: selectedFields,
     selected_count: selectedFields.length,
     total_target_fields: allTargetFields.length,
