@@ -159,6 +159,8 @@ KBA **3361376259** (propagation over HTTPS), **3367280** (401 / credential popup
 | `BW_CC_LOCATION_ID` | Cloud Connector location id, when several are connected |
 | `BW_PUBLIC_URL` | advertised URL behind a reverse proxy |
 | `BW_ALLOWED_ORIGINS` | CORS allowlist for browser-based MCP clients |
+| `BW_MCP_SERVER_NAME` | server name in the MCP handshake (default `bw-modeling-mcp`); make it unique per instance |
+| `BW_MCP_SYSTEM_LABEL` | free-text system label (e.g. `AP4 (BW production, read-only)`) shown at the top of the server instructions |
 
 With `BW_PP_ENABLED=true` the server refuses to start if `BW_USER`, `BW_PASSWORD` or
 `BW_COOKIE_FILE` is also set: BW ties a session to whoever opened it, so one leftover

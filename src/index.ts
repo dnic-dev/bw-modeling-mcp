@@ -10,6 +10,7 @@ import {
 import type { AuthInfo } from '@modelcontextprotocol/sdk/server/auth/types.js';
 import { fileURLToPath } from 'node:url';
 import { realpathSync } from 'node:fs';
+import { createRequire } from 'node:module';
 
 import { createClientFromEnv, type BwClient } from './bw-client.js';
 import { currentClient } from './request-context.js';
@@ -5670,6 +5671,32 @@ async function handleToolCall(
 
 // ── Server ────────────────────────────────────────────────────────────────────
 
+// The package version doubles as the advertised server version; a hardcoded copy here
+// drifted to 0.1.0 while the package was at 1.4.0.
+const { version: VERSION } = createRequire(import.meta.url)('../package.json') as { version: string };
+
+/**
+ * Sent in the MCP initialize response. Clients that defer tool loading use it to decide
+ * whether this server's tools are worth fetching at all, so the domain is named up front.
+ * BW_MCP_SYSTEM_LABEL exists because several instances of this server typically point at
+ * different BW systems (dev/QA/prod), and some clients show an opaque connector id instead
+ * of the advertised server name — the label is then the only thing that tells the model
+ * which system it is talking to, without a probing tool call.
+ */
+function buildInstructions(): string {
+  const label = process.env.BW_MCP_SYSTEM_LABEL;
+  return [
+    ...(label ? [`Connected SAP BW system: ${label}.`, ''] : []),
+    'SAP BW modeling over the BW backend APIs: aDSOs, InfoObjects, CompositeProviders,',
+    'transformations, DTPs, DataSources, InfoSources, source systems, process chains and',
+    'their runs, requests/loads, queries and query data, planning artifacts, and transports.',
+    'Reach for it for any question about BW metadata, data flows, load monitoring, or query',
+    'definitions on this system.',
+    '',
+    'One BW system per instance: there is no system selector, by design.',
+  ].join('\n');
+}
+
 /**
  * Build an MCP server with every tool registered.
  *
@@ -5679,8 +5706,10 @@ async function handleToolCall(
  */
 export function createServer(): Server {
   const server = new Server(
-    { name: 'bw-modeling-mcp', version: '0.1.0' },
-    { capabilities: { tools: {} } }
+    // BW_MCP_SERVER_NAME lets each instance advertise which system it fronts (e.g.
+    // "bw-mcp-prod"), so clients that key on the handshake name can tell them apart.
+    { name: process.env.BW_MCP_SERVER_NAME || 'bw-modeling-mcp', version: VERSION },
+    { capabilities: { tools: {} }, instructions: buildInstructions() }
   );
 
   server.setRequestHandler(ListToolsRequestSchema, async (_request, extra) => ({
