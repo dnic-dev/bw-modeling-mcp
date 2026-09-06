@@ -1,5 +1,24 @@
 # Changelog
 
+## [1.4.1] — 2026-09-06
+
+### Fixed
+
+- **Adding a routine left the generated class inactive** — `bw_set_transformation_routine` wrote the source of the generated `_M` class and then activated it while still holding the ADT lock, which the backend rejects with HTTP 403 "… is already being edited". The transformation itself had already been written at that point, so the call failed with a routine rule in place whose class had never been activated, and no obvious way back. The lock is now released before activation, the order the expert-routine tool already used ([#21](https://github.com/dnic-dev/bw-modeling-mcp/issues/21)).
+- **Generated AMDP end routines did not activate on field-based providers** — the column list of the generated `GLOBAL_END` skeleton applied the InfoObject naming rule to every target element, so a plain field became `"/BIC/FIELD_NAME"` and activation failed with `invalid column name`. Only elements that are actually InfoObject-backed get that mapping now ([#21](https://github.com/dnic-dev/bw-modeling-mcp/issues/21)).
+- **`bw_set_transformation_routine_fields` reported a field list it had not stored** — asked for a subset of the target fields, the backend answers HTTP 200 and keeps the full list. The tool reported the count it had computed locally, so a silent no-op looked like success. It now reads the transformation back and lets the stored state decide the result, naming the stored and the requested count when they differ ([#21](https://github.com/dnic-dev/bw-modeling-mcp/issues/21)).
+- **`rawPost` / `rawPut` / `rawDelete` bypassed the Cloud Connector proxy** — they built their own axios instance and so lost both the proxy transport and the `Proxy-Authorization` (plus optional location id) header the constructor's interceptor adds. Behind a BTP connectivity proxy every such call tried to resolve the virtual destination host itself and failed with `ENOTFOUND`, which took ADT DataPreview and all transformation writes with it. They now go through the shared client ([#24](https://github.com/dnic-dev/bw-modeling-mcp/issues/24)).
+- **`bw_push_data` and `bw_get_push_schema` ignored the BTP destination** — the push tools issued their requests outside the shared client and therefore without destination resolution or principal propagation. Both now use the same client as every other tool ([#25](https://github.com/dnic-dev/bw-modeling-mcp/issues/25)).
+
+### Improved
+
+- **The server identifies itself in the handshake** — `BW_MCP_SERVER_NAME` names the instance in `serverInfo`, and with `BW_MCP_SYSTEM_LABEL` the connected system becomes the first line of the `instructions` the server now sends, so several instances stay distinguishable in clients that show an opaque connector id. `serverInfo.version` follows `package.json` instead of a hardcoded copy that had drifted to `0.1.0`. Both variables are optional and the default handshake is unchanged ([#26](https://github.com/dnic-dev/bw-modeling-mcp/issues/26)).
+
+### Notes
+
+- The `Overflow when converting 256` reported in [#21](https://github.com/dnic-dev/bw-modeling-mcp/issues/21) could not be reproduced. The message is a 1-byte overflow of `RSTRAN_STEPID`: the `id` of a `<step>` is stored in an `INT1`, so `255` is written and `256` is rejected. Neither the number of target fields nor the size of the transformation drives that value — a transformation with 301 target fields in its end routine round-trips without complaint, and the tools only ever write step ids `1` and `2`. The routine tools are unchanged in this area since v1.1.0, so this release is not expected to change that error on its own.
+
+
 ## [1.4.0] — 2026-08-20
 
 ### Added

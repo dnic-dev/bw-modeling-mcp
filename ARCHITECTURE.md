@@ -35,6 +35,8 @@ The token is fetched once at startup and reused for all subsequent write operati
 
 **Central hosting (SAP BTP Cloud Foundry):** The HTTP transport (`src/http.ts`) puts XSUAA OAuth in front and a BTP destination behind. XSUAA authenticates each caller and carries the `read` / `write` scopes (`src/scopes.ts`, which also filters `tools/list` per role). The destination (`src/destination.ts`) decides the BW identity: with `BasicAuthentication` all callers share one technical user; with `PrincipalPropagation` each caller reaches BW as themselves via a short-lived X.509 certificate issued by the Cloud Connector and mapped to an ABAP user by CERTRULE. The server is stateless — a fresh `BwClient` per request, held in an `AsyncLocalStorage` (`src/request-context.ts`) so concurrent users never share a session. stdio (`src/stdio.ts`) is unaffected: one process, one user, no auth. Setup: `docs/CENTRAL-HOSTING-SETUP.md` and `docs/CLOUD-FOUNDRY.md`.
 
+Everything that talks to BW goes through `BwClient`, including the `raw*` helpers and the Push API. The proxy transport and the `Proxy-Authorization` header (plus an optional `SAP-Connectivity-SCC-Location_ID`) are attached by the client's interceptor, so any call path that builds its own `axios` instance silently loses them and tries to resolve the virtual destination host itself.
+
 ---
 
 ## Lock → Read → Modify → PUT → Activate Pattern
@@ -100,7 +102,7 @@ Body:     JSON array of records
 Success:  HTTP 204 No Content
 ```
 
-The Push API uses a separate `axios` client instance independent of the BW Modeling client.
+The Push API is a different base URL, not a different client: `bw_push_data` and `bw_get_push_schema` issue their calls through the same `BwClient` (`rawGet` / `rawPost`) as every other tool. That is what makes them honour the BTP destination, principal propagation and the Cloud Connector proxy — a private `axios` instance here saw none of those and failed with `ENOTFOUND` behind a connectivity proxy.
 
 ---
 

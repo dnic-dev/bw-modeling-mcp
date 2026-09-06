@@ -49,54 +49,28 @@ A two-part blog series about this project (both available in German and English)
 
 ---
 
-## 🆕 What's New — v1.4.0
+## 🆕 What's New — v1.4.1
 
-**🎯 SAP BW 7.5 on HANA**
+A maintenance release: three defects around **global end routines**, and the two connectivity fixes that BTP deployments have been running behind a Cloud Connector.
 
-Until now almost every call against a BW 7.5 system failed with HTTP 406, because the 7.5 REST framework looks the `Accept` header up case-sensitively. A small ABAP **post-exit** neutralises that — an enhancement, no modification. With it in place **every REST endpoint that exists on 7.5 is reachable**.
+**🔁 End routines**
 
-- **📘 [docs/BW75-SUPPORT.md](docs/BW75-SUPPORT.md)** — root cause, the ABAP code, the SE24 setup steps, and what BW 7.5 ships no REST resource for — split into what is reachable another way and what is not
-- **`bw_system_profile`** — one call and the agent knows what it is working on: BW/4HANA or classic BW, which REST endpoint groups the system publishes, and whether the three preconditions hold (`Accept`-header handling, ADT DataPreview access, query reporting). It can then take the route that works on this release — reading a transformation from the metadata tables where there is no REST resource for one — instead of discovering the release through failed calls
-- **`bw_read_metadata_tables`** — reads straight from the metadata tables what the system publishes no REST resource for:
-  - **Transformations** — field mappings with their rule types, and the source of the start, end, expert and field routines
-  - **DTPs** — path, resolved transformation, extraction mode and error handling
-  - **Classic providers** — `ODSO`, `CUBE` and `MPRO`
-  - **Process chains** — steps with their variant parameters and the dependencies between them, in the order the chain runs
-  - **Load history** of an InfoCube or DataStore object — request, status, update mode, start, user, duration, records and source
+- Adding a routine no longer leaves its generated class inactive. The class was activated while the ADT lock was still held, which the backend refuses — and the transformation had already been written by then, so the call failed with a routine rule whose class had never been activated ([#21](https://github.com/dnic-dev/bw-modeling-mcp/issues/21))
+- The generated AMDP end-routine skeleton names plain fields correctly. It applied the InfoObject naming rule to every target element, so a field-based provider produced `"/BIC/FIELD_NAME"` for an ordinary column and the transformation would not activate ([#21](https://github.com/dnic-dev/bw-modeling-mcp/issues/21))
+- **`bw_set_transformation_routine_fields` now proves what it stored.** Asked for a subset of the target fields, the backend answers 200 and quietly keeps the full list; the tool reported the count it had computed itself, so a silent no-op looked like success. It reads the transformation back and reports the stored state ([#21](https://github.com/dnic-dev/bw-modeling-mcp/issues/21))
 
-**🔗 Process chains, edited in place**
+**🔌 Connectivity**
 
-- **`bw_add_process_chain_edge`**, **`bw_remove_process_chain_edge`**, **`bw_remove_process_chain_step`** — change one dependency or one step instead of rewriting the whole model. Removing a step takes its edges and its inline variant with it and bridges the gap, so the strand stays connected
-- Steps are addressed by name — a DTP, an aDSO, the program of an ABAP step, a collector type, or `#<index>`. An ambiguous name is rejected with the candidates listed rather than resolved by guesswork
-- `before` / `after` now inserts a DTP or ABAP block **in series**: the target's edges are rerouted through the block, so it really runs ahead of or behind that step
+- `rawPost` / `rawPut` / `rawDelete` go through the shared client, so they keep the Cloud Connector proxy and its authorization header. Behind a BTP connectivity proxy they used to resolve the virtual destination host themselves and fail with `ENOTFOUND`, taking ADT DataPreview and every transformation write with them ([#24](https://github.com/dnic-dev/bw-modeling-mcp/issues/24))
+- `bw_push_data` and `bw_get_push_schema` use that same client and therefore honour the BTP destination and principal propagation ([#25](https://github.com/dnic-dev/bw-modeling-mcp/issues/25))
 
-**🧱 Remodeling monitor**
+**🏷️ Instance identity**
 
-- **`bw_list_remodeling_requests`**, **`bw_get_remodeling_request`**, **`bw_run_remodeling`** — monitor, diagnose and run remodeling requests: the five processing steps with their status and the application log per step, plus execute, restart, reset and reset-step. Running a rule restructures the InfoProvider and converts its data, so this is a write with data impact
-
-**📐 Query characteristic properties**
-
-- **`bw_update_query_characteristic`** — display of result rows, display as key/text, access type for result values, sorting, cumulation, display level, and the hierarchy assignment with its display options. `"*"` applies one set of properties to every characteristic in the layout
-
-**🗂️ aDSO field groups**
-
-- **`bw_update_adso`** takes a `dimension` on `add_field` and `add_pure_field`, so a new field is created in the right group — a key figure lands in the key figure group instead of the catch-all. That is where the value is: the second activation, and with it the reactivation of every aggregation level, transformation and DTP behind the aDSO, does not happen at all
-- `update_field_properties` takes the same parameter to move an existing field between groups, and changes nothing else about it
-- Group names are defined per aDSO rather than by a fixed vocabulary, so an unknown name is refused with the declared groups listed instead of quietly falling back to the catch-all
-
-**🔧 Minor changes and fixes**
-
-- DTP filters take the full range vocabulary — sign `I`/`E` with `Equal`, `Between`, `ContainsPattern` and the comparison operators — validated against the operators the field itself publishes
-- The CSRF token fetch is retried once on a dead keep-alive socket, which used to abort a run of process-chain writes mid-sequence
-- Process-chain run timestamps are parsed again ([#15](https://github.com/dnic-dev/bw-modeling-mcp/issues/15))
-- `bw_get_request` works for requests without a process log ([#16](https://github.com/dnic-dev/bw-modeling-mcp/issues/16))
-- A failed transformation model serialization is reported as such instead of dumped ([#17](https://github.com/dnic-dev/bw-modeling-mcp/issues/17))
-- `NODESNOTCONNECTED` is no longer reported as an InfoArea ([#18](https://github.com/dnic-dev/bw-modeling-mcp/issues/18))
-- Namespaced object names such as `/NAMESPACE/OBJECT_NAME` are addressed correctly in every URL ([#19](https://github.com/dnic-dev/bw-modeling-mcp/issues/19))
+- `BW_MCP_SERVER_NAME` names the instance in the handshake, and `BW_MCP_SYSTEM_LABEL` puts the connected system on the first line of the instructions the server now sends — so several instances stay apart in clients that only show an opaque connector id. `serverInfo.version` follows `package.json` again. Both variables are optional; without them the handshake is unchanged ([#26](https://github.com/dnic-dev/bw-modeling-mcp/issues/26))
 
 ---
 
-**Earlier releases** — the "What's New" notes for v1.3.0 and older are archived in [WHATS_NEW.md](WHATS_NEW.md); the full structured history is in [CHANGELOG.md](CHANGELOG.md).
+**Earlier releases** — the "What's New" notes for v1.4.0 and older are archived in [WHATS_NEW.md](WHATS_NEW.md); the full structured history is in [CHANGELOG.md](CHANGELOG.md).
 
 ---
 
