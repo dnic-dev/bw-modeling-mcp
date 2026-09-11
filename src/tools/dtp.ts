@@ -361,6 +361,7 @@ export async function bwUnlockDtp(client: BwClient, dtpName: string): Promise<vo
       'Content-Type': MEDIA_TYPES['dtpa'],
       'Accept': MEDIA_TYPES['dtpa'],
       'x-csrf-token': csrf,
+      'X-sap-adt-sessiontype': 'stateful',
     }
   );
 }
@@ -760,6 +761,10 @@ export async function bwCreateDtp(
   const responsible  = (process.env.BW_USER ?? '').toUpperCase();
 
   // Step 1: Generate DTP name via POST generateDtpId — DTP name is in Location header
+  // Every rawPost() in this flow declares the session type explicitly: rawPost() wipes the
+  // instance defaults, and a stateless request on the cookies of a stateful session ends
+  // that session on the server — the enqueue dies with it and the next call fails with
+  // "400 Session Timed Out or Not Found".
   const csrfToken = await client.getCsrfToken();
   const genResponse = await client.rawPost(
     '/sap/bw/modeling/dtpa/generateDtpId',
@@ -768,6 +773,7 @@ export async function bwCreateDtp(
       'Accept': MEDIA_TYPES['dtpa'],
       'Content-Type': MEDIA_TYPES['dtpa'],
       'x-csrf-token': csrfToken,
+      'X-sap-adt-sessiontype': 'stateful',
     }
   );
   const location = genResponse.headers['location'] ?? genResponse.headers['Location'] ?? '';
@@ -786,6 +792,7 @@ export async function bwCreateDtp(
       'activity_context': 'CREA',
       'Accept': MEDIA_TYPES['dtpa'],
       'x-csrf-token': csrfToken2,
+      'X-sap-adt-sessiontype': 'stateful',
     }
   );
   const lockHandle = lockResponse.body.match(/<LOCK_HANDLE>([^<]+)<\/LOCK_HANDLE>/)?.[1] ?? '';
@@ -843,6 +850,7 @@ export async function bwCreateDtp(
         'Content-Type': MEDIA_TYPES['dtpa'],
         'Accept': MEDIA_TYPES['dtpa'],
         'x-csrf-token': csrfToken3,
+        'X-sap-adt-sessiontype': 'stateful',
       }
     );
 
@@ -855,6 +863,7 @@ export async function bwCreateDtp(
         {
           'Accept': MEDIA_TYPES['dtpa'],
           'x-csrf-token': descLockCsrf,
+          'X-sap-adt-sessiontype': 'stateful',
         }
       );
       const descLockHandle = descLockResponse.body.match(/<LOCK_HANDLE>([^<]+)<\/LOCK_HANDLE>/)?.[1] ?? '';
@@ -895,6 +904,7 @@ export async function bwCreateDtp(
           'Content-Type': MEDIA_TYPES['dtpa'],
           'Accept': MEDIA_TYPES['dtpa'],
           'x-csrf-token': descUnlockCsrf,
+          'X-sap-adt-sessiontype': 'stateful',
         }
       );
     }
@@ -1055,8 +1065,11 @@ export async function bwUpdateDtp(
   // Resolved before the lock so an invalid filter never takes a lock or writes a document.
   const filterSelections = resolveFilterSelections(args);
 
-  // Lock (stateful_enqueue — same pattern as bwUpdateInfoObject)
-  const lockHandle = await client.lock('dtpa', dtpLower, {}, 'stateful_enqueue');
+  // Lock in a plain stateful session, not `stateful_enqueue`: the ADT session handler only
+  // knows `stateful` and `stateless`; any other value leaves the session stateless, the server
+  // ends it at the end of the lock request, and the PUT below then presents a handle whose
+  // enqueue no longer exists ("423 / lock handle could not be created").
+  const lockHandle = await client.lock('dtpa', dtpLower);
 
   // The enqueue lock (SM12: RSBKDTP) must be released on success AND error;
   // bwActivate does not release it for dtpa, so it is freed in the finally block.
@@ -1295,7 +1308,7 @@ export async function bwSetDtpFilterRoutine(
   const fieldName = args.field_name;
   const fieldNameEncoded = encodeURIComponent(fieldName);
 
-  // Step 1: Lock (no CREA)
+  // Step 1: Lock (no CREA) — stateful, so the enqueue outlives the request (see bwCreateDtp)
   const lockCsrf = await client.getCsrfToken();
   const lockResponse = await client.rawPost(
     `/sap/bw/modeling/dtpa/${bwSeg(dtpLower)}?action=lock`,
@@ -1303,6 +1316,7 @@ export async function bwSetDtpFilterRoutine(
     {
       'Accept': MEDIA_TYPES['dtpa'],
       'x-csrf-token': lockCsrf,
+      'X-sap-adt-sessiontype': 'stateful',
     }
   );
   const lockHandle = lockResponse.body.match(/<LOCK_HANDLE>([^<]+)<\/LOCK_HANDLE>/)?.[1] ?? '';
@@ -1325,6 +1339,7 @@ export async function bwSetDtpFilterRoutine(
         'Content-Type': 'application/vnd.sap.bw.modeling.dtpa.routine.code-v1_0_0+xml',
         'Accept': MEDIA_TYPES['dtpa'],
         'x-csrf-token': genCsrf,
+        'X-sap-adt-sessiontype': 'stateful',
       }
     );
 

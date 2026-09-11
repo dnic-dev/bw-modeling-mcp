@@ -429,6 +429,7 @@ export async function withQueryDocument(
     'Accept': QUERY_ACCEPT_LIST,
     'bwmt-level': '50',
     'x-csrf-token': csrf,
+    'X-sap-adt-sessiontype': 'stateful',
   });
   const lockMatch = lockResponse.body.match(/<LOCK_HANDLE>([^<]+)<\/LOCK_HANDLE>/);
   if (!lockMatch) {
@@ -461,6 +462,7 @@ export async function withQueryDocument(
       await client.rawPost(`${path}?action=unlock`, '', {
         'bwmt-level': '50',
         'x-csrf-token': await client.getCsrfToken(),
+        'X-sap-adt-sessiontype': 'stateful',
       });
     } catch (unlockErr) {
       process.stderr.write(`Warning: failed to unlock query ${nameLower}: ${unlockErr}\n`);

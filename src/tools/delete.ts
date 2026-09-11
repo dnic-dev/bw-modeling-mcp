@@ -31,6 +31,7 @@ async function bwDeleteQuery(
       'activity_context': 'DELE',
       'Accept': queryAccept(),
       'x-csrf-token': csrf,
+      'X-sap-adt-sessiontype': 'stateful',
     });
   const lockMatch = lockResponse.body.match(/<LOCK_HANDLE>([^<]+)<\/LOCK_HANDLE>/);
   if (!lockMatch) {
@@ -43,7 +44,7 @@ async function bwDeleteQuery(
     await client.rawPost(
       `/sap/bw/modeling/query/${bwSeg(nameLower)}/a?action=unlock`,
       '',
-      { 'Accept': queryAccept(), 'x-csrf-token': await client.getCsrfToken() });
+      { 'Accept': queryAccept(), 'x-csrf-token': await client.getCsrfToken(), 'X-sap-adt-sessiontype': 'stateful', });
   };
 
   try {

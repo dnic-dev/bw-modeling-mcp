@@ -1135,6 +1135,11 @@ export class BwClient {
       {
         headers: {
           'Content-Type': mediaType,
+          'Accept': mediaType,
+          // The enqueue lives in the stateful session that took the lock; the release has to
+          // arrive in that same session. The instance default is absent in cookie mode, so the
+          // session type is declared here explicitly.
+          'X-sap-adt-sessiontype': 'stateful',
           'X-CSRF-Token': this.csrfToken!,
           ...this.cookieHeaders(),
         },
