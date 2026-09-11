@@ -1,4 +1,4 @@
-import { BwClient, createClientFromEnv, bwSeg } from '../bw-client.js';
+import { BwClient, createClientFromEnv, bwSeg, resolveMasterSystem } from '../bw-client.js';
 import { rkfAccept, rkfWriteMediaType, QUERY_ACCEPT_LIST, queryWriteMediaType } from './query.js';
 
 /**
@@ -176,9 +176,7 @@ export async function bwCreateRkf(client: BwClient, args: CreateRkfArgs): Promis
   const infoArea = args.info_area?.toUpperCase();
 
   const language = process.env.BW_LANGUAGE ?? 'DE';
-  const masterSystem = new URL(process.env.BW_URL ?? 'http://localhost').hostname
-    .split('.')[0]
-    .toUpperCase();
+  const masterSystem = await resolveMasterSystem(client);
   const responsible = (process.env.BW_USER ?? '').toUpperCase();
   const timestampIso = new Date().toISOString().replace(/\.\d{3}Z$/, 'Z');
   const descEsc = escapeXml(args.description);
