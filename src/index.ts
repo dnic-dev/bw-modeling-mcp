@@ -592,6 +592,14 @@ const TOOL_DEFINITIONS = [
             type: 'string',
             description: 'InfoObject sub-type of the target. Only applies when target_object_type is IOBJ. Valid values: TEXT (text table), ATTR (attributes / master data), HIER (hierarchy).',
           },
+          transport: {
+            type: 'string',
+            description: 'Transport request (corrNr). Required when the package is transportable — without it the system records the object on a transport of its own choosing.',
+          },
+          activate: {
+            type: 'boolean',
+            description: 'Activate the transformation right after creation (default false). Uses the bw_activate flow including its retry handling.',
+          },
         },
         required: ['source_object_type', 'source_object_name', 'target_object_type', 'target_object_name'],
       },
@@ -4696,6 +4704,8 @@ async function handleToolCall(
           copy_from_transformation: args?.copy_from_transformation as string | undefined,
           source_object_subtype: args?.source_object_subtype as string | undefined,
           target_object_subtype: args?.target_object_subtype as string | undefined,
+          transport: args?.transport as string | undefined,
+          activate: args?.activate as boolean | undefined,
         });
         break;
 
