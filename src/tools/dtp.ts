@@ -834,6 +834,10 @@ export async function bwCreateDtp(
       }
     );
 
+    // Release an enqueue the create session may have taken — only that session can, the
+    // lock count lives in its roll area (see BwClient.unlock). No-op when it holds none.
+    await bwUnlockDtp(createClient, dtpLower).catch(() => {/* best effort */});
+
     // Step 4: Explicit unlock
     const csrfToken3 = await client.getCsrfToken();
     await client.rawPost(
