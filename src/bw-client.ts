@@ -1,4 +1,4 @@
-import axios, { AxiosInstance, AxiosResponse } from 'axios';
+import axios, { AxiosInstance, AxiosResponse, InternalAxiosRequestConfig } from 'axios';
 import https from 'https';
 import { randomUUID } from 'crypto';
 import * as fs from 'fs';
@@ -103,6 +103,20 @@ export interface BwClientOptions {
    * different identity and no lock could ever be matched to its session.
    */
   identity?: string;
+  /**
+   * Workaround for session-holding HTTP proxies (e.g. the SAP BAS destination proxy)
+   * that strip Set-Cookie from responses, keep the SAP `sap-contextid` themselves and
+   * inject it into every request without a Cookie header. Because a stateless request
+   * ends the injected context on the SAP side, the next request fails with
+   * ICMENOSESSION (HTTP 400) and the proxy never recovers on its own.
+   * When enabled: non-stateful requests carry an explicit empty `sap-contextid=` cookie
+   * (so the proxy does not inject — and thereby kill — its stateful context), and an
+   * ICMENOSESSION response is healed once by a stateful HEAD with an empty contextid on
+   * the same path (the proxy re-learns a live context), then the request is retried.
+   * No-op while the cookie jar holds cookies (i.e. the client manages the session).
+   * Also enabled via BW_PROXY_CONTEXTID_GUARD=1|true.
+   */
+  proxyContextIdGuard?: boolean;
 }
 
 /**
@@ -138,6 +152,9 @@ function tracksLock(type: string): boolean {
   return !NO_UNLOCK_TYPES.has(type.toLowerCase());
 }
 
+/** Marker on axios request configs used by the proxy-contextid guard. */
+type GuardedRequestConfig = InternalAxiosRequestConfig & { __bwGuard?: 'heal' | 'retried'; __bwStateful?: boolean };
+
 export class BwClient {
   private http: AxiosInstance;
   private csrfToken: string | null = null;
@@ -154,11 +171,16 @@ export class BwClient {
   // All debug output goes to stderr so it never corrupts the MCP stdio protocol.
   private readonly sessionDebug: boolean =
     process.env.BW_DEBUG_SESSION === '1' || process.env.BW_DEBUG_SESSION === 'true';
+  // Session-holding-proxy workaround, see BwClientOptions.proxyContextIdGuard.
+  private readonly proxyContextIdGuard: boolean;
 
   private readonly opts: BwClientOptions;
 
   constructor(opts: BwClientOptions) {
     this.opts = opts;
+    this.proxyContextIdGuard = opts.proxyContextIdGuard ??
+      (process.env.BW_PROXY_CONTEXTID_GUARD === '1' ||
+        (process.env.BW_PROXY_CONTEXTID_GUARD ?? '').toLowerCase() === 'true');
     this.basicAuth = opts.auth.kind === 'basic'
       ? 'Basic ' + Buffer.from(`${opts.auth.user}:${opts.auth.password}`).toString('base64')
       : null;
@@ -191,6 +213,7 @@ export class BwClient {
     });
     delete this.http.defaults.headers.post['Content-Type'];
     delete (this.http.defaults.headers as any).common['Content-Type'];
+    this.installProxyContextIdGuard(this.http);
 
     // Proxy credentials belong on every request, unlike the identity header — the
     // connectivity proxy authorizes each hop individually. An interceptor keeps that
@@ -351,6 +374,84 @@ export class BwClient {
       }
     }
     return false;
+  }
+
+  // ── Session-holding-proxy guard ─────────────────────────────────────────────
+
+  /**
+   * Installs the proxy-contextid guard on an axios instance (see
+   * BwClientOptions.proxyContextIdGuard). Request side: non-stateful requests without any
+   * cookie get an explicit empty `sap-contextid=`. Response side: an ICMENOSESSION reply
+   * is healed once and the request retried.
+   */
+  private installProxyContextIdGuard(instance: AxiosInstance): void {
+    if (!this.proxyContextIdGuard) return;
+    instance.interceptors.request.use((config) => {
+      const cfg = config as GuardedRequestConfig;
+      if (cfg.__bwGuard === 'heal') return config;
+      if (this.cookies.size > 0) return config; // the jar manages the session
+      if (cfg.headers.get('Cookie')) return config; // caller-provided cookie
+      const st = String(cfg.headers.get('X-sap-adt-sessiontype') ?? '').toLowerCase();
+      cfg.__bwStateful = st === 'stateful';
+      if (cfg.__bwStateful) return config; // proxy must inject its live context
+      cfg.headers.set('Cookie', 'sap-contextid=');
+      return config;
+    });
+    instance.interceptors.response.use(async (response) => {
+      if (!this.isIcmNoSession(response)) return response;
+      const cfg = response.config as GuardedRequestConfig;
+      if (cfg.__bwGuard) return response; // heal request itself, or already retried once
+      await this.healProxyContext(instance, cfg);
+      cfg.__bwGuard = 'retried';
+      // Re-running through axios re-merges the instance defaults; a request whose
+      // session-type header had been removed must not silently turn stateful.
+      if (cfg.__bwStateful === false) cfg.headers.set('X-sap-adt-sessiontype', 'stateless');
+      if (this.csrfToken && cfg.headers.has('X-CSRF-Token') &&
+          String(cfg.headers.get('X-CSRF-Token')).toLowerCase() !== 'fetch') {
+        cfg.headers.set('X-CSRF-Token', this.csrfToken);
+      }
+      return instance.request(cfg);
+    });
+  }
+
+  private isIcmNoSession(response: AxiosResponse): boolean {
+    if (response.status !== 400) return false;
+    const errId = String(response.headers?.['sap-err-id'] ?? '').toUpperCase();
+    if (errId === 'ICMENOSESSION') return true;
+    return typeof response.data === 'string' && /ICMENOSESSION/i.test(response.data);
+  }
+
+  /**
+   * Opens a fresh stateful SAP context on the failed request's path so the proxy replaces
+   * its dead stored context with a live one. The proxy keeps contexts per service path
+   * (/sap/bc/adt vs. /sap/bw/modeling), so the heal targets the same path; a HEAD (query
+   * string stripped) is side-effect free and creates the context even when the handler
+   * answers 400 or 405.
+   */
+  private async healProxyContext(instance: AxiosInstance, failed: GuardedRequestConfig): Promise<void> {
+    const url = String(failed.url ?? '').split('?')[0];
+    if (this.sessionDebug) {
+      console.error(`[bw-session] ICMENOSESSION on ${failed.method?.toUpperCase()} ${failed.url} — healing proxy context via HEAD ${url}`);
+    }
+    const healCfg = {
+      method: 'HEAD',
+      url,
+      headers: {
+        ...this.authHeaders(),
+        ...this.proxyHeaders(),
+        'X-sap-adt-sessiontype': 'stateful',
+        Cookie: 'sap-contextid=',
+      },
+      validateStatus: () => true,
+      __bwGuard: 'heal',
+    } as unknown as GuardedRequestConfig;
+    const resp = await instance.request(healCfg);
+    this.updateCookies(resp);
+    const token = resp.headers?.['x-csrf-token'] as string | undefined;
+    if (token && token.toLowerCase() !== 'fetch') {
+      this.csrfToken = token;
+      this.csrfTokenFetchedAt = Date.now();
+    }
   }
 
   // ── CSRF token ─────────────────────────────────────────────────────────────
@@ -805,6 +906,7 @@ export class BwClient {
       // Wipe every axios default-header bucket so nothing leaks through
       headers: { common: {}, get: {}, post: {}, put: {}, patch: {}, delete: {}, head: {} } as any,
     });
+    this.installProxyContextIdGuard(freshHttp);
 
     const cookieHdr = this.cookieHeader();
     const response = await freshHttp.post(url, body, {
@@ -871,6 +973,7 @@ export class BwClient {
       validateStatus: () => true,
       headers: { common: {}, get: {}, post: {}, put: {}, patch: {}, delete: {}, head: {} } as any,
     });
+    this.installProxyContextIdGuard(freshHttp);
 
     const cookieHdr = this.cookieHeader();
     const response = await freshHttp.put(url, body, {
@@ -908,6 +1011,7 @@ export class BwClient {
       validateStatus: () => true,
       headers: { common: {}, get: {}, post: {}, put: {}, patch: {}, delete: {}, head: {} } as any,
     });
+    this.installProxyContextIdGuard(freshHttp);
     const cookieHdr = this.cookieHeader();
     const response = await freshHttp.delete(url, {
       headers: {
