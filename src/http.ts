@@ -79,6 +79,13 @@ async function main(): Promise<void> {
         appUrl: resolveAppUrl(process.env, { publicUrlEnvVar: 'BW_PUBLIC_URL', port }),
         clientIdPrefix: 'bwmcp-',
         resourceName: 'SAP BW Modeling MCP',
+        // Advertised as `scopes_supported` in the OAuth metadata. Without it a client
+        // requests no scopes; XSUAA still grants them, and Copilot's older auth code
+        // then falls back to the JWT `scope` claim — an array on XSUAA — and crashes
+        // with `scope.split is not a function` (fixed upstream in vscode#325344, but
+        // the Eclipse Language Server lags behind). Also narrows the verifier's
+        // accepted scopes from the arc-1 default set to the two this server defines.
+        scopesSupported: ['read', 'write'],
         requiredScopes: ['read'],
       },
       allowedOrigins: process.env.BW_ALLOWED_ORIGINS?.split(',').map((s) => s.trim()).filter(Boolean),
