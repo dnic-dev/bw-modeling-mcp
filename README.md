@@ -307,6 +307,7 @@ For **local (stdio)** use, the server is configured via environment variables. F
 | `BW_CLIENT` | SAP client (e.g. `001`) | yes |
 | `BW_LANGUAGE` | Language for object texts (e.g. `EN`, `DE`). Default: `DE` | no |
 | `BW_COOKIE_FILE` | Path to a browser-exported cookie file for SAML-/OAuth-fronted systems (e.g. BW Bridge). Netscape or `name=value` format. When set, `BW_USER` / `BW_PASSWORD` are optional. | no |
+| `BW_PROXY_CONTEXTID_GUARD` | `true` to work around session-holding proxies (e.g. the SAP BAS destination proxy) that inject a dead `sap-contextid` and turn every request into HTTP 400 `ICMENOSESSION`. See ARCHITECTURE.md. | no |
 | `BW_MCP_SERVER_NAME` | Server name advertised in the MCP `initialize` handshake. Default: `bw-modeling-mcp`. Give each instance a unique name when running several against different BW systems. | no |
 | `BW_MCP_SYSTEM_LABEL` | Free-text label of the connected BW system (e.g. `AP4 (BW production, read-only)`), put at the top of the MCP server instructions. Lets a model tell look-alike instances apart even in clients that show an opaque connector id instead of the server name. | no |
 
