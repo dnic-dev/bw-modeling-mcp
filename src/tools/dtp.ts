@@ -128,9 +128,11 @@ interface DtpInfo {
   filterFields: DtpFilterField[];
   globalRoutineCode: string[];
   semanticGroupFields: { name: string; description: string; isKey: boolean; isField: boolean }[];
+  /** groupField entries that repeated a name already seen — see parseDtpXml. */
+  duplicateGroupFields: number;
 }
 
-function parseDtpXml(xml: string, status: string): DtpInfo {
+export function parseDtpXml(xml: string, status: string): DtpInfo {
   const attr = (tag: string, name: string) => {
     const m = tag.match(new RegExp(`\\b${name}="([^"]*)"`));
     return m ? m[1] : '';
@@ -220,16 +222,28 @@ function parseDtpXml(xml: string, status: string): DtpInfo {
 
   // Semantic group candidates. Entries with field="true" are plain fields or key figures,
   // the others are InfoObject-based and carry infoObjectType plus a reference.
+  // Keyed by name: a document served from a reused stateful session lists the
+  // <groupField> children n-fold (see freshRead in bw-client.ts), so a repeated name is
+  // the same field again, and its key flag counts if any copy carries it.
   const semanticGroupFields: DtpInfo['semanticGroupFields'] = [];
+  let duplicateGroupFields = 0;
   const sgBlock = xml.match(/<semanticGroup>[\s\S]*?<\/semanticGroup>/)?.[0] ?? '';
   const groupFieldRegex = /<groupField\b([^>]*)\/>/g;
   let sgm: RegExpExecArray | null;
   while ((sgm = groupFieldRegex.exec(sgBlock)) !== null) {
     const a = sgm[1];
+    const name = attr(a, 'name');
+    const isKey = /\bkeyField="true"/.test(a);
+    const seen = semanticGroupFields.find((f) => f.name === name);
+    if (seen) {
+      duplicateGroupFields++;
+      seen.isKey = seen.isKey || isKey;
+      continue;
+    }
     semanticGroupFields.push({
-      name: attr(a, 'name'),
+      name,
       description: attr(a, 'description'),
-      isKey: /\bkeyField="true"/.test(a),
+      isKey,
       isField: /\bfield="true"/.test(a),
     });
   }
@@ -246,6 +260,7 @@ function parseDtpXml(xml: string, status: string): DtpInfo {
     filterFields,
     globalRoutineCode,
     semanticGroupFields,
+    duplicateGroupFields,
   };
 }
 
@@ -322,6 +337,12 @@ export async function bwGetDtp(client: BwClient, dtpName: string): Promise<strin
     }
     if (sgAvailable.length > 0) {
       lines.push(`  Available: ${sgAvailable.map((f) => f.name).join(', ')}`);
+    }
+    if (info.duplicateGroupFields > 0) {
+      lines.push(
+        `  (note: ${info.duplicateGroupFields} repeated groupField entries collapsed — ` +
+        `the document was served from a reused stateful session)`
+      );
     }
   }
 
@@ -862,9 +883,8 @@ export async function bwCreateDtp(
         throw new Error(`No <LOCK_HANDLE> in description/filter lock response:\n${descLockResponse.body}`);
       }
 
-      // GET DTP XML (fresh client) — read timestamp
-      const descGetClient = createClientFromEnv();
-      const descGetResponse = await descGetClient.get(`/sap/bw/modeling/dtpa/${bwSeg(dtpLower)}/m`, MEDIA_TYPES['dtpa']);
+      // GET DTP XML (fresh stateless read) — read timestamp
+      const descGetResponse = await freshRead(`/sap/bw/modeling/dtpa/${bwSeg(dtpLower)}/m`, MEDIA_TYPES['dtpa']);
       const descTimestamp = descGetResponse.headers['timestamp'] ?? '';
 
       let descXml = descGetResponse.body;
@@ -997,6 +1017,10 @@ export interface UpdateDtpArgs {
  * every entry. Replacing keyField="false" would therefore silently hit nothing on a GET
  * document, so all keyField attributes are stripped and re-added instead.
  *
+ * Each groupable field is kept once. A document served from a reused stateful session
+ * lists the <groupField> children n-fold (see freshRead in bw-client.ts); sending them
+ * back n-fold, with the key flag on every copy, is nothing Eclipse ever sends.
+ *
  * Throws when the document has no semantic group, or when a requested field name is not
  * among the groupable fields — the server would answer HTTP 200 and keep the old
  * selection, which is indistinguishable from success for the caller.
@@ -1014,10 +1038,15 @@ export function applySemanticGroup(xml: string, fields: string, dtpName: string)
     fields.split(',').map((f) => f.trim()).filter(Boolean)
   )];
 
-  let sgXml = sgMatch[0].replace(
-    /(<groupField\b[^>]*?)\s+keyField="(?:true|false)"/g,
-    '$1'
-  );
+  const seen = new Set<string>();
+  let sgXml = sgMatch[0]
+    .replace(/\s*<groupField\b([^>]*)\/>/g, (tag: string, attrs: string) => {
+      const name = attrs.match(/\bname="([^"]*)"/)?.[1] ?? '';
+      if (seen.has(name)) return '';
+      seen.add(name);
+      return tag;
+    })
+    .replace(/(<groupField\b[^>]*?)\s+keyField="(?:true|false)"/g, '$1');
 
   const missing: string[] = [];
   for (const field of requested) {
@@ -1061,9 +1090,8 @@ export async function bwUpdateDtp(
   // The enqueue lock (SM12: RSBKDTP) must be released on success AND error;
   // bwActivate does not release it for dtpa, so it is freed in the finally block.
   try {
-    // GET current DTP XML (fresh client) — read timestamp
-    const getClient = createClientFromEnv();
-    const getResponse = await getClient.get(`/sap/bw/modeling/dtpa/${bwSeg(dtpLower)}/m`, MEDIA_TYPES['dtpa']);
+    // GET current DTP XML (fresh stateless read) — read timestamp
+    const getResponse = await freshRead(`/sap/bw/modeling/dtpa/${bwSeg(dtpLower)}/m`, MEDIA_TYPES['dtpa']);
     const timestamp = getResponse.headers['timestamp'] ?? '';
 
     // Apply modifications
@@ -1479,12 +1507,8 @@ export async function bwSetDtpFilterRoutine(
       // Step 5: DELETE routineReports (mandatory cleanup)
       await deleteRoutineReport();
 
-      // Step 6: GET current DTP XML (fresh client, read timestamp)
-      const dtpGetClient = createClientFromEnv();
-      const dtpGetResponse = await dtpGetClient.get(
-        `/sap/bw/modeling/dtpa/${bwSeg(dtpLower)}/m`,
-        MEDIA_TYPES['dtpa']
-      );
+      // Step 6: GET current DTP XML (fresh stateless read, read timestamp)
+      const dtpGetResponse = await freshRead(`/sap/bw/modeling/dtpa/${bwSeg(dtpLower)}/m`, MEDIA_TYPES['dtpa']);
       const timestamp = dtpGetResponse.headers['timestamp'] ?? '';
 
       // Step 7: Convert routineReports XML → DTP PUT format

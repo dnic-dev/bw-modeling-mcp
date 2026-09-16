@@ -138,6 +138,12 @@ function tracksLock(type: string): boolean {
   return !NO_UNLOCK_TYPES.has(type.toLowerCase());
 }
 
+/** Per-call options for BwClient.get(). */
+export interface GetOptions {
+  /** Session type declared on this one request; unset keeps the instance default. */
+  sessionType?: 'stateful' | 'stateless';
+}
+
 export class BwClient {
   private http: AxiosInstance;
   private csrfToken: string | null = null;
@@ -431,7 +437,7 @@ export class BwClient {
 
   // ── Public HTTP helpers ────────────────────────────────────────────────────
 
-  async get(path: string, accept: string): Promise<GetResult> {
+  async get(path: string, accept: string, options?: GetOptions): Promise<GetResult> {
     await this.ensureCsrf();
     const IOBJ_ACCEPT_ALL = 'application/vnd.sap-bw-modeling.iobj-v1_0_0+xml, application/vnd.sap-bw-modeling.iobj-v1_1_0+xml, application/vnd.sap-bw-modeling.iobj-v1_2_0+xml, application/vnd.sap-bw-modeling.iobj-v1_3_0+xml, application/vnd.sap-bw-modeling.iobj-v1_4_0+xml, application/vnd.sap-bw-modeling.iobj-v1_5_0+xml, application/vnd.sap-bw-modeling.iobj-v1_6_0+xml, application/vnd.sap-bw-modeling.iobj-v1_7_0+xml, application/vnd.sap-bw-modeling.iobj-v1_8_0+xml, application/vnd.sap-bw-modeling.iobj-v1_9_0+xml, application/vnd.sap-bw-modeling.iobj-v2_0_0+xml, application/vnd.sap-bw-modeling.iobj-v2_1_0+xml, application/vnd.sap-bw-modeling.iobj-v2_2_0+xml, application/vnd.sap-bw-modeling.iobj-v2_3_0+xml, application/vnd.sap-bw-modeling.iobj-v2_4_0+xml';
     const resolvedAccept = accept.includes('iobj') ? IOBJ_ACCEPT_ALL : `application/xml, ${accept}`;
@@ -440,6 +446,7 @@ export class BwClient {
         Accept: resolvedAccept,
         'bwmt-level': '50',
         'X-CSRF-Token': this.csrfToken!,
+        ...(options?.sessionType ? { 'X-sap-adt-sessiontype': options.sessionType } : {}),
         ...this.cookieHeaders(),
       },
       responseType: 'text',
@@ -1289,7 +1296,18 @@ export function decodeXmlEntities(value: string): string {
     .replace(/&amp;/g, '&');
 }
 
+/**
+ * The read is declared stateless on purpose. The modeling handlers keep the object
+ * instance in the stateful ABAP session and build some derived lists by appending to
+ * it: the DTP `/m` document, for one, carries the children of <semanticGroup>,
+ * <temporaryStorage> and <programFlow> n-fold on the n-th read of the same DTP within
+ * one context (forceCacheUpdate does not help — the instance is the buffer). A fresh
+ * client does not escape that behind a proxy that injects the sap-contextid it holds
+ * into every request, because every stateful request of the process then shares that
+ * one context. A stateless request gets a context of its own that ends with the
+ * request: it returns the database state exactly once and leaves no session behind.
+ */
 export async function freshRead(path: string, accept: string): Promise<GetResult> {
   const sep = path.includes('?') ? '&' : '?';
-  return createClientFromEnv().get(`${path}${sep}forceCacheUpdate=true`, accept);
+  return createClientFromEnv().get(`${path}${sep}forceCacheUpdate=true`, accept, { sessionType: 'stateless' });
 }
