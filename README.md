@@ -90,7 +90,7 @@ structures — can now be created and changed rather than only read.
 
 **✨ Also new**
 
-- `bw_delete_request` deletes load requests — the precondition BW demands before switching a DTP from delta to full extraction
+- `bw_delete_request` deletes load requests — with the data they brought in and their entry in request management
 - Characteristics can be modelled for values with lower case letters or umlauts (`lower_case`), which previously failed at request activation rather than at load time
 - `bw_get_request` reads the log of each process step, so a failed activation names the value and the characteristic that caused it
 
@@ -270,7 +270,7 @@ An overview by area. Every tool in detail — parameters, behaviour, and the seq
 - List load requests for a target InfoProvider — status, last process status/action, record count, timestamp, user, TSN
 - Full status analysis of a single load request — header, DTP information (start/finish/duration), process step chain, and message log in one call
 - Activate loaded data (DSO request activation) — move a finished load from the inbound table into the active data table + change log
-- Delete load requests — with the data they brought in and their entry in request management, which is what BW demands before a DTP can be switched from delta to full extraction. An activation request is rolled back instead, together with every later activation on top of it
+- Delete load requests — with the data they brought in and their entry in request management. An activation request is rolled back instead, together with every later activation on top of it
 - Monitor, diagnose and run remodeling requests — the five processing steps (`CHECK`, `SAVE`, `CONVERT`, `ACTIVATE`, `CLEANUP`) with their individual status and the application log per step, plus execute, restart, reset and reset-step. Running a rule restructures the InfoProvider and converts its data
 - Uses the BW/4HANA `/sap/bc/.../bw4` manage API (the same operations as the BW/4HANA Cockpit)
 - On classic BW, where that API does not exist, these tools are not offered; the load history of a provider is read with `bw_read_metadata_tables` instead, which the server names in place of every tool it hides
