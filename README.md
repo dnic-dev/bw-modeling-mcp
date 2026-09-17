@@ -8,7 +8,7 @@ A Model Context Protocol (MCP) server that enables AI assistants like Claude to 
 
 ## ☁️ Running on SAP BTP Cloud Foundry
 
-![Central MCP server for AI-assisted SAP BW/4HANA modeling: MCP-capable AI clients connect via OAuth to bw-modeling-mcp with role-based access control, which reaches on-premise, private cloud and BW Bridge systems via principal propagation](docs/btp-hosting.png)
+![Central MCP server for AI-assisted SAP BW modeling: MCP-capable AI clients connect via OAuth to bw-modeling-mcp, whose analyst, reader and developer roles reach on-premise, private cloud and BW Bridge systems via principal propagation](docs/btp-hosting.png)
 
 Besides stdio, the server can run as an HTTP service on SAP BTP Cloud Foundry with XSUAA
 OAuth in front and a BTP destination behind — either a shared technical user
