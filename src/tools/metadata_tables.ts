@@ -1,4 +1,26 @@
 import { BwClient, MEDIA_TYPES, bwSeg } from '../bw-client.js';
+import {
+  queryTable,
+  sqlLiteral,
+  inListBatches,
+  toDisplayName,
+  formatStamp,
+  durationSeconds,
+  type Row,
+} from './metadata_sql.js';
+
+// Re-exported because they were part of this module before the split, and both the
+// offline tests and the other readers import them from here.
+export { parseDataPreview, queryTable, inListBatches, formatStamp, durationSeconds } from './metadata_sql.js';
+export type { Row } from './metadata_sql.js';
+import {
+  readPlanningFunction,
+  readPlanningSequence,
+  readPlanningProperties,
+  readDataSlices,
+} from './metadata_planning.js';
+import { readChainLog } from './metadata_chainlog.js';
+import { readAnalysisProcess } from './metadata_apd.js';
 
 /**
  * Read BW object definitions straight from their metadata tables, through the ADT
@@ -12,80 +34,6 @@ import { BwClient, MEDIA_TYPES, bwSeg } from '../bw-client.js';
  * Every statement in this module is fixed in code. Nothing is assembled from caller input
  * beyond the object name, which is escaped before use.
  */
-
-// ── DataPreview access ──────────────────────────────────────────────────────
-
-export type Row = Record<string, string>;
-
-/** Single quotes are the only character that could break out of the literal. */
-function sqlLiteral(value: string): string {
-  return value.replace(/'/g, "''");
-}
-
-function decodeEntities(value: string): string {
-  return value
-    .replace(/&lt;/g, '<')
-    .replace(/&gt;/g, '>')
-    .replace(/&quot;/g, '"')
-    .replace(/&apos;/g, "'")
-    .replace(/&#(\d+);/g, (_, d) => String.fromCharCode(Number(d)))
-    .replace(/&amp;/g, '&');
-}
-
-/**
- * The response is column-oriented: one <columns> block per column, each carrying the
- * column name and a <dataSet> holding one <data> element per row. Rows are rebuilt by
- * index; an empty cell arrives as a self-closing element.
- */
-export function parseDataPreview(xml: string): Row[] {
-  const columns: { name: string; values: string[] }[] = [];
-  const blockRe = /<dataPreview:columns>([\s\S]*?)<\/dataPreview:columns>/g;
-  let block: RegExpExecArray | null;
-  while ((block = blockRe.exec(xml)) !== null) {
-    const name = block[1].match(/dataPreview:name="([^"]+)"/)?.[1];
-    if (!name) continue;
-    const values: string[] = [];
-    const cellRe = /<dataPreview:data\s*\/>|<dataPreview:data>([\s\S]*?)<\/dataPreview:data>/g;
-    let cell: RegExpExecArray | null;
-    while ((cell = cellRe.exec(block[1])) !== null) {
-      values.push(cell[1] === undefined ? '' : decodeEntities(cell[1]));
-    }
-    columns.push({ name, values });
-  }
-  const rowCount = columns.length ? Math.max(...columns.map((c) => c.values.length)) : 0;
-  const rows: Row[] = [];
-  for (let i = 0; i < rowCount; i++) {
-    const row: Row = {};
-    // Trailing only: SAP pads CHAR columns, but leading blanks carry meaning — they are
-    // the indentation of ABAP source lines read from RSAABAP.
-    for (const col of columns) row[col.name] = (col.values[i] ?? '').replace(/\s+$/, '');
-    rows.push(row);
-  }
-  return rows;
-}
-
-/** Run one ABAP SQL statement through ADT DataPreview. */
-export async function queryTable(client: BwClient, sql: string, maxRows = 500): Promise<Row[]> {
-  const token = await client.getCsrfToken();
-  const { body } = await client.rawPost(
-    `/sap/bc/adt/datapreview/freestyle?rowNumber=${maxRows}`,
-    sql,
-    {
-      'Content-Type': 'text/plain',
-      Accept: 'application/xml, application/vnd.sap.adt.datapreview.table.v1+xml',
-      'X-CSRF-Token': token,
-    },
-  );
-  return parseDataPreview(body);
-}
-
-// ── Shared helpers ──────────────────────────────────────────────────────────
-
-/** Tables store `/NAMESPACE/FIELD`; the REST API and the frontend render `$NAMESPACE$FIELD`. */
-function toDisplayName(field: string): string {
-  const m = field.match(/^\/([^/]+)\/(.+)$/);
-  return m ? `$${m[1]}$${m[2]}` : field;
-}
 
 // ── Load history (RSSTATMANPART / RSBKREQUEST) ──────────────────────────────
 
@@ -112,33 +60,6 @@ const REQUEST_UPDATE_MODES: Record<string, string> = {
   R: 'Repeat',
 };
 
-/** `20190111125226` and `20190111125226.6875150` alike become `2019-01-11 12:52:26`. */
-export function formatStamp(date: string | undefined, time?: string): string {
-  const d = (date ?? '').trim();
-  if (!d || /^0+$/.test(d)) return '';
-  const digits = d.replace(/\..*$/, '');
-  const day = digits.slice(0, 8);
-  const clock = (time ?? digits.slice(8, 14)).padEnd(6, '0');
-  if (day.length < 8) return d;
-  return `${day.slice(0, 4)}-${day.slice(4, 6)}-${day.slice(6, 8)} ` +
-    `${clock.slice(0, 2)}:${clock.slice(2, 4)}:${clock.slice(4, 6)}`;
-}
-
-/** Seconds between two RSBKREQUEST timestamps, which carry fractions after the dot. */
-export function durationSeconds(start: string | undefined, finish: string | undefined): string {
-  const toSec = (v: string | undefined): number | undefined => {
-    const m = (v ?? '').trim().match(/^(\d{4})(\d{2})(\d{2})(\d{2})(\d{2})(\d{2})(?:\.(\d+))?$/);
-    if (!m) return undefined;
-    const ms = Date.UTC(+m[1], +m[2] - 1, +m[3], +m[4], +m[5], +m[6]);
-    return ms / 1000 + (m[7] ? Number(`0.${m[7]}`) : 0);
-  };
-  const a = toSec(start);
-  const b = toSec(finish);
-  if (a === undefined || b === undefined || b < a) return '';
-  const secs = b - a;
-  return secs < 60 ? `${secs.toFixed(1)} s` : `${Math.floor(secs / 60)}m ${(secs % 60).toFixed(0)}s`;
-}
-
 /**
  * The load history of one data target, as the request management ("Manage") view shows it.
  *
@@ -148,25 +69,32 @@ export function durationSeconds(start: string | undefined, finish: string | unde
  * and is joined on RSBKREQUEST-REQUEST = RSSTATMANPART-RNR; a request loaded by an
  * InfoPackage simply has no counterpart there and is reported without that detail.
  *
- * Best effort: a target whose history cannot be read yields no section rather than failing
- * the whole object read.
+ * Best effort by default: a target whose history cannot be read yields no section rather
+ * than failing the whole object read. `strict` is for the caller whose entire answer is
+ * this section — there, silence would read as "never loaded" and the reason must surface.
  */
-async function loadHistorySection(client: BwClient, dataTarget: string, limit = 10): Promise<string[]> {
+async function loadHistorySection(
+  client: BwClient,
+  dataTarget: string,
+  limit = 10,
+  strict = false,
+): Promise<string[]> {
   const name = sqlLiteral(dataTarget.trim().toUpperCase());
   let requests: Row[];
   let total: Row[];
   try {
-    [requests, total] = await Promise.all([
-      queryTable(
-        client,
-        `SELECT rnr, status, updmode, datum_anf, zeit_anf, anz_recs, insert_recs, ` +
-          `source_dta, source_dta_type, stornoflag, archivflag FROM rsstatmanpart ` +
-          `WHERE dta = '${name}' ORDER BY datum_anf DESCENDING, zeit_anf DESCENDING`,
-        limit,
-      ),
-      queryTable(client, `SELECT count(*) AS cnt FROM rsstatmanpart WHERE dta = '${name}'`, 1),
-    ]);
-  } catch {
+    // Sequential, not parallel: the second statement spends the CSRF token the first one
+    // may already have rotated, and one avoidable retry per read is not worth the overlap.
+    requests = await queryTable(
+      client,
+      `SELECT rnr, status, updmode, datum_anf, zeit_anf, anz_recs, insert_recs, ` +
+        `source_dta, source_dta_type, stornoflag, archivflag FROM rsstatmanpart ` +
+        `WHERE dta = '${name}' ORDER BY datum_anf DESCENDING, zeit_anf DESCENDING`,
+      limit,
+    );
+    total = await queryTable(client, `SELECT count(*) AS cnt FROM rsstatmanpart WHERE dta = '${name}'`, 1);
+  } catch (err) {
+    if (strict) throw err;
     return [];
   }
 
@@ -547,6 +475,34 @@ const ODSO_TYPES: Record<string, string> = {
   T: 'DataStore Object for direct update',
 };
 
+/**
+ * The load history of an aDSO.
+ *
+ * Only the history, unlike the classic providers below: every release that has aDSOs also
+ * publishes the `adso` REST resource, so the structure is read with bw_get_adso and there is
+ * nothing here to duplicate. What is missing on a classic release is the request management
+ * view — the BW/4HANA manage API behind bw_list_requests does not exist there, and that tool
+ * is therefore not offered. This is the route to load status for an aDSO on such a system.
+ *
+ * Strict, because the history is the entire answer here: silence would read as "never
+ * loaded" when in truth the table could not be read.
+ */
+async function readAdso(client: BwClient, adsoName: string): Promise<string> {
+  const name = adsoName.trim().toUpperCase();
+  const out = [
+    `aDSO: ${name}`,
+    '',
+    'Structure, settings and field list: bw_get_adso — the REST resource exists on every release.',
+    // Without this an aDSO read on BW/4HANA reports "no requests" for a provider that has
+    // hundreds: RSSTATMANPART is the classic request store and stays empty there (verified —
+    // 0 rows against 15k in RSPMREQUEST), and an empty section would read as "never loaded".
+    'The history below is RSSTATMANPART, the request store of classic releases. On BW/4HANA it',
+    'is empty by design — requests live in RSPMREQUEST there and are read with bw_list_requests.',
+  ];
+  const section = await loadHistorySection(client, name, 10, true);
+  return [...out, ...section].join('\n');
+}
+
 async function readOdso(client: BwClient, odsoName: string): Promise<string> {
   const name = sqlLiteral(odsoName.trim().toUpperCase());
   const scope = `odsobject = '${name}' AND objvers = 'A'`;
@@ -705,33 +661,6 @@ async function readCube(client: BwClient, cubeName: string): Promise<string> {
   // A MultiProvider holds no data of its own — its parts do, and each is readable here.
   if (head.CUBETYPE !== 'M') out.push(...(await loadHistorySection(client, cubeName)));
   return out.join('\n');
-}
-
-/**
- * Split values into quoted IN-list fragments that keep the statement inside the length the
- * DataPreview service accepts.
- *
- * That service parses at most 255 characters of statement; beyond it the text is cut and the
- * parser complains about an unterminated literal rather than about the length. `budget` is the
- * room left for the list once the rest of the statement is counted.
- */
-export function inListBatches(values: string[], budget: number): string[] {
-  const batches: string[] = [];
-  let current: string[] = [];
-  let length = 0;
-  for (const v of values) {
-    const piece = `'${sqlLiteral(v)}'`;
-    const added = piece.length + (current.length > 0 ? 2 : 0);
-    if (current.length > 0 && length + added > budget) {
-      batches.push(current.join(', '));
-      current = [];
-      length = 0;
-    }
-    current.push(piece);
-    length += piece.length + (current.length > 1 ? 2 : 0);
-  }
-  if (current.length > 0) batches.push(current.join(', '));
-  return batches;
 }
 
 // ── Process chain (RSPC) ────────────────────────────────────────────────────
@@ -965,7 +894,7 @@ async function readProcessChain(client: BwClient, chainName: string): Promise<st
 
 // ── Dispatcher ──────────────────────────────────────────────────────────────
 
-const SUPPORTED = ['TRFN', 'DTPA', 'ODSO', 'CUBE', 'MPRO', 'RSPC'];
+const SUPPORTED = ['TRFN', 'DTPA', 'ADSO', 'ODSO', 'CUBE', 'MPRO', 'RSPC', 'PLSE', 'PLSQ', 'PLCR', 'PLDS', 'RSPCLOG', 'ANPR'];
 
 /**
  * Width of the key column each type is looked up by. A name wider than its column does not
@@ -977,10 +906,20 @@ const NAME_WIDTHS: Record<string, number> = {
   TRFN: 32,
   DTPA: 30,
   DTP: 30,
+  ADSO: 30,
   ODSO: 30,
   CUBE: 30,
   MPRO: 30,
   RSPC: 30,
+  // RSPLF_SRVNM and RSPLS_SEQNM are CHAR(20); the planning objects keyed by InfoProvider
+  // follow RSINFOPROV at 30.
+  PLSE: 20,
+  PLSQ: 20,
+  PLCR: 30,
+  PLDS: 30,
+  // RSPC_CHAIN and RSPC_LOGID are both CHAR(25); a pattern is checked before the width is.
+  RSPCLOG: 25,
+  ANPR: 30,
 };
 
 /**
@@ -999,7 +938,8 @@ export async function bwReadMetadataTables(
   if (!name) return 'object_name is required.';
 
   const width = NAME_WIDTHS[type];
-  if (width && name.length > width) {
+  // A wildcard is a pattern, not a name, so the width of a single object does not apply.
+  if (width && !name.includes('*') && name.length > width) {
     return (
       `"${name}" is ${name.length} characters, but an object name of type ${type} is at most ${width}. ` +
       `No object can carry this name — check the value that was passed.`
@@ -1012,6 +952,8 @@ export async function bwReadMetadataTables(
     case 'DTPA':
     case 'DTP':
       return readDtp(client, objectName.trim());
+    case 'ADSO':
+      return readAdso(client, objectName.trim());
     case 'ODSO':
       return readOdso(client, objectName.trim());
     case 'CUBE':
@@ -1019,6 +961,18 @@ export async function bwReadMetadataTables(
       return readCube(client, objectName.trim());
     case 'RSPC':
       return readProcessChain(client, objectName.trim());
+    case 'PLSE':
+      return readPlanningFunction(client, objectName.trim());
+    case 'PLSQ':
+      return readPlanningSequence(client, objectName.trim());
+    case 'PLCR':
+      return readPlanningProperties(client, objectName.trim());
+    case 'PLDS':
+      return readDataSlices(client, objectName.trim());
+    case 'RSPCLOG':
+      return readChainLog(client, objectName.trim());
+    case 'ANPR':
+      return readAnalysisProcess(client, objectName.trim());
     default:
       return (
         `Object type "${objectType}" is not supported yet. Supported: ${SUPPORTED.join(', ')}.`

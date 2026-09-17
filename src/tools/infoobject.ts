@@ -13,6 +13,22 @@ const KYF_TYPE_MAP: Record<string, { keyfigureType: string; semantics: string }>
   TIMS: { keyfigureType: 'NUM', semantics: 'NUM' },
 };
 
+// ── CHA: lower case flag (RSDCHABAS-LOWERCASE) ───────────────────────────────
+
+/**
+ * Set withLowerCaseLetters on the Characteristic root element.
+ *
+ * The attribute is absent from the XML of a characteristic that does not allow lower
+ * case, so it has to be added rather than replaced in that case.
+ */
+export function setLowerCase(xml: string, lowerCase: boolean): string {
+  if (/\bwithLowerCaseLetters="/.test(xml)) {
+    return xml.replace(/\bwithLowerCaseLetters="[^"]*"/, `withLowerCaseLetters="${lowerCase}"`);
+  }
+  if (!lowerCase) return xml;
+  return xml.replace(/(<\w+:infoObject\b)/, `$1 withLowerCaseLetters="true"`);
+}
+
 // ── bwCreateInfoObject ────────────────────────────────────────────────────────
 
 export interface CreateInfoObjectArgs {
@@ -26,6 +42,7 @@ export interface CreateInfoObjectArgs {
   conversion_routine?: string;
   with_master_data?: boolean;
   with_texts?: boolean;
+  lower_case?: boolean;
   referenced_infoobject?: string;
   // KYF
   object_specific_data_type?: string;
@@ -66,6 +83,10 @@ export async function bwCreateInfoObject(
   const pkg = args.package ?? '$TMP';
   const desc = args.description;
   const infoArea = args.info_area.toUpperCase();
+
+  if (isobjType === 'KYF' && args.lower_case !== undefined) {
+    throw new Error('lower_case applies to Characteristics (CHA) only — remove it for a Key Figure.');
+  }
 
   // Step 1: Lock with CREA headers (stateful_enqueue session)
   const lockHandle = await client.lock('iobj', nameLower, {
@@ -192,6 +213,7 @@ export async function bwCreateInfoObject(
   const chaConv = args.conversion_routine ?? defaultConv;
   const withMasterData = args.with_master_data ?? false;
   const withTexts = args.with_texts ?? false;
+  const lowerCase = args.lower_case ?? false;
 
   // Root element attributes
   putXml = putXml.replace(/\bobjectSpecificDataType="[^"]*"/, `objectSpecificDataType="${chaDataType}"`);
@@ -202,6 +224,7 @@ export async function bwCreateInfoObject(
     // Add conversionRoutine attribute to root element if not present
     putXml = putXml.replace(/(<iobj:infoObject\b)/, `$1 conversionRoutine="${chaConv}"`);
   }
+  putXml = setLowerCase(putXml, lowerCase);
   // CHA child elements
   putXml = putXml.replace(/<dataType>[^<]*<\/dataType>/, `<dataType>${chaDataType}</dataType>`);
   putXml = putXml.replace(/<length>[^<]*<\/length>/, `<length>${chaLength}</length>`);
@@ -300,6 +323,7 @@ export async function bwCreateInfoObject(
     conversionRoutine: chaConv,
     withMasterData,
     withTexts,
+    lowerCase,
   };
   if (args.referenced_infoobject) resultExtra['referencedInfoObject'] = args.referenced_infoobject.toUpperCase();
   if (args.compound_infoobjects?.length) resultExtra['compoundParents'] = args.compound_infoobjects.map(p => p.toUpperCase());
@@ -356,8 +380,10 @@ export interface AttributeDef {
 
 export interface UpdateInfoObjectArgs {
   name: string;
+  /** Replaces the whole attribute list; [] removes all attributes, undefined keeps them. */
   attributes?: AttributeDef[];
   description?: string;
+  lower_case?: boolean;
   fixed_unit?: string;
   fixed_currency?: string;
   transport?: string;
@@ -383,6 +409,9 @@ export async function bwUpdateInfoObject(
 ): Promise<string> {
   const nameLower = args.name.toLowerCase();
   const nameUpper = args.name.toUpperCase();
+  // Omitting attributes leaves the existing list untouched — otherwise a change to any
+  // other property (description, lower_case) would silently drop every attribute.
+  const replaceAttributes = args.attributes !== undefined;
   const attributes = args.attributes ?? [];
 
   // Step 1: Lock with the original client (holds the lock session)
@@ -398,6 +427,9 @@ export async function bwUpdateInfoObject(
     // ── KYF fast path: only patch fixedUnit / fixedCurrency / description ─────
     const isKyf = /<infoObjectType>KYF<\/infoObjectType>/.test(xml);
     if (isKyf) {
+      if (args.lower_case !== undefined) {
+        throw new Error(`InfoObject '${nameUpper}' is a Key Figure — lower_case applies to Characteristics (CHA) only.`);
+      }
       if (args.description) {
         const desc = args.description;
         xml = xml.replace(/<longDescription>[^<]*<\/longDescription>/, `<longDescription>${desc}</longDescription>`);
@@ -495,29 +527,35 @@ export async function bwUpdateInfoObject(
       );
     }
 
-    // Step 4: Remove all existing <attributeN .../> self-closing elements
-    xml = xml.replace(/\s*<attributeN\b[^>]*\/>/g, '');
+    if (replaceAttributes) {
+      // Step 4: Remove all existing <attributeN .../> self-closing elements
+      xml = xml.replace(/\s*<attributeN\b[^>]*\/>/g, '');
 
-    // Step 5: Remove existing hanaAttributeMapping type="02" block — only when rebuilding
-    // with new attributes. When removing all attributes (empty list), SAP cleans up
-    // hanaAttributeMapping type="02" automatically on activation.
-    if (attrXmlParts.length > 0) {
-      xml = xml.replace(/\s*<hanaAttributeMapping type="02">[\s\S]*?<\/hanaAttributeMapping>/g, '');
+      // Step 5: Remove existing hanaAttributeMapping type="02" block — only when rebuilding
+      // with new attributes. When removing all attributes (empty list), SAP cleans up
+      // hanaAttributeMapping type="02" automatically on activation.
+      if (attrXmlParts.length > 0) {
+        xml = xml.replace(/\s*<hanaAttributeMapping type="02">[\s\S]*?<\/hanaAttributeMapping>/g, '');
+      }
+
+      // Step 6: Insert new attributeN elements before <runtimeProperties
+      if (attrXmlParts.length > 0) {
+        const attrBlock = attrXmlParts.join('\n') + '\n';
+        xml = xml.replace(/(<runtimeProperties)/, attrBlock + '$1');
+      }
+
+      // Step 7: Insert hanaAttributeMapping type="02" before type="03" if attributes present
+      if (sourceFieldParts.length > 0) {
+        const hanaMappingBlock =
+          `<hanaAttributeMapping type="02">\n` +
+          sourceFieldParts.join('\n') + '\n' +
+          `</hanaAttributeMapping>\n`;
+        xml = xml.replace('<hanaAttributeMapping type="03">', hanaMappingBlock + '<hanaAttributeMapping type="03">');
+      }
     }
 
-    // Step 6: Insert new attributeN elements before <runtimeProperties
-    if (attrXmlParts.length > 0) {
-      const attrBlock = attrXmlParts.join('\n') + '\n';
-      xml = xml.replace(/(<runtimeProperties)/, attrBlock + '$1');
-    }
-
-    // Step 7: Insert hanaAttributeMapping type="02" before type="03" if attributes present
-    if (sourceFieldParts.length > 0) {
-      const hanaMappingBlock =
-        `<hanaAttributeMapping type="02">\n` +
-        sourceFieldParts.join('\n') + '\n' +
-        `</hanaAttributeMapping>\n`;
-      xml = xml.replace('<hanaAttributeMapping type="03">', hanaMappingBlock + '<hanaAttributeMapping type="03">');
+    if (args.lower_case !== undefined) {
+      xml = setLowerCase(xml, args.lower_case);
     }
 
     // Patch description if provided
@@ -541,13 +579,22 @@ export async function bwUpdateInfoObject(
     await client.unlock('iobj', nameLower).catch(() => undefined);
   }
 
-  return JSON.stringify({
-    success: true,
-    name: nameUpper,
-    attributeCount: attributes.length,
-    attributes: attributes.map((a) => ({ name: a.name.toUpperCase(), type: a.type })),
-    message: `InfoObject '${nameUpper}' updated and activated with ${attributes.length} attribute(s).`,
-  });
+  const changes: string[] = [];
+  if (replaceAttributes) changes.push(`${attributes.length} attribute(s)`);
+  if (args.lower_case !== undefined) changes.push(`lowerCase=${args.lower_case}`);
+  if (args.description) changes.push('description');
+
+  const result: Record<string, unknown> = { success: true, name: nameUpper };
+  if (replaceAttributes) {
+    result['attributeCount'] = attributes.length;
+    result['attributes'] = attributes.map((a) => ({ name: a.name.toUpperCase(), type: a.type }));
+  }
+  if (args.lower_case !== undefined) result['lowerCase'] = args.lower_case;
+  result['message'] =
+    `InfoObject '${nameUpper}' updated and activated` +
+    (changes.length > 0 ? ` (${changes.join(', ')}).` : '.');
+
+  return JSON.stringify(result);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

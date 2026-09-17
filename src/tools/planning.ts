@@ -926,6 +926,8 @@ export async function bwGetPlanningSequence(client: BwClient, seqName: string): 
 interface PlseSelectionRange {
   selectionType: string;
   operator: string;
+  /** `exclude="true"` on the constraint — the difference between "is X" and "is not X". */
+  exclude: boolean;
   fromType: string;
   fromValue: string;
   toType?: string;
@@ -938,6 +940,8 @@ interface PlseParameter {
   multiselection: string;
   children: PlseParameter[];
   selections: PlseSelectionRange[];
+  /** A data-selection parameter (type 3) restricts characteristics, not a single value. */
+  fieldSelections: PlseCondition[];
 }
 
 interface PlseCharUsage {
@@ -955,6 +959,8 @@ interface PlseQryValue {
 interface PlseConditionConstraint {
   selectionType: string;
   operator: string;
+  /** `exclude="true"` on the constraint — without it a condition reads as its own opposite. */
+  exclude: boolean;
   from: PlseQryValue;
   to?: PlseQryValue;
 }
@@ -962,6 +968,19 @@ interface PlseConditionConstraint {
 interface PlseCondition {
   characteristic: string;
   constraints: PlseConditionConstraint[];
+}
+
+/**
+ * One rule of a planning function: its conditions and its parameter values.
+ *
+ * A function type that supports several rules repeats the whole set per rule, and the
+ * resource writes one `<condition>` block per rule. Reading only the first one — which is
+ * what a non-global regex does — drops every later rule silently, conditions and parameters
+ * alike, and the answer looks complete.
+ */
+interface PlseRule {
+  conditions: PlseCondition[];
+  parameters: PlseParameter[];
 }
 
 interface PlseInfo {
@@ -974,14 +993,15 @@ interface PlseInfo {
   infoArea: string;
   package: string;
   charUsages: PlseCharUsage[];
-  conditions: PlseCondition[];
-  parameters: PlseParameter[];
+  rules: PlseRule[];
 }
 
 function parseQryValue(block: string): PlseQryValue {
   return {
     type: block.match(/<qry:type>([^<]*)<\/qry:type>/)?.[1] ?? '',
-    value: block.match(/<qry:value>([\s\S]*?)<\/qry:value>/)?.[1] ?? '',
+    // Decoded: a value carries the characters of the model, and FOX source is a value here —
+    // an operator written `==>` came back as `==&gt;`, which is not the code that runs.
+    value: decodeXmlEntities(block.match(/<qry:value>([\s\S]*?)<\/qry:value>/)?.[1] ?? ''),
     variable: block.match(/<qry:variable>([^<]*)<\/qry:variable>/)?.[1] || undefined,
   };
 }
@@ -1017,14 +1037,69 @@ function findMatchingClose(xml: string, tagName: string, bodyStart: number): num
   return -1;
 }
 
+/** The `<constraint>` children of one characteristic, as conditions and data selections share them. */
+function parseConstraints(body: string): PlseConditionConstraint[] {
+  const constraints: PlseConditionConstraint[] = [];
+  const constrRe = /<constraint\b([^>]*?)(\/>|>([\s\S]*?)<\/constraint>)/g;
+  let cm: RegExpExecArray | null;
+  while ((cm = constrRe.exec(body)) !== null) {
+    const inner = cm[3] ?? '';
+    const fromBlock = inner.match(/<qry:fromValue>([\s\S]*?)<\/qry:fromValue>/)?.[1] ?? '';
+    const toBlock = inner.match(/<qry:toValue>([\s\S]*?)<\/qry:toValue>/)?.[1];
+    constraints.push({
+      selectionType: attr(cm[1], 'selectionType'),
+      operator: attr(cm[1], 'operator'),
+      exclude: attr(cm[1], 'exclude') === 'true',
+      from: parseQryValue(fromBlock),
+      to: toBlock ? parseQryValue(toBlock) : undefined,
+    });
+  }
+  return constraints;
+}
+
+/**
+ * The characteristic restrictions of one element, whether it is a function condition
+ * (`<fieldSelection>`) or the content of a data-selection parameter (`<FieldSelection>`
+ * inside `<fieldSelectionSet>` — same shape, different capitalisation in the schema).
+ */
+function parseFieldSelections(body: string, tag: 'fieldSelection' | 'FieldSelection'): PlseCondition[] {
+  const out: PlseCondition[] = [];
+  const re = new RegExp(`<${tag}\\b([^>]*)>([\\s\\S]*?)</${tag}>`, 'g');
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(body)) !== null) {
+    const charRaw = attr(m[1], 'characteristic');
+    const lastSlash = charRaw.lastIndexOf('/');
+    out.push({
+      characteristic: lastSlash >= 0 ? charRaw.slice(lastSlash + 1) : charRaw,
+      constraints: parseConstraints(m[2]),
+    });
+  }
+  return out;
+}
+
 // Parse <parameter> elements from xml, returning only top-level ones (nested handled by recursion).
 function parsePlseParameters(xml: string): PlseParameter[] {
   const params: PlseParameter[] = [];
-  const openRe = /<parameter\b([^>]*)>/g;
+  // The second alternative matches a self-closing tag. Without it such a tag was taken for an
+  // opening one, the search for its `</parameter>` ran into the *next* parameter's closing tag,
+  // and everything in between was skipped — a key figure selection written as `<parameter …/>`
+  // swallowed the whole from/to table that followed it.
+  const openRe = /<parameter\b([^>]*?)(\/>|>)/g;
   let match: RegExpExecArray | null;
 
   while ((match = openRe.exec(xml)) !== null) {
     const attrs = match[1];
+    const base = {
+      name: attr(attrs, 'name'),
+      parameterType: attr(attrs, 'parameterType'),
+      multiselection: attr(attrs, 'multiselection'),
+    };
+
+    if (match[2] === '/>') {
+      params.push({ ...base, children: [], selections: [], fieldSelections: [] });
+      continue;
+    }
+
     const bodyStart = match.index + match[0].length;
     const closeIdx = findMatchingClose(xml, 'parameter', bodyStart);
     if (closeIdx === -1) break;
@@ -1044,6 +1119,7 @@ function parsePlseParameters(xml: string): PlseParameter[] {
         selections.push({
           selectionType: attr(sm[1], 'selectionType'),
           operator: attr(sm[1], 'operator'),
+          exclude: attr(sm[1], 'exclude') === 'true',
           fromType: fromQry.type,
           fromValue: fromQry.value,
           toType: toQry?.type,
@@ -1053,11 +1129,15 @@ function parsePlseParameters(xml: string): PlseParameter[] {
     }
 
     params.push({
-      name: attr(attrs, 'name'),
-      parameterType: attr(attrs, 'parameterType'),
-      multiselection: attr(attrs, 'multiselection'),
+      ...base,
       children,
       selections,
+      // A data-selection parameter carries its restrictions in a fieldSelectionSet rather
+      // than in a selectionRange; without this the from/to selections of a copy or a
+      // distribution function came back empty. Only read where the parameter has no child
+      // parameters, as with selectionRange above: the body of a structure parameter contains
+      // its children, whose selections would otherwise be repeated on the parent.
+      fieldSelections: children.length === 0 ? parseFieldSelections(body, 'FieldSelection') : [],
     });
 
     // Advance past the closing tag so the outer loop skips nested parameters
@@ -1065,6 +1145,20 @@ function parsePlseParameters(xml: string): PlseParameter[] {
   }
 
   return params;
+}
+
+/** One characteristic value, with the variable spelled out where the value is a reference. */
+function formatQryValue(v: PlseQryValue): string {
+  return v.type === 'VariableCIN' ? `variable: ${v.value}` : `${v.type}: "${v.value}"`;
+}
+
+/**
+ * The operator of a constraint. `exclude` inverts it, and leaving it out prints a condition
+ * as its own opposite — an "everything but the unassigned value" restriction read as
+ * "exactly the unassigned value".
+ */
+function formatOperator(operator: string, selectionType: string, exclude: boolean): string {
+  return `[${exclude ? 'exclude ' : ''}${operator} | ${selectionType}]`;
 }
 
 function formatPlseParameters(params: PlseParameter[], indent: number): string[] {
@@ -1081,21 +1175,36 @@ function formatPlseParameters(params: PlseParameter[], indent: number): string[]
     }
 
     for (const s of p.selections) {
+      const op = formatOperator(s.operator, s.selectionType, s.exclude);
       if (s.fromValue.includes('\n')) {
-        lines.push(`${pad}  = [${s.operator}] ${s.fromType}:`);
+        lines.push(`${pad}  = ${op} ${s.fromType}:`);
         for (const codeLine of s.fromValue.split('\n')) {
           lines.push(`${pad}    | ${codeLine}`);
         }
       } else {
-        lines.push(`${pad}  = [${s.operator}] ${s.fromType}: "${s.fromValue}"`);
+        lines.push(`${pad}  = ${op} ${s.fromType}: "${s.fromValue}"`);
       }
       if (s.toValue !== undefined) {
         lines.push(`${pad}    to ${s.toType}: "${s.toValue}"`);
       }
     }
+
+    for (const fs of p.fieldSelections) {
+      lines.push(`${pad}  ${fs.characteristic}`);
+      for (const c of fs.constraints) {
+        let line = `${pad}    ${formatOperator(c.operator, c.selectionType, c.exclude)}  ${formatQryValue(c.from)}`;
+        if (c.to) line += `  to  ${formatQryValue(c.to)}`;
+        lines.push(line);
+      }
+    }
   }
 
   return lines;
+}
+
+/** Test seam: the parser is where the defects were, and it needs no system to exercise. */
+export function parsePlseXmlForTest(xml: string, status: string): PlseInfo {
+  return parsePlseXml(xml, status);
 }
 
 function parsePlseXml(xml: string, status: string): PlseInfo {
@@ -1142,37 +1251,14 @@ function parsePlseXml(xml: string, status: string): PlseInfo {
       : (xml.match(/adtcore:version="([^"]*)"/)?.[1] ?? 'unknown');
   }
 
-  const conditionBody = xml.match(/<condition>([\s\S]*?)<\/condition>/)?.[1] ?? '';
+  // Every <condition> block, not just the first: each one is a rule.
+  const rules: PlseRule[] = [...xml.matchAll(/<condition>([\s\S]*?)<\/condition>/g)].map((m) => ({
+    // <fieldSelection> siblings inside <condition> are the conditions of that rule.
+    conditions: parseFieldSelections(m[1], 'fieldSelection'),
+    parameters: parsePlseParameters(m[1]),
+  }));
 
-  // Parse <fieldSelection> siblings inside <condition> (function conditions)
-  const conditions: PlseCondition[] = [];
-  const fsRe = /<fieldSelection\b([^>]*)>([\s\S]*?)<\/fieldSelection>/g;
-  let fsm: RegExpExecArray | null;
-  while ((fsm = fsRe.exec(conditionBody)) !== null) {
-    const charRaw = attr(fsm[1], 'characteristic');
-    const lastSlash = charRaw.lastIndexOf('/');
-    const characteristic = lastSlash >= 0 ? charRaw.slice(lastSlash + 1) : charRaw;
-
-    const constraints: PlseConditionConstraint[] = [];
-    const constrRe = /<constraint\b([^>]*)>([\s\S]*?)<\/constraint>/g;
-    let cm: RegExpExecArray | null;
-    while ((cm = constrRe.exec(fsm[2])) !== null) {
-      const fromBlock = cm[2].match(/<qry:fromValue>([\s\S]*?)<\/qry:fromValue>/)?.[1] ?? '';
-      const toBlock = cm[2].match(/<qry:toValue>([\s\S]*?)<\/qry:toValue>/)?.[1];
-      constraints.push({
-        selectionType: attr(cm[1], 'selectionType'),
-        operator: attr(cm[1], 'operator'),
-        from: parseQryValue(fromBlock),
-        to: toBlock ? parseQryValue(toBlock) : undefined,
-      });
-    }
-
-    conditions.push({ characteristic, constraints });
-  }
-
-  const parameters = parsePlseParameters(conditionBody);
-
-  return { name, description, planningServiceType, alvl, documentation, status: resolvedStatus, infoArea, package: tlogoPkg, charUsages, conditions, parameters };
+  return { name, description, planningServiceType, alvl, documentation, status: resolvedStatus, infoArea, package: tlogoPkg, charUsages, rules };
 }
 
 export async function bwGetPlanningFunction(client: BwClient, funcName: string): Promise<string> {
@@ -1207,31 +1293,34 @@ export async function bwGetPlanningFunction(client: BwClient, funcName: string):
     }
   }
 
-  if (info.conditions.length > 0) {
-    lines.push('', `── Conditions (${info.conditions.length}) ──`);
-    for (const cond of info.conditions) {
-      lines.push(`  ${cond.characteristic}`);
-      for (const c of cond.constraints) {
-        const fromDesc = c.from.type === 'VariableCIN'
-          ? `variable: ${c.from.value}`
-          : `${c.from.type}: "${c.from.value}"`;
-        let constrLine = `    [${c.operator} | ${c.selectionType}]  ${fromDesc}`;
-        if (c.to) {
-          const toDesc = c.to.type === 'VariableCIN'
-            ? `variable: ${c.to.value}`
-            : `${c.to.type}: "${c.to.value}"`;
-          constrLine += `  to  ${toDesc}`;
+  const multiRule = info.rules.length > 1;
+  const conditionCount = info.rules.reduce((n, r) => n + r.conditions.length, 0);
+
+  if (conditionCount > 0) {
+    lines.push('', `── Conditions (${conditionCount}) ──`);
+    info.rules.forEach((rule, i) => {
+      if (multiRule) lines.push(`  Rule ${i + 1}`);
+      const pad = multiRule ? '    ' : '  ';
+      for (const cond of rule.conditions) {
+        lines.push(`${pad}${cond.characteristic}`);
+        for (const c of cond.constraints) {
+          let constrLine =
+            `${pad}  ${formatOperator(c.operator, c.selectionType, c.exclude)}  ${formatQryValue(c.from)}`;
+          if (c.to) constrLine += `  to  ${formatQryValue(c.to)}`;
+          lines.push(constrLine);
         }
-        lines.push(constrLine);
       }
-    }
+    });
   }
 
   lines.push('', `── Parameter Tree ──`);
-  if (info.parameters.length === 0) {
+  if (info.rules.every((r) => r.parameters.length === 0)) {
     lines.push('  (no parameters)');
   } else {
-    lines.push(...formatPlseParameters(info.parameters, 1));
+    info.rules.forEach((rule, i) => {
+      if (multiRule) lines.push(`  Rule ${i + 1}`);
+      lines.push(...formatPlseParameters(rule.parameters, multiRule ? 2 : 1));
+    });
   }
 
   lines.push('', `── Raw XML ──`, result.body);

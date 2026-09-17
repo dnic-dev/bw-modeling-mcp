@@ -196,7 +196,8 @@ Two role collections ship in `xs-security.json`:
 
 | Collection | Grants |
 |---|---|
-| **BW MCP Reader** | the read-only tools |
+| **BW MCP Reader** | everything that only reads, query data included |
+| **BW MCP Analyst** | reporting only — a 14-tool client for business users |
 | **BW MCP Developer** | all tools, including create/change/delete/activate |
 
 Assign a collection to each user — in the BTP Cockpit (**Security → Users → Role Collection

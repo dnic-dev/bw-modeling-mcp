@@ -115,6 +115,49 @@ function renderFormula(
   }
 }
 
+// ── Formula tree (round-trippable counterpart to the rendered string) ────────
+
+/**
+ * Convert a formula token into the same node syntax the write tools accept
+ * (`bw_create_ckf`, `bw_update_ckf`), so a formula can be read, edited and written
+ * back without parsing the rendered string.
+ *
+ * Component operands resolve to `{ type: "component", component_name }` via the
+ * embedded sub-components; an id that has no sub-component entry (an unusual but
+ * possible state) is passed through as `component_id` so the caller still sees it.
+ */
+function formulaToTree(
+  token: Record<string, unknown>,
+  ckfMap: Map<string, ComponentEntry>,
+  rkfMap: Map<string, ComponentEntry>,
+  depth = 0
+): Record<string, unknown> {
+  if (depth > 50) return { type: 'unknown', reason: 'max depth exceeded' };
+  const type = token['@_xsi:type'] as string | undefined;
+  switch (type) {
+    case 'Qry:FormulaInfixOperator':
+    case 'Qry:FormulaPrefixOperator':
+      return {
+        type: 'operator',
+        code: (token['@_code'] as string) ?? '',
+        operands: (ensureArray(token['Qry:childToken']) as Record<string, unknown>[]).map((c) =>
+          formulaToTree(c, ckfMap, rkfMap, depth + 1)
+        ),
+      };
+    case 'Qry:FormulaIObjectOperand':
+      return { type: 'key_figure', name: (token['@_infoObject'] as string) ?? '' };
+    case 'Qry:FormulaMemberOperand': {
+      const memberId = token['@_member'] as string;
+      const name = ckfMap.get(memberId)?.technicalName ?? rkfMap.get(memberId)?.technicalName;
+      return name ? { type: 'component', component_name: name } : { type: 'component', component_id: memberId };
+    }
+    case 'Qry:FormulaConstant':
+      return { type: 'constant', value: token['@_value'] ?? '' };
+    default:
+      return { type: 'unknown', xsi_type: type ?? '' };
+  }
+}
+
 // ── Metadata extraction (common to CKF, RKF, Structure) ─────────────────────
 
 function extractMetadata(
@@ -187,6 +230,7 @@ export async function bwGetCkf(client: BwClient, componentName: string): Promise
   const formulaDef = member?.['Qry:formulaDefinition'] as Record<string, unknown> | undefined;
   const formulaToken = formulaDef?.['Qry:formulaToken'] as Record<string, unknown> | undefined;
   const formula = formulaToken ? renderFormula(formulaToken, ckfMap, rkfMap, new Map()) : '';
+  const formulaTree = formulaToken ? formulaToTree(formulaToken, ckfMap, rkfMap) : null;
 
   const dependencies = buildDependencies(subComponents);
 
@@ -199,6 +243,7 @@ export async function bwGetCkf(client: BwClient, componentName: string): Promise
       component_type: 'CKF',
       ...extractMetadata(mainComp),
       formula,
+      formula_tree: formulaTree,
       dependency_count: dependencies.length,
       dependencies,
     },

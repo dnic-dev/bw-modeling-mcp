@@ -24,6 +24,10 @@ applications:
       BW_BTP_DESTINATION: "BW4_NLB"
       BW_CLIENT: "001"
       BW_LANGUAGE: "DE"
+      # Platform of the destination system, which decides which tools are offered:
+      # auto (default) detects BW/4HANA vs classic BW 7.5 from the system itself,
+      # classic forces the classic verdict, bw4 switches the filter off.
+      # BW_PLATFORM: "auto"
       # Per-user identity via Cloud Connector principal propagation. Requires CERTRULE
       # and ICM trust on the ABAP side — see docs/CLOUD-FOUNDRY.md §3.
       BW_PP_ENABLED: "true"

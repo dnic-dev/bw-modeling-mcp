@@ -10,6 +10,10 @@ classic providers — `bw_read_metadata_tables` reads the metadata tables instea
 readable but not writable (see [No REST resource — but reachable another way](#no-rest-resource--but-reachable-another-way)).
 What stays out of reach altogether is listed under [What is still unavailable](#what-is-still-unavailable).
 
+None of that is left to the client to know: the server detects the platform, adjusts its own tool
+surface, names the substitute route for every tool it hides, and translates the ICF error page — see
+[What the server does automatically on 7.5](#what-the-server-does-automatically-on-75).
+
 Verified end-to-end on a BW 7.5 system (SAP_BASIS 750).
 
 ---
@@ -232,6 +236,79 @@ resource version rejects a higher one with HTTP 415).
 
 ---
 
+## What the server does automatically on 7.5
+
+The tables in this document used to be something the *model* had to know. It did not: against
+a 7.5 system it called `bw_list_requests`, `bw_get_transformation` and
+`bw_list_process_chain_runs` first — their descriptions promise they work — collected an
+HTTP 404 from each, and only then found the way round. A note in the prompt does not compete
+with a tool list, so the server now acts on what it detects.
+
+**It detects the platform itself.** `bw.b4hanamode` from `repo/is/systeminfo` states it
+(`STRICT` is BW/4HANA, `STANDARD` a classic release), and the discovery document lists the
+collections the system publishes. Both are read once per process, before the first tool call.
+
+**`tools/list` only offers what this system can answer.** A tool that addresses a
+`/sap/bw/modeling` collection is offered exactly where that collection is published, so the
+system itself decides rather than a hardcoded release list. The `/sap/bw4/…` APIs and the
+monitoring OData services are not in the discovery document; those follow the platform
+verdict. On a 7.5 system 44 of the tools drop out — transformations, DTPs, process chains,
+transport operations, planning functions and sequences, query data, the data flow graph, the
+request monitor, push, process variants, and the two monitoring OData families. The planning
+reads among those now have a route through the metadata tables; the writes do not.
+`bw_system_profile` lists them with the reason. A tool that is called anyway — a client with
+a tool list cached from before, or from another instance — is answered with that same reason
+instead of a request to BW.
+
+**One route per backend, and the hidden tools name theirs.** The tools that drop out are not
+replaced by a hidden reroute: the REST API and the metadata tables are different backends —
+the second one is direct table access through ADT DataPreview — and keeping them in separate
+tools keeps that boundary where it can be governed. An installation that does not grant ADT
+simply does not offer `bw_read_metadata_tables`, and no tool quietly becomes a table read
+behind its own description. What the hidden tools do carry is the route: the server names the
+substitute call both in the message a stale client gets and in the instructions it sends at
+handshake time, generated from one table in `platform.ts`:
+
+| Question | On a classic release |
+|---|---|
+| Transformations (rules, routines) | `bw_read_metadata_tables`, `object_type="TRFN"` |
+| DTPs | `bw_read_metadata_tables`, `object_type="DTPA"` (filter selections and the semantic group stay unreadable) |
+| Process chains | `bw_read_metadata_tables`, `object_type="RSPC"` |
+| Load history of a provider | `bw_read_metadata_tables` on the provider — `ADSO`, `ODSO`, `CUBE` or `MPRO` |
+| Planning functions (type, parameters, FOX formula) | `bw_read_metadata_tables`, `object_type="PLSE"` |
+| Planning sequences (steps in execution order) | `bw_read_metadata_tables`, `object_type="PLSQ"` |
+| Planning properties and characteristic relationships of a provider | `bw_read_metadata_tables`, `object_type="PLCR"` (data slices: `"PLDS"`) |
+| Run history of a process chain | `bw_read_metadata_tables`, `object_type="RSPCLOG"` with the chain name |
+| The steps of one chain run | `bw_read_metadata_tables`, `object_type="RSPCLOG"` with the log id |
+| Last status of several chains | `bw_read_metadata_tables`, `object_type="RSPCLOG"` with a pattern such as `Z*` |
+| Data flow around an object | `bw_xref`, one hop at a time |
+
+`ADSO` was added to `bw_read_metadata_tables` for exactly that last-but-one row: aDSOs exist
+on 7.5, and their load history had no route at all before — the tool refused the type, and
+`bw_list_requests` needs the manage API. It returns the history only; structure and settings
+come from `bw_get_adso`, whose resource every release publishes. The section is read from
+`RSSTATMANPART`, which is the classic request store and says so in the output: on BW/4HANA
+that table is empty by design, requests live in `RSPMREQUEST` there.
+
+Extending this is one line per tool: teach `bw_read_metadata_tables` the object type, add the
+substitute entry, remove the tool's entry from the catalog if it should become visible again.
+Nothing else needs touching — the instructions text follows the table.
+
+**An ICF error page never reaches the chat.** A 404 whose body is the HTML "Logon Error
+Message" page is replaced by the sentence it means, naming the path and the route that works
+instead. ADT exception documents are passed through unchanged, because callers parse them.
+
+**`BW_PLATFORM` overrides the verdict** (`auto` by default):
+
+| Value | Effect |
+|---|---|
+| `auto` | detect; if detection fails, offer the full surface and log a warning |
+| `classic` | force the classic verdict, even when detection failed — the setting for a 7.5 system the server cannot reach for detection |
+| `bw4` | switch the platform filter off entirely — the escape hatch if a tool is hidden that does work on your system |
+
+Detection never fails closed: a system that cannot be identified gets the full tool surface,
+because an empty server would be the worse failure.
+
 ## No REST resource — but reachable another way
 
 For these the endpoint is missing, yet the object can still be read, because
@@ -244,17 +321,22 @@ and it needs ADT authorization for the calling user.
 | DTPs | `dtpa` | `bw_read_metadata_tables` `DTPA` — path, resolved transformation, extraction mode and error handling. Filter selections and the semantic group are not readable: they live in a serialised ABAP object, not in relational columns |
 | Process chains | `rspc` | `bw_read_metadata_tables` `RSPC` — steps with their variant parameters and dependencies, in execution order. Note that `bw_search` by this object type still dumps server-side |
 | Classic DSO, InfoCube, MultiProvider | `odso` and friends | `bw_read_metadata_tables` `ODSO` / `CUBE` / `MPRO` — key and data fields, dimensions, part providers |
-| Load status of a cube or DSO | `/sap/bw4/*` | `bw_read_metadata_tables` on the provider — the Load History section reads `RSSTATMANPART`, enriched from `RSBKREQUEST`: request, status, update mode, start, user, duration, records and source |
+| Load status of an aDSO, cube or DSO | `/sap/bw4/*` | `bw_read_metadata_tables` on the provider — the Load History section reads `RSSTATMANPART`, enriched from `RSBKREQUEST`: request, status, update mode, start, user, duration, records and source |
 | Data flow graph | `dmod` | `bw_xref` on the object — the same edges, one object at a time instead of a graph |
+| Planning functions | `plse` | `bw_read_metadata_tables` `PLSE` — function type and its exit class, aggregation level, characteristic usage, conditions, and the parameter tree with its selections. Variable references are resolved to their names; a FOX formula comes back as source code rather than as one table row per line |
+| Planning sequences | `plsq` | `bw_read_metadata_tables` `PLSQ` — steps in execution order with aggregation level, function and filter. A sequence has no parallel branches, so `STEPID` order *is* the execution order |
+| Planning properties, characteristic relationships | `plcr` | `bw_read_metadata_tables` `PLCR` — key date, max combinations, save strategy, and one entry per relationship with its type, the characteristics involved and the validity range. Keyed by the **InfoProvider**, not by the aggregation level |
+| Process chain runs | the `RV_C_PCM*` OData services | `bw_read_metadata_tables` `RSPCLOG` — run history from `RSPCLOGCHAIN`, steps from `RSPCPROCESSLOG` with status, start, duration and process variant. The message log of a step is an application log (BAL) and is not readable through table access |
+| Analysis process (APD) | none on any release | `bw_read_metadata_tables` `ANPR` — the whole definition is one XML document in `RSANT_PROCESS.XML`: nodes with the object each reads or writes, the edges from its `<MAPPINGS>` block, filters, formulas and routine ABAP. BW/4HANA does not have the object type at all |
+| Data slices | none on any release | `bw_read_metadata_tables` `PLDS` — type, exit class and selection per slice. No release publishes a REST resource for these, so this is the only route on any platform |
 
 ## What is still unavailable
 
 | Area | Endpoint | Note |
 |---|---|---|
-| Planning functions and sequences | `plcr`, `plsq`, `plse` | only `alvl` is available |
 | Transport operations | `cto/*` | not published by discovery |
 | Query **data** | `comp/reporting` | the collection is published, but the handler answers "Reporting resource not implemented" — query *definitions* read fine |
-| Request monitor, process variants, push | `/sap/bw4/*` | the BW/4HANA manage API does not exist on 7.5; only the load history above is available |
+| Request monitor, process variants, push | `/sap/bw4/*` | the BW/4HANA manage API does not exist on 7.5; only the load history and the chain runs above are available |
 
 This is systematic rather than accidental: the BW Modeling Tools for 7.5 never supported editing
 transformations, DTPs or process chains — those capabilities arrived with BW/4HANA. Opening such an

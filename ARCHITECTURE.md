@@ -33,7 +33,7 @@ The token is fetched once at startup and reused for all subsequent write operati
 
 **Important:** Lock and write operations on the same object must use separate `BwClient` instances (separate `sap-contextid` session cookies). SAP's internal buffer caches object state per session — reusing the same session for both Lock and PUT causes null pointer crashes in the ABAP backend (`CL_RSTRAN_TRFN=>GET_PROGID`). This is not documented in the API — discovered via ABAP debugging.
 
-**Central hosting (SAP BTP Cloud Foundry):** The HTTP transport (`src/http.ts`) puts XSUAA OAuth in front and a BTP destination behind. XSUAA authenticates each caller and carries the `read` / `write` scopes (`src/scopes.ts`, which also filters `tools/list` per role). The destination (`src/destination.ts`) decides the BW identity: with `BasicAuthentication` all callers share one technical user; with `PrincipalPropagation` each caller reaches BW as themselves via a short-lived X.509 certificate issued by the Cloud Connector and mapped to an ABAP user by CERTRULE. The server is stateless — a fresh `BwClient` per request, held in an `AsyncLocalStorage` (`src/request-context.ts`) so concurrent users never share a session. stdio (`src/stdio.ts`) is unaffected: one process, one user, no auth. Setup: `docs/CENTRAL-HOSTING-SETUP.md` and `docs/CLOUD-FOUNDRY.md`.
+**Central hosting (SAP BTP Cloud Foundry):** The HTTP transport (`src/http.ts`) puts XSUAA OAuth in front and a BTP destination behind. XSUAA authenticates each caller and carries the `read` / `analyst` / `write` scopes (`src/scopes.ts`, which also filters `tools/list` per role). `analyst` is a strict subset of `read`: it exists to hand a business user a fourteen-tool client rather than a hundred-tool one, not to narrow anyone's permissions, so adding it took nothing away from a reader. A tool therefore carries the *set* of scopes that admit it rather than one required scope, and `write` admits everything. A second, independent filter decides what the *system* can answer rather than what the caller may invoke (`src/platform.ts`): the platform is detected once per process from `bw.b4hanamode` and the discovery document, and a tool is offered only where the resource behind it exists. `BW_PLATFORM` overrides the verdict; see `docs/BW75-SUPPORT.md`. The destination (`src/destination.ts`) decides the BW identity: with `BasicAuthentication` all callers share one technical user; with `PrincipalPropagation` each caller reaches BW as themselves via a short-lived X.509 certificate issued by the Cloud Connector and mapped to an ABAP user by CERTRULE. The server is stateless — a fresh `BwClient` per request, held in an `AsyncLocalStorage` (`src/request-context.ts`) so concurrent users never share a session. stdio (`src/stdio.ts`) is unaffected: one process, one user, no auth. Setup: `docs/CENTRAL-HOSTING-SETUP.md` and `docs/CLOUD-FOUNDRY.md`.
 
 Everything that talks to BW goes through `BwClient`, including the `raw*` helpers and the Push API. The proxy transport and the `Proxy-Authorization` header (plus an optional `SAP-Connectivity-SCC-Location_ID`) are attached by the client's interceptor, so any call path that builds its own `axios` instance silently loses them and tries to resolve the virtual destination host itself.
 
@@ -116,6 +116,7 @@ src/
 ├── destination.ts        # builds a BwClient from a BTP destination (PrincipalPropagation or BasicAuthentication)
 ├── request-context.ts    # AsyncLocalStorage holding the per-request BW client under principal propagation
 ├── scopes.ts             # read/write scope classification and tools/list filtering for XSUAA role-based access
+├── platform.ts           # BW/4HANA vs classic BW detection and the platform half of the tools/list filter
 ├── bw-client.ts          # HTTP client (CSRF, session, lock/unlock, GET/PUT/POST/rawGet/rawPost/rawPut)
 └── tools/
     ├── activation.ts     # bw_activate, bw_unlock
@@ -136,11 +137,25 @@ src/
     ├── infoarea.ts       # bw_get_infoarea, bw_create_infoarea, bw_move_object
     ├── infoobject.ts     # bw_get_infoobject, bw_create_infoobject, bw_update_infoobject
     ├── infosource.ts     # bw_get_infosource, bw_create_infosource, bw_update_infosource
-    ├── metadata_tables.ts # bw_read_metadata_tables — reads TRFN, DTPA, the classic providers
-    │                     # (ODSO, CUBE, MPRO) from their metadata tables via ADT DataPreview
-    │                     # and RSPC, for systems that publish no REST resource for them; a cube
-    │                     # or DSO also reports its load history (RSSTATMANPART + RSBKREQUEST),
-    │                     # a chain its steps and dependencies resolved into execution order
+    ├── metadata_apd.ts   # the ANPR reader behind bw_read_metadata_tables: the analysis
+    │                     # process XML in RSANT_PROCESS, parsed into nodes and edges and
+    │                     # sorted into execution order; node-type catalogue by XML tag
+    ├── metadata_chainlog.ts # the RSPCLOG reader behind bw_read_metadata_tables: run
+    │                     # history (RSPCLOGCHAIN), the steps of one run (RSPCPROCESSLOG)
+    │                     # and the last status per chain for a name pattern
+    ├── metadata_planning.ts # the planning readers behind bw_read_metadata_tables: PLSE
+    │                     # (RSPLF_SRV* — function type, exit class, characteristic usage,
+    │                     # conditions, parameter tree built from the type's declaration),
+    │                     # PLSQ (RSPLS_SEQUENCE*), PLCR (RSPLS_CR_*) and PLDS (RSPLS_DS_*,
+    │                     # the only route to data slices on any platform)
+    ├── metadata_sql.ts   # ADT DataPreview access shared by the metadata readers: statement
+    │                     # execution with CSRF and connection retry, row parsing, IN-list
+    │                     # batching, timestamp formatting
+    ├── metadata_tables.ts # bw_read_metadata_tables — the dispatcher, and the readers for TRFN,
+    │                     # DTPA, the classic providers (ODSO, CUBE, MPRO) and RSPC, for systems
+    │                     # that publish no REST resource for them; a cube or DSO also reports
+    │                     # its load history (RSSTATMANPART + RSBKREQUEST), a chain its steps
+    │                     # and dependencies resolved into execution order
     ├── openhub.ts        # bw_get_open_hub
     ├── planning.ts       # bw_get_aggregation_level, bw_create_aggregation_level,
     │                     # bw_update_aggregation_level, bw_get_planning_properties,

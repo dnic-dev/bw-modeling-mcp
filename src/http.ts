@@ -19,6 +19,7 @@ import type { AuthInfo } from '@modelcontextprotocol/sdk/server/auth/types.js';
 import { setupHttpAuth, loadXsuaaCredentials, resolveAppUrl } from '@arc-mcp/xsuaa-auth';
 import { createConnectivityProxy, parseVCAPServices } from '@arc-mcp/xsuaa-auth/btp';
 import { createServer } from './index.js';
+import { ensurePlatform } from './platform.js';
 import { runWithClient } from './request-context.js';
 import {
   createPrincipalPropagationClient,
@@ -85,7 +86,7 @@ async function main(): Promise<void> {
         // with `scope.split is not a function` (fixed upstream in vscode#325344, but
         // the Eclipse Language Server lags behind). Also narrows the verifier's
         // accepted scopes from the arc-1 default set to the two this server defines.
-        scopesSupported: ['read', 'write'],
+        scopesSupported: ['read', 'analyst', 'write'],
         requiredScopes: ['read'],
       },
       allowedOrigins: process.env.BW_ALLOWED_ORIGINS?.split(',').map((s) => s.trim()).filter(Boolean),
@@ -119,6 +120,11 @@ async function main(): Promise<void> {
       });
       return;
     }
+
+    // Detect the platform before the server is built: createServer() puts the platform
+    // paragraph into the instructions from the cached verdict and cannot await anything
+    // itself. Cached process-wide after the first request, and it never rejects.
+    await ensurePlatform(client);
 
     // Stateless: a fresh Server and transport per request. The SDK binds a Server to one
     // transport for its lifetime, so a shared instance fails after the first call. Per

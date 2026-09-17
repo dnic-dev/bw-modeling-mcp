@@ -26,6 +26,21 @@ export function escapeXml(s: string): string {
     .replace(/"/g, '&quot;');
 }
 
+/**
+ * Reverse escapeXml for an attribute value read back out of the document. Member
+ * matchers compare caller input against these values, and the caller writes plain
+ * text — without this, any description containing & < > or " is unmatchable, while
+ * bw_get_query reports the decoded value, so the value shown would not be the
+ * value that matches.
+ */
+export function unescapeXml(s: string): string {
+  return s
+    .replace(/&lt;/g, '<')
+    .replace(/&gt;/g, '>')
+    .replace(/&quot;/g, '"')
+    .replace(/&amp;/g, '&');
+}
+
 /** Escape a string for literal use inside a RegExp. */
 export function escapeRegex(s: string): string {
   return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
@@ -37,7 +52,7 @@ export function escapeRegex(s: string): string {
  * description without the flag as an auto-generated default and drops it). Text
  * that merely defaults to the technical name keeps the plain form.
  */
-function descriptionEl(descEsc: string, custom: boolean): string {
+export function descriptionEl(descEsc: string, custom: boolean): string {
   const def = custom ? 'default="false" ' : '';
   return `<Qry:description ${def}shortValue="${descEsc}" value="${descEsc}"/>`;
 }
@@ -79,7 +94,7 @@ function parseCheckResult(body: string): string[] {
  * per inserted element within one mutation (each insert is scanned by the next
  * allocation).
  */
-function allocateVirtualId(doc: string): string {
+export function allocateVirtualId(doc: string): string {
   let max = 0;
   const re = /!VIRTUAL-(\d+)/g;
   let m: RegExpExecArray | null;
@@ -278,32 +293,52 @@ function mainComponentHasFirstCustomDimension(doc: string): boolean {
 }
 
 /**
- * Locate the key figure structure (CustomDimension on 1KYFNM) in rows or columns,
- * scoped to the mainComponent region. These containers never nest, so a lazy
- * match to the matching close tag captures exactly one element.
+ * True when a structure element holds key figures: its members either select on
+ * 1KYFNM or are local formulas. This is what identifies the key figure structure
+ * when the open tag does not say so — see findKeyFigureStructure.
  */
-function findKeyFigureStructure(
+function structureHoldsKeyFigures(element: string): boolean {
+  return /<Qry:groups\b[^>]*\binfoObject="1KYFNM"/.test(element) || element.includes('xsi:type="Qry:MemberFormula"');
+}
+
+/**
+ * Locate the key figure structure in rows or columns, scoped to the mainComponent
+ * region. These containers never nest, so a lazy match to the matching close tag
+ * captures exactly one element.
+ *
+ * The open tag carries infoObjectName="1KYFNM" only for a structure built in the
+ * BW modeling tools. A structure this tool creates is written with 1KYFNM but
+ * comes back from the server normalized to the generic 1STRUC, so matching on the
+ * attribute alone stops recognizing the structure right after it was created —
+ * every later member operation on it then fails with "query has no key figure
+ * structure". A structure whose members hold key figures therefore counts too,
+ * with the explicitly marked one taking precedence: a query may carry both a
+ * characteristic structure and a key figure structure, and only the members
+ * decide which is which.
+ */
+export function findKeyFigureStructure(
   doc: string
 ): { container: string; id: string | undefined; element: string; start: number; end: number } | null {
   const region = locateMainComponentRegion(doc, 'key figure structure lookup');
   const sub = doc.slice(region.start, region.end);
   const re = /<Qry:(rows|columns)\b[^>]*?(\/>|>[\s\S]*?<\/Qry:\1>)/g;
   let m: RegExpExecArray | null;
+  let fallback: { container: string; id: string | undefined; element: string; start: number; end: number } | null = null;
   while ((m = re.exec(sub)) !== null) {
     const full = m[0];
     const openTag = full.match(/^<Qry:(?:rows|columns)\b[^>]*?(?:\/?>)/)?.[0] ?? full;
-    if (openTag.includes('xsi:type="Qry:CustomDimension"') && openTag.includes('infoObjectName="1KYFNM"')) {
-      const id = openTag.match(/\bid="([^"]+)"/)?.[1];
-      return {
-        container: m[1],
-        id,
-        element: full,
-        start: region.start + m.index,
-        end: region.start + m.index + full.length,
-      };
-    }
+    if (!openTag.includes('xsi:type="Qry:CustomDimension"')) continue;
+    const hit = {
+      container: m[1],
+      id: openTag.match(/\bid="([^"]+)"/)?.[1],
+      element: full,
+      start: region.start + m.index,
+      end: region.start + m.index + full.length,
+    };
+    if (openTag.includes('infoObjectName="1KYFNM"')) return hit;
+    if (!fallback && structureHoldsKeyFigures(full)) fallback = hit;
   }
-  return null;
+  return fallback;
 }
 
 /**
@@ -1051,6 +1086,22 @@ export interface MemberProperties {
   exception_aggregation?: ExceptionAggregation | false;
   /** New description text (written with default="false"). */
   description?: string;
+  /**
+   * Input readiness — the property that makes a member writable in a planning
+   * query. "inputReady" turns input on, "not" turns it explicitly off, false
+   * restores the server default (also not input-ready). The lock flag is not
+   * settable and must not be: the backend derives it from this setting.
+   */
+  input_mode?: 'inputReady' | 'not' | false;
+  /** Disaggregation of an entered value, or false to restore the default. */
+  disaggregation?: 'copy' | 'no' | 'absolute' | false;
+  /**
+   * Reference member for disaggregation "absolute", by member id or description.
+   * Resolved against the document in the same save batch, like formula operands.
+   */
+  disaggregation_reference?: string;
+  /** Constant selection on the member itself (not on its individual restrictions). */
+  constant_selection?: boolean;
 }
 
 /** Recursive formula node; validated structurally at render time. */
@@ -1072,8 +1123,30 @@ export interface KeyFigureOperation {
   formula?: FormulaNode;
   /** Exception aggregation for the member (add_* actions). */
   exception_aggregation?: ExceptionAggregation | false;
-  /** Member display properties (add_formula and set_member_properties). */
+  /** Member display and planning properties (all add actions and set_member_properties). */
   properties?: MemberProperties;
+  /**
+   * Nest the member under this one, by member id or description. On an add action
+   * the new member is created as a child; on set_member_properties an existing
+   * member is moved there. Empty string moves a member back to the top level.
+   */
+  parent?: string;
+  /** Position among the siblings (0-based). Appends when omitted. */
+  position?: number;
+  /** Inverse formula, on add_formula and set_member_properties. */
+  inverse?: InverseFormula;
+}
+
+export interface InverseFormula {
+  /** Member an entered value is written back to, by member id or description. */
+  target: string;
+  /**
+   * How the written-back value is derived. Defaults to a reference to the formula
+   * member itself, which is the form the modeling tools produce.
+   */
+  formula?: FormulaNode;
+  /** Description of the inverse formula member; a generic one is used when omitted. */
+  description?: string;
 }
 
 export interface UpdateQueryKeyFiguresArgs {
@@ -1084,7 +1157,7 @@ export interface UpdateQueryKeyFiguresArgs {
 }
 
 /** Build the additional restriction groups (one per characteristic) for a member. */
-function buildRestrictionGroups(restrictions: KeyFigureRestriction[] | undefined): string {
+export function buildRestrictionGroups(restrictions: KeyFigureRestriction[] | undefined): string {
   if (!restrictions || restrictions.length === 0) return '';
   return restrictions
     .map((r) => {
@@ -1147,25 +1220,165 @@ function excAggEl(ea: ExceptionAggregation | false | undefined): string {
 }
 
 /**
- * Replace the child element <Qry:{tag}...> inside a member with newXml, or insert
- * newXml before the member's content section if the element is absent. Operates on
- * the first occurrence, which for a well-formed member is the top-level element
- * (display defaults precede any childMembers).
+ * Order of the settings elements inside a structure member, as the server writes
+ * them. A newly inserted element is placed before the first element that must
+ * follow it, so that a member assembled here keeps the document order the server
+ * produces. exceptionAggregation is kept last of the settings, which is where the
+ * insert landed before this order existed.
  */
-function setMemberChildElement(memberXml: string, tag: string, newXml: string): string {
-  const re = new RegExp(`<Qry:${tag}\\b[^>]*?(\\/>|>[\\s\\S]*?<\\/Qry:${tag}>)`);
-  if (re.test(memberXml)) {
-    return memberXml.replace(re, newXml);
+const MEMBER_ELEMENT_ORDER = [
+  'defaultHint',
+  'description',
+  'calculation',
+  'emphasize',
+  'nodeExpanded',
+  'signInversion',
+  'hidden',
+  'scaling',
+  'decimals',
+  'planning',
+  'currencyConversion',
+  'unitConversion',
+  'exceptionAggregation',
+  'formulaDefinition',
+  'groups',
+];
+
+/** Markers at which a member's own content ends and its nested children begin. */
+const MEMBER_CONTENT_END_MARKERS = [
+  '<Qry:childFormulas',
+  '<Qry:childMembers',
+  '</Qry:members>',
+  '</Qry:childMembers>',
+  '</Qry:childFormulas>',
+];
+
+/**
+ * Offset where the member's own content ends. Everything from here on belongs to
+ * nested child members or inverse formulas, which carry settings elements of the
+ * same names — a search that runs past this point edits the child instead.
+ */
+function memberOwnContentEnd(memberXml: string): number {
+  // Search past the member's own opening tag: a child member's element name is
+  // itself one of the markers, so searching from zero would report it as empty.
+  const from = memberXml.indexOf('>') + 1;
+  let end = memberXml.length;
+  for (const marker of MEMBER_CONTENT_END_MARKERS) {
+    const idx = memberXml.indexOf(marker, from);
+    if (idx >= 0 && idx < end) end = idx;
   }
-  for (const marker of ['<Qry:formulaDefinition', '<Qry:groups', '<Qry:childMembers', '</Qry:members>']) {
-    const idx = memberXml.indexOf(marker);
-    if (idx >= 0) return memberXml.slice(0, idx) + newXml + '\n  ' + memberXml.slice(idx);
+  return end;
+}
+
+/**
+ * Replace the child element <Qry:{tag}...> inside a member with newXml, or insert
+ * newXml in document order if the element is absent. Scoped to the member's own
+ * content so a nested child member's element of the same name is never touched.
+ */
+export function setMemberChildElement(memberXml: string, tag: string, newXml: string): string {
+  const own = memberXml.slice(0, memberOwnContentEnd(memberXml));
+  const re = new RegExp(`<Qry:${tag}\\b[^>]*?(\\/>|>[\\s\\S]*?<\\/Qry:${tag}>)`);
+  const existing = re.exec(own);
+  if (existing) {
+    return memberXml.slice(0, existing.index) + newXml + memberXml.slice(existing.index + existing[0].length);
+  }
+  const orderIdx = MEMBER_ELEMENT_ORDER.indexOf(tag);
+  if (orderIdx >= 0) {
+    for (const later of MEMBER_ELEMENT_ORDER.slice(orderIdx + 1)) {
+      const idx = own.indexOf(`<Qry:${later}`);
+      if (idx >= 0) return memberXml.slice(0, idx) + newXml + '\n  ' + memberXml.slice(idx);
+    }
+  }
+  const insertAt = memberOwnContentEnd(memberXml);
+  if (insertAt < memberXml.length) {
+    return memberXml.slice(0, insertAt) + newXml + '\n  ' + memberXml.slice(insertAt);
   }
   return memberXml;
 }
 
+const INPUT_MODES = ['inputReady', 'not'];
+const DISAGGREGATIONS = ['copy', 'no', 'absolute'];
+
+/**
+ * Resolve a single reference that may be given as either a member id or a member
+ * description, and return the member id. resolveOneMember treats member_id as
+ * exclusive — passing the same string as both matchers would only ever match an
+ * id — so the two readings are tried in turn, with the description error surfacing
+ * because that is the form callers normally use.
+ */
+function resolveMemberByRef(doc: string, ref: string, context: string): { member: MatchedMember; cdStart: number } {
+  try {
+    return resolveOneMember(doc, { member_id: ref }, context);
+  } catch {
+    return resolveOneMember(doc, { description: ref }, context);
+  }
+}
+
+function resolveMemberReference(doc: string, ref: string, context: string): string {
+  return resolveMemberByRef(doc, ref, context).member.id;
+}
+
+/**
+ * Build the Qry:planning block for a member. The block holds input readiness and
+ * disaggregation together, so the setting that is not being changed is carried
+ * over from the member's current block rather than reset to its default.
+ */
+export function planningEl(memberXml: string, props: MemberProperties, doc: string): string {
+  const own = memberXml.slice(0, memberOwnContentEnd(memberXml));
+  const current = own.match(/<Qry:planning\b[^>]*?(\/>|>[\s\S]*?<\/Qry:planning>)/)?.[0] ?? '';
+  let inputModeXml = current.match(/<Qry:inputMode\b[^>]*\/>/)?.[0] ?? '<Qry:inputMode default="true"/>';
+  let disaggXml = current.match(/<Qry:disaggregation\b[^>]*\/>/)?.[0] ?? '<Qry:disaggregation default="true"/>';
+
+  if (props.input_mode !== undefined) {
+    if (props.input_mode === false) {
+      inputModeXml = '<Qry:inputMode default="true"/>';
+    } else if (INPUT_MODES.includes(props.input_mode)) {
+      inputModeXml = `<Qry:inputMode default="false" type="${props.input_mode}"/>`;
+    } else {
+      throw new Error(`input_mode must be one of ${INPUT_MODES.join(', ')}, or false.`);
+    }
+  }
+
+  if (props.disaggregation !== undefined) {
+    if (props.disaggregation === false) {
+      disaggXml = '<Qry:disaggregation default="true"/>';
+    } else if (DISAGGREGATIONS.includes(props.disaggregation)) {
+      let refAttr = '';
+      if (props.disaggregation_reference !== undefined) {
+        if (props.disaggregation !== 'absolute') {
+          throw new Error('disaggregation_reference is only meaningful with disaggregation "absolute".');
+        }
+        refAttr = ` reference="${resolveMemberReference(doc, props.disaggregation_reference, 'disaggregation_reference')}"`;
+      }
+      disaggXml = `<Qry:disaggregation default="false" type="${props.disaggregation}"${refAttr}/>`;
+    } else {
+      throw new Error(`disaggregation must be one of ${DISAGGREGATIONS.join(', ')}, or false.`);
+    }
+  } else if (props.disaggregation_reference !== undefined) {
+    throw new Error('disaggregation_reference requires disaggregation to be set as well.');
+  }
+
+  return `<Qry:planning>${inputModeXml}${disaggXml}</Qry:planning>`;
+}
+
+/**
+ * Set an attribute on the member's own opening tag, replacing it in place or
+ * appending it when absent. Scoped to the opening tag so a nested child member's
+ * attribute of the same name is never touched.
+ */
+function setMemberAttribute(memberXml: string, name: string, value: string): string {
+  const openTagEnd = memberXml.indexOf('>');
+  if (openTagEnd < 0) return memberXml;
+  const openTag = memberXml.slice(0, openTagEnd);
+  const attrRe = new RegExp(`\\s${escapeRegex(name)}="[^"]*"`);
+  const updated = attrRe.test(openTag)
+    ? openTag.replace(attrRe, ` ${name}="${value}"`)
+    : `${openTag} ${name}="${value}"`;
+  return updated + memberXml.slice(openTagEnd);
+}
+
 /** Apply a MemberProperties object to a member XML string (each field replaces its element). */
-function applyMemberProperties(memberXml: string, props: MemberProperties): string {
+export function applyMemberProperties(memberXml: string, props: MemberProperties, doc: string): string {
   let out = memberXml;
   if (props.decimals !== undefined) {
     if (!Number.isInteger(props.decimals) || props.decimals < 0 || props.decimals > 9) {
@@ -1191,6 +1404,16 @@ function applyMemberProperties(memberXml: string, props: MemberProperties): stri
   if (props.description !== undefined) {
     out = setMemberChildElement(out, 'description', descriptionEl(escapeXml(props.description), true));
   }
+  if (
+    props.input_mode !== undefined ||
+    props.disaggregation !== undefined ||
+    props.disaggregation_reference !== undefined
+  ) {
+    out = setMemberChildElement(out, 'planning', planningEl(out, props, doc));
+  }
+  if (props.constant_selection !== undefined) {
+    out = setMemberAttribute(out, 'constSelection', props.constant_selection ? 'true' : 'false');
+  }
   return out;
 }
 
@@ -1200,35 +1423,93 @@ interface MatchedMember {
   start: number;
   end: number;
   full: string;
+  /** Element name the member is carried by: a top-level member, a child, or an inverse formula. */
+  tag: 'members' | 'childMembers' | 'childFormulas';
+  /** Id of the member this one is nested under; undefined at the top level. */
+  parentId?: string;
 }
 
 /**
- * Find top-level structure members (MemberSelection or MemberFormula) matching the
- * given criteria. member_id takes precedence; otherwise description and/or the
- * CINLink component id must match. Operates on the CustomDimension element string.
+ * Find the member elements directly contained in a structure or member element,
+ * without descending into their own children. Member elements nest (a member's
+ * children are childMembers, whose children are childMembers again), so the depth
+ * is counted rather than matched lazily: a lazy regex would end a parent at the
+ * first close tag of its first grandchild.
+ */
+function findDirectMemberElements(
+  xml: string
+): { tag: MatchedMember['tag']; start: number; end: number; full: string }[] {
+  const out: { tag: MatchedMember['tag']; start: number; end: number; full: string }[] = [];
+  const re = /<(\/?)Qry:(members|childMembers|childFormulas)\b([^>]*?)(\/?)>/g;
+  let depth = 0;
+  let startIdx = -1;
+  let startTag: MatchedMember['tag'] = 'members';
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(xml)) !== null) {
+    const tag = m[2] as MatchedMember['tag'];
+    if (m[1] === '/') {
+      depth--;
+      if (depth === 0 && startIdx >= 0) {
+        const end = m.index + m[0].length;
+        out.push({ tag: startTag, start: startIdx, end, full: xml.slice(startIdx, end) });
+        startIdx = -1;
+      }
+    } else if (m[4] === '/') {
+      if (depth === 0) out.push({ tag, start: m.index, end: m.index + m[0].length, full: m[0] });
+    } else {
+      if (depth === 0) {
+        startIdx = m.index;
+        startTag = tag;
+      }
+      depth++;
+    }
+  }
+  return out;
+}
+
+/** Read a member's own id and description, ignoring those of its nested children. */
+function memberIdentity(full: string): { id: string; description: string } {
+  const own = full.slice(0, memberOwnContentEnd(full));
+  return {
+    id: full.match(/^<Qry:(?:members|childMembers|childFormulas)\b[^>]*?\bid="([^"]+)"/)?.[1] ?? '',
+    description: unescapeXml(own.match(/<Qry:description\b[^>]*\bvalue="([^"]*)"/)?.[1] ?? ''),
+  };
+}
+
+/**
+ * Collect every member in a structure, at any depth, with offsets relative to the
+ * element the walk started from. Children are reachable as targets in their own
+ * right — a member nested under a formula must be addressable to be given
+ * properties, to be referenced, or to be removed.
+ */
+export function walkMembers(xml: string, base = 0, parentId?: string): MatchedMember[] {
+  const out: MatchedMember[] = [];
+  for (const el of findDirectMemberElements(xml)) {
+    const { id, description } = memberIdentity(el.full);
+    out.push({ id, description, start: base + el.start, end: base + el.end, full: el.full, tag: el.tag, parentId });
+    if (el.full.endsWith('/>')) continue;
+    const innerStart = el.full.indexOf('>') + 1;
+    const innerEnd = el.full.length - `</Qry:${el.tag}>`.length;
+    out.push(...walkMembers(el.full.slice(innerStart, innerEnd), base + el.start + innerStart, id));
+  }
+  return out;
+}
+
+/**
+ * Find structure members matching the given criteria, at any depth. member_id
+ * takes precedence; otherwise description and/or the CINLink component id must
+ * match. Operates on the CustomDimension element string.
  */
 function findStructureMembers(
   cdElement: string,
   matcher: { member_id?: string; description?: string; componentId?: string }
 ): MatchedMember[] {
-  const memberRe = /<Qry:members\b[^>]*?(\/>|>[\s\S]*?<\/Qry:members>)/g;
-  const matches: MatchedMember[] = [];
-  let mm: RegExpExecArray | null;
-  while ((mm = memberRe.exec(cdElement)) !== null) {
-    const full = mm[0];
-    const id = full.match(/^<Qry:members\b[^>]*?\bid="([^"]+)"/)?.[1] ?? '';
-    const dv = full.match(/<Qry:description\b[^>]*\bvalue="([^"]*)"/)?.[1] ?? '';
-    let ok: boolean;
-    if (matcher.member_id !== undefined) {
-      ok = id === matcher.member_id;
-    } else {
-      ok = true;
-      if (matcher.description !== undefined && dv !== matcher.description) ok = false;
-      if (matcher.componentId !== undefined && cinLinkValue(full) !== matcher.componentId) ok = false;
-    }
-    if (ok) matches.push({ id, description: dv, start: mm.index, end: mm.index + full.length, full });
-  }
-  return matches;
+  return walkMembers(cdElement).filter((member) => {
+    if (matcher.member_id !== undefined) return member.id === matcher.member_id;
+    if (matcher.description !== undefined && member.description !== matcher.description) return false;
+    if (matcher.componentId !== undefined && cinLinkValue(member.full) !== matcher.componentId) return false;
+    return true;
+  });
 }
 
 /**
@@ -1277,7 +1558,7 @@ function resolveOneMember(
  * here fall back to the lenient "at least one operand" check so unusual/system-specific
  * operators are not rejected. Codes are matched upper-cased.
  */
-const FORMULA_OPERATOR_ARITY: Record<string, [number, number]> = {
+export const FORMULA_OPERATOR_ARITY: Record<string, [number, number]> = {
   // basic
   '+': [1, 2], '-': [1, 2], '*': [2, 2], '/': [2, 2], '**': [2, 2], DIV: [2, 2], MOD: [2, 2],
   // math (unary)
@@ -1463,6 +1744,151 @@ function appendKeyFigureMember(doc: string, memberXml: string, structureTarget: 
   return out;
 }
 
+/**
+ * Build the inverse formula of an input-ready formula member. It names the member
+ * an entered value is written back to and how that value is derived. A formula
+ * without one is rejected by the server as "cannot be input ready, it is a formula
+ * element" — while the input readiness flag is still stored, which is exactly how
+ * an unusable member comes about.
+ */
+function buildInverseFormula(vid: string, targetId: string, formulaXml: string, descEsc: string): string {
+  // Hidden by default, as in every inverse formula the modeling tools produce: it
+  // carries the write-back rule and has nothing to show in the result set.
+  return `<Qry:childFormulas xsi:type="Qry:MemberFormulaInverse" member="${targetId}" id="${vid}">
+  ${descriptionEl(descEsc, true)}
+  <Qry:hidden default="false" type="showNever"/>
+  <Qry:formulaDefinition>${formulaXml}</Qry:formulaDefinition>
+</Qry:childFormulas>`;
+}
+
+/** Reference to a member, as a formula token — the default body of an inverse formula. */
+function memberOperandToken(memberId: string, tag: string): string {
+  return `<${tag} xsi:type="Qry:FormulaMemberOperand" member="${memberId}" operandType="Member"/>`;
+}
+
+/**
+ * Put an inverse formula into a member, replacing an existing one for the same
+ * target. Inverse formulas precede the child members in document order.
+ */
+function withInverseFormula(memberXml: string, inverseXml: string, targetId: string): string {
+  const tag = memberXml.match(/^<Qry:(members|childMembers|childFormulas)\b/)?.[1] ?? 'members';
+  const closeTag = `</Qry:${tag}>`;
+  const innerStart = memberXml.indexOf('>') + 1;
+  const inner = memberXml.slice(innerStart, memberXml.length - closeTag.length);
+  const existing = findDirectMemberElements(inner).find(
+    (c) => c.tag === 'childFormulas' && new RegExp(`\\bmember="${escapeRegex(targetId)}"`).test(c.full)
+  );
+  if (existing) {
+    return (
+      memberXml.slice(0, innerStart + existing.start) + inverseXml + memberXml.slice(innerStart + existing.end)
+    );
+  }
+  const firstChild = findDirectMemberElements(inner).find((c) => c.tag === 'childMembers');
+  const offset = firstChild ? firstChild.start : inner.length;
+  return memberXml.slice(0, innerStart + offset) + inverseXml + memberXml.slice(innerStart + offset);
+}
+
+/**
+ * Build the inverse formula element for a formula member, returning it together
+ * with the resolved target id so an existing inverse for that target is replaced
+ * rather than duplicated.
+ */
+function inverseFor(doc: string, inverse: InverseFormula, formulaMemberId: string): [string, string] {
+  if (!inverse.target) throw new Error('inverse requires a target member.');
+  const targetId = resolveMemberReference(doc, inverse.target, 'inverse target');
+  const body = inverse.formula
+    ? renderFormulaNode(inverse.formula, doc, 'Qry:formulaToken')
+    : memberOperandToken(formulaMemberId, 'Qry:formulaToken');
+  const descEsc = escapeXml(inverse.description ?? `Inverse formula for ${inverse.target}`);
+  return [buildInverseFormula(allocateVirtualId(doc), targetId, body, descEsc), targetId];
+}
+
+/** Rename a child member element into a top-level member. */
+function asTopLevelMember(memberXml: string): string {
+  return memberXml
+    .replace(/^<Qry:childMembers\b/, '<Qry:members')
+    .replace(/<\/Qry:childMembers>$/, '</Qry:members>');
+}
+
+/** Rename a member element built as a top-level member into a child member. */
+function asChildMember(memberXml: string): string {
+  return memberXml
+    .replace(/^<Qry:members\b/, '<Qry:childMembers')
+    .replace(/<\/Qry:members>$/, '</Qry:childMembers>');
+}
+
+/** Validate a caller-supplied sibling position. */
+function checkPosition(position: number | undefined): void {
+  if (position === undefined) return;
+  if (!Number.isInteger(position) || position < 0) {
+    throw new Error('position must be a non-negative integer (0 inserts before the first sibling).');
+  }
+}
+
+/**
+ * Offset inside an element at which a new member goes, given the position among
+ * its existing siblings of the same kind. A position at or beyond the end appends.
+ * fallbackEnd is used when there are no siblings yet.
+ */
+function siblingInsertOffset(
+  container: string,
+  siblingTag: MatchedMember['tag'],
+  position: number | undefined,
+  fallbackEnd: number
+): number {
+  const siblings = findDirectMemberElements(container).filter((c) => c.tag === siblingTag);
+  if (siblings.length === 0) return fallbackEnd;
+  if (position !== undefined && position < siblings.length) return siblings[position].start;
+  return siblings[siblings.length - 1].end;
+}
+
+/**
+ * Insert a member into the key figure structure: at top level, or as a child of
+ * another member, optionally at a given position among its siblings.
+ *
+ * Order among members comes from document order, not from the flatPosition
+ * attribute — the server leaves that at 0 for members written here and still
+ * renders them in the order they appear. Inserting therefore means splicing at the
+ * right offset, with no renumbering of the surrounding members.
+ */
+export function insertKeyFigureMember(
+  doc: string,
+  memberXml: string,
+  structureTarget: string,
+  options: { parent?: string; position?: number }
+): string {
+  checkPosition(options.position);
+
+  if (options.parent === undefined) {
+    const cd = findKeyFigureStructure(doc);
+    // Without a structure there is nothing to position against: the member is the first one.
+    if (!cd || options.position === undefined) return appendKeyFigureMember(doc, memberXml, structureTarget);
+    const closeTag = `</Qry:${cd.container}>`;
+    const offset = siblingInsertOffset(cd.element, 'members', options.position, cd.element.length - closeTag.length);
+    const insertAt = cd.start + offset;
+    return doc.slice(0, insertAt) + memberXml + '\n' + doc.slice(insertAt);
+  }
+
+  const { member: parent, cdStart } = resolveMemberByRef(doc, options.parent, 'parent');
+  const childXml = asChildMember(memberXml);
+  const closeTag = `</Qry:${parent.tag}>`;
+
+  // A member with no content of its own is written self-closing; give it an open
+  // and close tag so there is somewhere to put the child.
+  if (parent.full.endsWith('/>')) {
+    const expanded = `${parent.full.slice(0, -2)}>${childXml}${closeTag}`;
+    const at = cdStart + parent.start;
+    return doc.slice(0, at) + expanded + doc.slice(at + parent.full.length);
+  }
+
+  const innerStart = parent.full.indexOf('>') + 1;
+  const innerEnd = parent.full.length - closeTag.length;
+  const inner = parent.full.slice(innerStart, innerEnd);
+  const offset = siblingInsertOffset(inner, 'childMembers', options.position, inner.length);
+  const insertAt = cdStart + parent.start + innerStart + offset;
+  return doc.slice(0, insertAt) + '\n' + childXml + doc.slice(insertAt);
+}
+
 interface ResolvedComponent {
   componentId: string;
   description: string;
@@ -1592,8 +2018,9 @@ async function resolveStructure(
  * bw_update_query_key_figures — manage the key figure structure (CustomDimension
  * on 1KYFNM) of an existing BW Query: add basic key figures, add references to
  * reusable CKFs/RKFs (with optional local restrictions), add local formula
- * members, set member display properties (decimals, hidden, sign inversion) and
- * exception aggregation, and remove members. All operations are applied in one
+ * members, set member display and planning properties (decimals, hidden, sign
+ * inversion, input readiness, disaggregation, constant selection) and exception
+ * aggregation, and remove members. All operations are applied in one
  * read-modify-write save cycle (one PUT).
  *
  * Member operations target the query's 1KYFNM CustomDimension whether it is a
@@ -1629,8 +2056,13 @@ export async function bwUpdateQueryKeyFigures(
       if (!op.member_id && !op.description && !op.component_name) {
         throw new Error('set_member_properties requires member_id, description, or component_name.');
       }
-      if (!op.properties || typeof op.properties !== 'object') {
-        throw new Error('set_member_properties requires a properties object.');
+      if (!op.properties && op.parent === undefined && op.position === undefined && !op.inverse) {
+        throw new Error(
+          'set_member_properties requires at least one of properties, parent, position, or inverse.'
+        );
+      }
+      if (op.properties !== undefined && typeof op.properties !== 'object') {
+        throw new Error('properties must be an object.');
       }
     } else {
       throw new Error(
@@ -1666,7 +2098,8 @@ export async function bwUpdateQueryKeyFigures(
         if (op.exception_aggregation !== undefined) {
           memberXml = setMemberChildElement(memberXml, 'exceptionAggregation', excAggEl(op.exception_aggregation));
         }
-        doc = appendKeyFigureMember(doc, memberXml, structureTarget);
+        if (op.properties) memberXml = applyMemberProperties(memberXml, op.properties, doc);
+        doc = insertKeyFigureMember(doc, memberXml, structureTarget, { parent: op.parent, position: op.position });
         summary.push(`add key figure ${kyf}`);
       } else if (op.action === 'add_ckf' || op.action === 'add_rkf') {
         const kind = op.action === 'add_ckf' ? 'ckf' : 'rkf';
@@ -1691,7 +2124,8 @@ export async function bwUpdateQueryKeyFigures(
         if (op.exception_aggregation !== undefined) {
           memberXml = setMemberChildElement(memberXml, 'exceptionAggregation', excAggEl(op.exception_aggregation));
         }
-        doc = appendKeyFigureMember(doc, memberXml, structureTarget);
+        if (op.properties) memberXml = applyMemberProperties(memberXml, op.properties, doc);
+        doc = insertKeyFigureMember(doc, memberXml, structureTarget, { parent: op.parent, position: op.position });
         let entry = `add ${kind.toUpperCase()} ${op.component_name!.toUpperCase()}`;
         if (dupMemberId) {
           entry = `WARNING: component already referenced by member ${dupMemberId} — duplicate mapname — ${entry}`;
@@ -1707,8 +2141,11 @@ export async function bwUpdateQueryKeyFigures(
         if (op.exception_aggregation !== undefined) {
           memberXml = setMemberChildElement(memberXml, 'exceptionAggregation', excAggEl(op.exception_aggregation));
         }
-        if (op.properties) memberXml = applyMemberProperties(memberXml, op.properties);
-        doc = appendKeyFigureMember(doc, memberXml, structureTarget);
+        if (op.properties) memberXml = applyMemberProperties(memberXml, op.properties, doc);
+        if (op.inverse) {
+          memberXml = withInverseFormula(memberXml, ...inverseFor(doc, op.inverse, vid));
+        }
+        doc = insertKeyFigureMember(doc, memberXml, structureTarget, { parent: op.parent, position: op.position });
         summary.push(`add formula member '${op.description}'`);
       } else if (op.action === 'remove_member') {
         // resolveOneMember matches both MemberSelection and MemberFormula members.
@@ -1738,9 +2175,38 @@ export async function bwUpdateQueryKeyFigures(
           { member_id: op.member_id, description: op.description, component_name: op.component_name },
           'set_member_properties'
         );
-        const updated = applyMemberProperties(member.full, op.properties!);
-        doc = doc.slice(0, cdStart + member.start) + updated + doc.slice(cdStart + member.end);
-        summary.push(`set properties on member ${member.id}${member.description ? ` (${member.description})` : ''}`);
+        let updated = op.properties ? applyMemberProperties(member.full, op.properties, doc) : member.full;
+        if (op.inverse) {
+          updated = withInverseFormula(updated, ...inverseFor(doc, op.inverse, member.id));
+        }
+        const label = `member ${member.id}${member.description ? ` (${member.description})` : ''}`;
+        if (op.parent !== undefined || op.position !== undefined) {
+          // Moving means removing the member first so the re-insert offsets are
+          // computed against a document that no longer contains it. Without an
+          // explicit parent the member stays on its current level.
+          const targetParent = op.parent !== undefined ? op.parent || undefined : member.parentId;
+          // Lifting a nested member back to the top level is the one move the
+          // backend refuses: the save fails with "PARSE_CUSTDIMENSION cannot
+          // process XML element childMembers" even though the document is
+          // well-formed. Nesting, re-parenting and reordering all work.
+          if (member.parentId !== undefined && targetParent === undefined) {
+            throw new Error(
+              `set_member_properties: member ${member.id}` +
+              `${member.description ? ` (${member.description})` : ''} cannot be moved out of its parent ` +
+              `to the top level — the backend rejects that save. Remove the member and add it again ` +
+              `instead. Moving it to a different parent, or reordering it within its parent, does work.`
+            );
+          }
+          doc = doc.slice(0, cdStart + member.start) + doc.slice(cdStart + member.end);
+          doc = insertKeyFigureMember(doc, asTopLevelMember(updated), structureTarget, {
+            parent: targetParent,
+            position: op.position,
+          });
+          summary.push(`move ${label}${targetParent ? ` under ${targetParent}` : ' to the top level'}`);
+        } else {
+          doc = doc.slice(0, cdStart + member.start) + updated + doc.slice(cdStart + member.end);
+          summary.push(`set properties on ${label}`);
+        }
       }
     }
     return doc;

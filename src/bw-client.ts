@@ -67,6 +67,50 @@ export interface GetResult {
   headers: Record<string, string>;
 }
 
+/**
+ * Turn a failed response into an error message a model can act on.
+ *
+ * The body is passed through unchanged — every ADT error is an XML document that callers
+ * further up parse, and several decisions in this server are made on its text. The one
+ * exception is an HTML page: the ICF answers a request for a service that does not exist
+ * with a full "Logon Error Message" page, and on a classic BW system every `/sap/bw4/…`
+ * path does exactly that. Thousands of bytes of markup then reached the chat and told the
+ * model nothing, so an HTML body is replaced by the sentence it actually means.
+ *
+ * Both are kept: `HTTP <status>` stays in the message, because that is what the callers
+ * that branch on the status match on.
+ */
+export function bwHttpError(label: string, status: number, data: unknown): Error {
+  const body = typeof data === 'string' ? data : data === undefined ? '' : JSON.stringify(data);
+  const isHtml = /^\s*(?:<!DOCTYPE\s+html|<html\b)/i.test(body) || /<title>\s*Logon Error/i.test(body);
+  if (!isHtml) return new Error(`${label} → HTTP ${status}\n${body}`);
+
+  const path = label.match(/\/sap\/\S+/)?.[0]?.split('?')[0];
+  const isBw4Path = path ? /\/sap\/(?:bc\/http\/sap\/)?bw4\//.test(path) : false;
+  if (status === 404 && isBw4Path) {
+    return new Error(
+      `${label} → HTTP ${status}\nThe BW/4HANA API ${path} does not exist on this system ` +
+        '(classic BW 7.5 or lower). Use bw_read_metadata_tables for transformations, DTPs, ' +
+        'process chains and the load history.',
+    );
+  }
+  if (status === 404) {
+    return new Error(
+      `${label} → HTTP ${status}\nThe service ${path ?? 'behind this path'} is not active or ` +
+        'does not exist on this system.',
+    );
+  }
+  // Anything else: the page title is the only part of it worth keeping. The ICF titles its
+  // page "Logon Error Message" whatever went wrong, so it is quoted as the server's wording
+  // rather than presented as the cause.
+  const title = body.match(/<title>([^<]*)<\/title>/i)?.[1]?.trim();
+  return new Error(
+    `${label} → HTTP ${status}\nThe server returned an HTML page instead of an API response — ` +
+      'the service is not reachable for this user (ICF service inactive, or the logon was ' +
+      `rejected).${title ? ` The page is titled "${title}".` : ''}`,
+  );
+}
+
 /** Cloud Connector hop. The token expires, so it is resolved per request. */
 export interface BwProxyConfig {
   host: string;
@@ -447,7 +491,7 @@ export class BwClient {
     });
     this.updateCookies(response);
     if (response.status >= 400) {
-      throw new Error(`GET ${path} → HTTP ${response.status}\n${response.data}`);
+      throw bwHttpError(`GET ${path}`, response.status, response.data);
     }
     return {
       body: response.data as string,
@@ -507,7 +551,7 @@ export class BwClient {
       // the caller wait for the ADT session to time out.
       const held = tracksLock(type) ? lockSessions.get(key) : undefined;
       if (response.status === 403 && held) return held.handle;
-      throw new Error(`Lock ${type}/${name} → HTTP ${response.status}\n${response.data}`);
+      throw bwHttpError(`Lock ${type}/${name}`, response.status, response.data);
     }
     const body = response.data as string;
     // lockHandle is in <LOCK_HANDLE>...</LOCK_HANDLE> in the response body
@@ -559,7 +603,7 @@ export class BwClient {
     this.updateCookies(response);
     this.csrfToken = null;
     if (response.status >= 400) {
-      throw new Error(`POST ${path} → HTTP ${response.status}\n${response.data}`);
+      throw bwHttpError(`POST ${path}`, response.status, response.data);
     }
     return response.data as string;
   }
@@ -596,7 +640,7 @@ export class BwClient {
     this.updateCookies(response);
     this.csrfToken = null;
     if (response.status >= 400) {
-      throw new Error(`PUT ${path} → HTTP ${response.status}\n${response.data}`);
+      throw bwHttpError(`PUT ${path}`, response.status, response.data);
     }
     return response.data as string;
   }
@@ -626,7 +670,7 @@ export class BwClient {
     if (response.status >= 400) {
       const held = tracksLock(type) ? lockSessions.get(key) : undefined;
       if (response.status === 403 && held) return held.handle;
-      throw new Error(`Delete-lock ${type}/${name} → HTTP ${response.status}\n${response.data}`);
+      throw bwHttpError(`Delete-lock ${type}/${name}`, response.status, response.data);
     }
     const body = response.data as string;
     const match = body.match(/<LOCK_HANDLE>([^<]+)<\/LOCK_HANDLE>/);
@@ -662,7 +706,7 @@ export class BwClient {
     this.updateCookies(response);
     this.csrfToken = null;
     if (response.status >= 400) {
-      throw new Error(`DELETE ${path} → HTTP ${response.status}\n${response.data}`);
+      throw bwHttpError(`DELETE ${path}`, response.status, response.data);
     }
     return response.data as string;
   }
@@ -703,9 +747,7 @@ export class BwClient {
     this.updateCookies(response);
     this.csrfToken = null;
     if (response.status >= 400) {
-      throw new Error(
-        `Activation of ${type}/${name} → HTTP ${response.status}\n${response.data}`
-      );
+      throw bwHttpError(`Activation of ${type}/${name}`, response.status, response.data);
     }
     return response.data as string;
   }
@@ -746,7 +788,7 @@ export class BwClient {
     this.updateCookies(response);
     this.csrfToken = null;
     if (response.status >= 400) {
-      throw new Error(`POST ${path} → HTTP ${response.status}\n${response.data}`);
+      throw bwHttpError(`POST ${path}`, response.status, response.data);
     }
     return response.data as string;
   }
@@ -765,7 +807,7 @@ export class BwClient {
     this.updateCookies(response);
     this.csrfToken = null;
     if (response.status >= 400) {
-      throw new Error(`POST ${path} → HTTP ${response.status}\n${response.data}`);
+      throw bwHttpError(`POST ${path}`, response.status, response.data);
     }
     return response.data as string;
   }
@@ -818,7 +860,7 @@ export class BwClient {
     });
     this.updateCookies(response);
     if (response.status >= 400) {
-      throw new Error(`POST ${url} → HTTP ${response.status}\n${response.data}`);
+      throw bwHttpError(`POST ${url}`, response.status, response.data);
     }
     return {
       body: response.data as string,
@@ -847,7 +889,7 @@ export class BwClient {
     });
     this.updateCookies(response);
     if (response.status >= 400) {
-      throw new Error(`GET ${url} → HTTP ${response.status}\n${response.data}`);
+      throw bwHttpError(`GET ${url}`, response.status, response.data);
     }
     return {
       body: response.data as string,
@@ -884,7 +926,7 @@ export class BwClient {
     });
     this.updateCookies(response);
     if (response.status >= 400) {
-      throw new Error(`PUT ${url} → HTTP ${response.status}\n${response.data}`);
+      throw bwHttpError(`PUT ${url}`, response.status, response.data);
     }
     return {
       body: response.data as string,
@@ -922,7 +964,7 @@ export class BwClient {
     this.updateCookies(response);
     this.csrfToken = null;
     if (response.status >= 400) {
-      throw new Error(`DELETE ${url} → HTTP ${response.status}\n${response.data}`);
+      throw bwHttpError(`DELETE ${url}`, response.status, response.data);
     }
     return {
       body: response.data as string,
@@ -946,7 +988,7 @@ export class BwClient {
     });
     this.updateCookies(response);
     if (response.status >= 400) {
-      throw new Error(`Discovery GET → HTTP ${response.status}\n${response.data}`);
+      throw bwHttpError(`Discovery GET`, response.status, response.data);
     }
     const xml: string = response.data as string;
     // A single <app:collection> publishes one OR MORE <app:accept> media types,
@@ -1009,7 +1051,7 @@ export class BwClient {
       return null;
     }
     if (response.status >= 400) {
-      throw new Error(`ADT GET source ${classEncoded} → HTTP ${response.status}\n${response.data}`);
+      throw bwHttpError(`ADT GET source ${classEncoded}`, response.status, response.data);
     }
     return response.data as string;
   }
@@ -1033,7 +1075,7 @@ export class BwClient {
     );
     this.updateCookies(response);
     if (response.status >= 400) {
-      throw new Error(`ADT LOCK ${classEncoded} → HTTP ${response.status}\n${response.data}`);
+      throw bwHttpError(`ADT LOCK ${classEncoded}`, response.status, response.data);
     }
     const body = response.data as string;
     const match = body.match(/<LOCK_HANDLE>([^<]+)<\/LOCK_HANDLE>/);
@@ -1062,7 +1104,7 @@ export class BwClient {
     this.updateCookies(response);
     this.csrfToken = null;
     if (response.status >= 400) {
-      throw new Error(`ADT PUT source ${classEncoded} → HTTP ${response.status}\n${response.data}`);
+      throw bwHttpError(`ADT PUT source ${classEncoded}`, response.status, response.data);
     }
   }
 
@@ -1092,7 +1134,7 @@ export class BwClient {
     this.updateCookies(response);
     this.csrfToken = null;
     if (response.status >= 400) {
-      throw new Error(`ADT activate ${classEncoded} → HTTP ${response.status}\n${response.data}`);
+      throw bwHttpError(`ADT activate ${classEncoded}`, response.status, response.data);
     }
   }
 
@@ -1113,7 +1155,7 @@ export class BwClient {
     this.updateCookies(response);
     this.csrfToken = null;
     if (response.status >= 400) {
-      throw new Error(`ADT UNLOCK ${classEncoded} → HTTP ${response.status}\n${response.data}`);
+      throw bwHttpError(`ADT UNLOCK ${classEncoded}`, response.status, response.data);
     }
   }
 
@@ -1144,7 +1186,7 @@ export class BwClient {
     this.updateCookies(response);
     this.csrfToken = null;
     if (response.status >= 400) {
-      throw new Error(`UNLOCK ${type.toUpperCase()} ${name} → HTTP ${response.status}\n${response.data}`);
+      throw bwHttpError(`UNLOCK ${type.toUpperCase()} ${name}`, response.status, response.data);
     }
     lockSessions.delete(key);
   }

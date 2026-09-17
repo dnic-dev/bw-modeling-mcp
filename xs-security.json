@@ -3,8 +3,9 @@
   "tenant-mode": "dedicated",
   "description": "SAP BW Modeling MCP server",
   "scopes": [
-    { "name": "$XSAPPNAME.read",  "description": "Read BW modeling objects and query data" },
-    { "name": "$XSAPPNAME.write", "description": "Create, change, delete and activate BW objects (implies read)" }
+    { "name": "$XSAPPNAME.read",    "description": "Read BW modelling objects and query data" },
+    { "name": "$XSAPPNAME.analyst", "description": "Reporting only: run queries and read the data behind them (a subset of read)" },
+    { "name": "$XSAPPNAME.write",   "description": "Create, change, delete and activate BW objects (implies read and analyst)" }
   ],
   "role-templates": [
     {
@@ -13,16 +14,26 @@
       "scope-references": ["$XSAPPNAME.read"]
     },
     {
+      "name": "BWAnalyst",
+      "description": "Run BW queries and read the data behind them via MCP",
+      "scope-references": ["$XSAPPNAME.analyst"]
+    },
+    {
       "name": "BWDeveloper",
       "description": "Full read and write access to BW modeling objects via MCP",
-      "scope-references": ["$XSAPPNAME.read", "$XSAPPNAME.write"]
+      "scope-references": ["$XSAPPNAME.read", "$XSAPPNAME.analyst", "$XSAPPNAME.write"]
     }
   ],
   "role-collections": [
     {
       "name": "BW MCP Reader",
-      "description": "Read BW modeling objects via MCP. Write tools are not offered.",
+      "description": "Read BW modelling objects and query data via MCP. Write tools are not offered.",
       "role-template-references": ["$XSAPPNAME.BWReader"]
+    },
+    {
+      "name": "BW MCP Analyst",
+      "description": "Ask questions of BW data: run queries, read the values behind them. A small client — the modelling tools are not offered.",
+      "role-template-references": ["$XSAPPNAME.BWAnalyst"]
     },
     {
       "name": "BW MCP Developer",

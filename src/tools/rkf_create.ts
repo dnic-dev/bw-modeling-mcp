@@ -1,5 +1,6 @@
 import { BwClient, createClientFromEnv, bwSeg } from '../bw-client.js';
 import { rkfAccept, rkfWriteMediaType, QUERY_ACCEPT_LIST, queryWriteMediaType } from './query.js';
+import { recordedIn } from './elem_write.js';
 
 /**
  * bw_create_rkf — create one reusable Restricted Key Figure (TLOGO ELEM, xsi:type
@@ -407,6 +408,12 @@ ${groupsXml.join('\n')}
     // Step 9: read back the final version through the same (edit) session.
     await clientB.get(`${basePath}?forceCacheUpdate=true`, rkfAccept());
 
+    // The consistency feed routinely says "no change recording required" even when the
+    // object was recorded — the entry lands in the developer task belonging to the
+    // request, not under the request number itself. Reporting where it actually landed
+    // keeps that message from being read as "not in the transport, do it again".
+    const recorded = transport ? await recordedIn(clientB, elemUid) : undefined;
+
     return JSON.stringify(
       {
         success: true,
@@ -419,6 +426,7 @@ ${groupsXml.join('\n')}
         package: pkg,
         ...(infoArea ? { info_area: infoArea } : {}),
         ...(transport ? { transport_request: transport } : {}),
+        ...(recorded ? { recorded_in: recorded } : {}),
         consistency_messages: consistencyMessages,
         message: `Restricted key figure '${nameUpper}' created on InfoProvider '${provider}' with ${args.restrictions.length} restriction(s).`,
         debug: {

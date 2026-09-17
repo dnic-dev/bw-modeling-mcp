@@ -15,7 +15,7 @@ OAuth in front and a BTP destination behind — either a shared technical user
 (`BasicAuthentication`) or **principal propagation**, where each caller reaches BW as
 themselves and BW applies their own authorizations.
 
-Two role collections decide what a user is offered: **BW MCP Reader** and **BW MCP Developer**.
+Three role collections decide what a user is offered: **BW MCP Reader** (everything that only reads), **BW MCP Analyst** (a small reporting client — run queries and understand what they return) and **BW MCP Developer** (everything, including changes).
 stdio is unchanged — `npm start` behaves exactly as before. Setup:
 [docs/CENTRAL-HOSTING-SETUP.md](docs/CENTRAL-HOSTING-SETUP.md) (step-by-step) and
 [docs/CLOUD-FOUNDRY.md](docs/CLOUD-FOUNDRY.md) (reference).
@@ -43,9 +43,9 @@ Principal propagation additionally needs a certificate rule and ICM trust on the
 |---|---|
 | SAP BW/4HANA (all versions) | ✅ Full support |
 | SAP BW Bridge (SAP BTP ABAP stack) | ✅ Via cookie authentication (`BW_COOKIE_FILE`) |
-| SAP BW on HANA (7.5) | ⚠️ Modeling reads after a small ABAP enhancement — see [BW 7.5 Support](docs/BW75-SUPPORT.md) |
+| SAP BW on HANA (7.5) | ✅ Modelling reads after a small ABAP enhancement; the tool surface adjusts to what the system publishes, and the objects without a REST resource — including planning, chain runs and the APD — are read from their metadata tables. See [BW 7.5 Support](docs/BW75-SUPPORT.md) |
 
-<p><em><sub>On SAP BW 7.5 the REST framework looks up the <code>Accept</code> header case-sensitively while the kernel delivers header names in lower case, so almost every call fails with HTTP 406. A ~20-line post-exit enhancement (no modification) resolves this and makes all REST endpoints that exist on 7.5 reachable. Objects for which BW 7.5 ships no REST resource at all — transformations, DTPs, process chains, classic DSOs, InfoCubes — are readable through <code>bw_read_metadata_tables</code>, which goes to their metadata tables instead, but they cannot be written; Eclipse opens the embedded SAP GUI for those as well. Details, ABAP code and setup steps: <a href="docs/BW75-SUPPORT.md">docs/BW75-SUPPORT.md</a>.</sub></em></p>
+<p><em><sub>On SAP BW 7.5 the REST framework looks up the <code>Accept</code> header case-sensitively while the kernel delivers header names in lower case, so almost every call fails with HTTP 406. A ~20-line post-exit enhancement (no modification) resolves this and makes all REST endpoints that exist on 7.5 reachable. Objects for which BW 7.5 ships no REST resource at all — transformations, DTPs, process chains and their runs, classic DSOs, InfoCubes, the planning objects and the Analysis Process Designer — are readable through <code>bw_read_metadata_tables</code>, which goes to their metadata tables instead, but they cannot be written; Eclipse opens the embedded SAP GUI for those as well. Details, ABAP code and setup steps: <a href="docs/BW75-SUPPORT.md">docs/BW75-SUPPORT.md</a>.</sub></em></p>
 
 ---
 
@@ -61,32 +61,48 @@ A two-part blog series about this project (both available in German and English)
 
 ---
 
-## 🆕 What's New — v1.4.1
+## 🆕 What's New — v1.5.0
 
-A maintenance release: the two connectivity fixes that BTP deployments have been running behind a Cloud Connector, instance identity in the handshake, and a set of end-routine defects.
+Classic SAP BW 7.5 becomes a first-class system, business users get a client of their own,
+and the reusable query building blocks — calculated key figures, restricted key figures and
+structures — can now be created and changed rather than only read.
 
-**🔌 Connectivity**
+**🏛️ Classic BW 7.5, properly supported**
 
-- `rawPost` / `rawPut` / `rawDelete` go through the shared client, so they keep the Cloud Connector proxy and its authorization header. Behind a BTP connectivity proxy they used to resolve the virtual destination host themselves and fail with `ENOTFOUND`, taking ADT DataPreview and every transformation write with them ([#24](https://github.com/dnic-dev/bw-modeling-mcp/issues/24))
-- `bw_push_data` and `bw_get_push_schema` use that same client and therefore honour the BTP destination and principal propagation ([#25](https://github.com/dnic-dev/bw-modeling-mcp/issues/25))
+- `tools/list` follows the platform: a tool whose resource a 7.5 does not publish is no longer offered there, and each one names the call that answers the same question instead. The platform is detected from the system's own `bw.b4hanamode` flag and its discovery document, so the system decides and not a hardcoded release list. On BW/4HANA nothing changes
+- `bw_read_metadata_tables` gains the object types those hidden tools would have answered for: planning functions, sequences, characteristic relationships and data slices (`PLSE`, `PLSQ`, `PLCR`, `PLDS`), process chain runs with their steps and the process variant behind each (`RSPCLOG`), and the load history of an aDSO (`ADSO`)
+- It also reads the **Analysis Process Designer** (APD, `object_type="ANPR"`) — nodes in execution order with the object each source reads and each target writes, the edges between them, filters, formulas and the ABAP of a routine node. No release ever published a REST resource for it, and BW/4HANA dropped the object type, so this is the only route to one
 
-**🏷️ Instance identity**
+**👤 A client for business users**
 
-- `BW_MCP_SERVER_NAME` names the instance in the handshake, and `BW_MCP_SYSTEM_LABEL` puts the connected system on the first line of the instructions the server now sends — so several instances stay apart in clients that only show an opaque connector id. `serverInfo.version` follows `package.json` again. Both variables are optional; without them the handshake is unchanged ([#26](https://github.com/dnic-dev/bw-modeling-mcp/issues/26))
+- The new **BW MCP Analyst** role collection offers 14 tools instead of 105: run a query — or a provider directly — read the characteristic values to filter by, find what there is to ask, and understand what the numbers mean. The size is the point: a client carrying every tool reaches for the wrong one far more often
+- Purely additive. `read` is unchanged and still admits everything it did, `analyst` is a strict subset of it, and a caller may hold both
 
-**🔁 End routines**
+**🧱 Reusable query building blocks**
 
-- Adding a routine no longer leaves its generated class inactive, the generated AMDP skeleton names plain fields correctly on field-based providers, and `bw_set_transformation_routine_fields` reads the transformation back instead of reporting a field list it never stored ([#21](https://github.com/dnic-dev/bw-modeling-mcp/issues/21))
+- `bw_create_ckf` / `bw_update_ckf` — calculated key figures, with the formula as an operator/operand tree that `bw_get_ckf` hands back unchanged. `update` takes targeted operations, so another summand can be added to a sum without rebuilding the expression
+- `bw_create_structure` / `bw_update_structure` — reusable key figure structures. A change reaches every query that embeds the structure, which is why it happens at the structure rather than through one query that uses it
+- `bw_update_rkf` — a restricted key figure keeps its UID when changed, so references from CKFs, structures and queries survive. Until now the only correction was delete-and-recreate, which is impossible once the RKF is referenced anywhere
+
+**🔑 Client compatibility (hosted instance)**
+
+- The OAuth metadata advertises `scopes_supported`. Without it a client requests no scopes at all, and Copilot's older auth code then fails with `scope.split is not a function` (fixed upstream in vscode#325344, but the Eclipse Language Server lags behind)
+
+**✨ Also new**
+
+- `bw_delete_request` deletes load requests — the precondition BW demands before switching a DTP from delta to full extraction
+- Characteristics can be modelled for values with lower case letters or umlauts (`lower_case`), which previously failed at request activation rather than at load time
+- `bw_get_request` reads the log of each process step, so a failed activation names the value and the characteristic that caused it
 
 ---
 
-**Earlier releases** — the "What's New" notes for v1.4.0 and older are archived in [WHATS_NEW.md](WHATS_NEW.md); the full structured history is in [CHANGELOG.md](CHANGELOG.md).
+**Earlier releases** — the "What's New" notes for v1.4.1 and older are archived in [WHATS_NEW.md](WHATS_NEW.md); the full structured history is in [CHANGELOG.md](CHANGELOG.md).
 
 ---
 
 ## What it can do
 
-An overview by area. Every tool in detail — parameters, behaviour, and the sequences it belongs in — is in the **[Tools Reference](TOOLS.md)** (99 tools).
+An overview by area. Every tool in detail — parameters, behaviour, and the sequences it belongs in — is in the **[Tools Reference](TOOLS.md)** (105 tools).
 
 ### Search & Discovery
 - Search BW objects by name or description (wildcards supported), filtered by type
@@ -158,6 +174,9 @@ An overview by area. Every tool in detail — parameters, behaviour, and the seq
 - Record query edits on a transport request for queries on a transportable package
 - Delete a query
 - Create characteristic variables — user entry, customer exit, authorization or replacement path; as characteristic value, hierarchy or hierarchy nodes; interval, single value, several single values or comparison operators
+- Create and change **reusable calculated key figures** — the formula as an operator/operand tree that reads back unchanged, and targeted operations for editing one that already exists
+- Create and change **reusable key figure structures** — the object queries embed as an axis, so one definition drives all of them; a change reaches every query that uses it
+- Change a **restricted key figure** in place — the UID survives, so references from CKFs, structures and queries stay intact
 
 ### Live Data Querying
 - Execute a BEx Query or preview data from any InfoProvider (aDSO, CompositeProvider) — returns a formatted result table
@@ -236,19 +255,25 @@ An overview by area. Every tool in detail — parameters, behaviour, and the seq
 - Read Planning Functions (PLSE) — function type, characteristic usage roles, and parameter tree; FOX code surfaced for FORMULA functions
 - Read Planning Sequences (PLSQ) — ordered step list with aggregation level, planning function, and filter references
 - Read Planning Properties (PLCR) — key-date mode, maximum characteristic combinations, and save strategy for plan-enabled InfoProviders
+- On a system that publishes no planning resources — every classic BW release — the same objects are read from the metadata tables with `bw_read_metadata_tables`, including the **data slices** (`PLDS`) that no release exposes over REST at all
 
 ### System Diagnostics & Classic Objects
 - Profile the connected system — BW/4HANA vs classic BW, the REST endpoint groups it publishes and therefore which tool groups work on it, plus three preconditions: `Accept`-header handling, ADT DataPreview access, and whether query reporting is implemented
 - Read objects the connected system publishes no REST resource for, straight from the metadata tables: transformations (including start, end, expert and field routine source code), DTPs, the classic providers — DataStore objects, InfoCubes and MultiProviders — and process chains, whose steps, variant parameters and dependencies are resolved into execution order
+- Read the planning objects the same way — functions, sequences, characteristic relationships and data slices — and the **runs** of a process chain: the history of one chain, the steps of a single run with status, duration and process variant, or the last status of every chain matching a pattern
+- Read an **Analysis Process Designer** process (APD) — nodes in execution order with the object each source reads and each target writes, the edges between them, filters, formulas and routine ABAP. No release publishes a REST resource for it and BW/4HANA dropped the object type, so the metadata tables are the only route on any platform
 - Read the load history of an InfoCube or DataStore object — request, status, update mode, start time, user, duration, records transferred and added, and the source — which on a classic BW system is the only route to load status at all
 - SAP BW 7.5 on HANA is reachable for modeling reads after a small ABAP post-exit — see [docs/BW75-SUPPORT.md](docs/BW75-SUPPORT.md)
+- Adapts its own tool surface to the platform — the server detects BW/4HANA vs classic BW and offers only the tools that release can answer, so a model is never handed a call that must fail; `bw_system_profile` lists what is hidden and why
 
 ### Request Monitor & Runtime
 - List load requests for a target InfoProvider — status, last process status/action, record count, timestamp, user, TSN
 - Full status analysis of a single load request — header, DTP information (start/finish/duration), process step chain, and message log in one call
 - Activate loaded data (DSO request activation) — move a finished load from the inbound table into the active data table + change log
+- Delete load requests — with the data they brought in and their entry in request management, which is what BW demands before a DTP can be switched from delta to full extraction. An activation request is rolled back instead, together with every later activation on top of it
 - Monitor, diagnose and run remodeling requests — the five processing steps (`CHECK`, `SAVE`, `CONVERT`, `ACTIVATE`, `CLEANUP`) with their individual status and the application log per step, plus execute, restart, reset and reset-step. Running a rule restructures the InfoProvider and converts its data
 - Uses the BW/4HANA `/sap/bc/.../bw4` manage API (the same operations as the BW/4HANA Cockpit)
+- On classic BW, where that API does not exist, these tools are not offered; the load history of a provider is read with `bw_read_metadata_tables` instead, which the server names in place of every tool it hides
 
 ### General
 - Search & Where-Used (xref)
@@ -309,6 +334,7 @@ For **local (stdio)** use, the server is configured via environment variables. F
 | `BW_COOKIE_FILE` | Path to a browser-exported cookie file for SAML-/OAuth-fronted systems (e.g. BW Bridge). Netscape or `name=value` format. When set, `BW_USER` / `BW_PASSWORD` are optional. | no |
 | `BW_MCP_SERVER_NAME` | Server name advertised in the MCP `initialize` handshake. Default: `bw-modeling-mcp`. Give each instance a unique name when running several against different BW systems. | no |
 | `BW_MCP_SYSTEM_LABEL` | Free-text label of the connected BW system (e.g. `AP4 (BW production, read-only)`), put at the top of the MCP server instructions. Lets a model tell look-alike instances apart even in clients that show an opaque connector id instead of the server name. | no |
+| `BW_PLATFORM` | `auto` (default), `classic` or `bw4`. The server detects whether it is talking to BW/4HANA or a classic release and offers only the tools that release can answer. `classic` forces that verdict when detection cannot run, `bw4` switches the filter off. See [docs/BW75-SUPPORT.md](docs/BW75-SUPPORT.md). | no |
 
 **Cookie authentication (BW Bridge / SAP BTP):** For BW systems that sit behind a SAML or OAuth login (such as BW Bridge on the SAP BTP ABAP stack), Basic Auth is not available. Export the authenticated session cookies from your browser into a file and point `BW_COOKIE_FILE` at it. The login/session approach is analogous to [vibing-steampunk](https://github.com/oisee/vibing-steampunk) and [ARC-1](https://github.com/arc-mcp/arc-1). When the session expires, refresh the cookie file and restart the server.
 

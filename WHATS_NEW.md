@@ -8,6 +8,25 @@ For the complete, structured change history see [CHANGELOG.md](CHANGELOG.md).
 
 ---
 
+## What's New — v1.4.1
+
+A maintenance release: the two connectivity fixes that BTP deployments have been running behind a Cloud Connector, instance identity in the handshake, and a set of end-routine defects.
+
+**🔌 Connectivity**
+
+- `rawPost` / `rawPut` / `rawDelete` go through the shared client, so they keep the Cloud Connector proxy and its authorization header. Behind a BTP connectivity proxy they used to resolve the virtual destination host themselves and fail with `ENOTFOUND`, taking ADT DataPreview and every transformation write with them ([#24](https://github.com/dnic-dev/bw-modeling-mcp/issues/24))
+- `bw_push_data` and `bw_get_push_schema` use that same client and therefore honour the BTP destination and principal propagation ([#25](https://github.com/dnic-dev/bw-modeling-mcp/issues/25))
+
+**🏷️ Instance identity**
+
+- `BW_MCP_SERVER_NAME` names the instance in the handshake, and `BW_MCP_SYSTEM_LABEL` puts the connected system on the first line of the instructions the server now sends — so several instances stay apart in clients that only show an opaque connector id. `serverInfo.version` follows `package.json` again. Both variables are optional; without them the handshake is unchanged ([#26](https://github.com/dnic-dev/bw-modeling-mcp/issues/26))
+
+**🔁 End routines**
+
+- Adding a routine no longer leaves its generated class inactive, the generated AMDP skeleton names plain fields correctly on field-based providers, and `bw_set_transformation_routine_fields` reads the transformation back instead of reporting a field list it never stored ([#21](https://github.com/dnic-dev/bw-modeling-mcp/issues/21))
+
+---
+
 ## What's New — v1.4.0
 
 **🎯 SAP BW 7.5 on HANA**

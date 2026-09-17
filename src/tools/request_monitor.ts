@@ -57,6 +57,9 @@ interface DomainText {
   text?: string;
 }
 
+// Cap on the extra per-step log reads of one bw_get_request call.
+const MAX_STEP_LOGS = 10;
+
 // Module-scope caches for the system domain text maps. The status tables are
 // stable for the process lifetime, so they are fetched once and reused.
 let requestStatusMap: Map<string, string> | null = null;
@@ -162,7 +165,9 @@ export async function bwGetRequest(
   const headerUrl = `/sap/bc/http/sap/bw4/v1/manage/requests/${encodeURIComponent(requestTsn)}/${s}`;
   const dtpInfoUrl = `/sap/bc/http/sap/bw4/v1/manage/requests/${encodeURIComponent(requestTsn)}/${s}/datatransferprocessinformation`;
   const processesUrl = `/sap/bc/http/sap/bw4/v1/manage/processes?request=${encodeURIComponent(requestTsn)}&storage=${s}`;
-  const logsUrl = `/sap/bc/http/sap/bw4/v1/manage/processes/${encodeURIComponent(requestTsn)}/logs?top=100&readMaximumNumberOfResults=true`;
+  const logUrlFor = (tsn: string) =>
+    `/sap/bc/http/sap/bw4/v1/manage/processes/${encodeURIComponent(tsn)}/logs?top=100&readMaximumNumberOfResults=true`;
+  const logsUrl = logUrlFor(requestTsn);
 
   // The message log is the primary diagnostic source and needs no storage code, so it must
   // never die on a 404 of the storage-dependent header/DTP-info/process endpoints (a wrong
@@ -177,6 +182,34 @@ export async function bwGetRequest(
   const errMsg = (r: PromiseRejectedResult): string =>
     r.reason instanceof Error ? r.reason.message : String(r.reason);
 
+  const processes: ProcessStep[] = processesRes.status === 'fulfilled'
+    ? JSON.parse(processesRes.value.body) as ProcessStep[]
+    : [];
+
+  // A process step that runs under its own TSN — a request activation, for one — keeps its
+  // messages in its own process log. The request-level log only carries the messages of the
+  // load itself, so a step that failed would otherwise show up as a red line with the reason
+  // nowhere in the output. Read those logs as well; on a request with many steps, restrict
+  // them to the steps that did not finish green.
+  const ownTsnSteps = processes.filter((p) => p.processTsn && p.processTsn !== requestTsn);
+  const stepLogSteps = (ownTsnSteps.length > MAX_STEP_LOGS
+    ? ownTsnSteps.filter((p) => p.processStatus !== 'G')
+    : ownTsnSteps
+  ).slice(0, MAX_STEP_LOGS);
+
+  const stepLogsRes = await Promise.allSettled(
+    stepLogSteps.map((p) => client.rawGet(logUrlFor(p.processTsn as string), GET_HEADERS)),
+  );
+
+  const stepLogs = stepLogSteps.map((step, i) => {
+    const res = stepLogsRes[i] as PromiseSettledResult<{ body: string }>;
+    return {
+      step,
+      logs: res.status === 'fulfilled' ? JSON.parse(res.value.body) as LogMessage[] : undefined,
+      error: res.status === 'rejected' ? errMsg(res) : undefined,
+    };
+  });
+
   if (format === 'raw') {
     return JSON.stringify({
       header: headerRes.status === 'fulfilled'
@@ -186,11 +219,17 @@ export async function bwGetRequest(
         ? JSON.parse(dtpInfoRes.value.body) as DtpInformation
         : { error: errMsg(dtpInfoRes) },
       processes: processesRes.status === 'fulfilled'
-        ? JSON.parse(processesRes.value.body) as ProcessStep[]
+        ? processes
         : { error: errMsg(processesRes) },
       logs: logsRes.status === 'fulfilled'
         ? JSON.parse(logsRes.value.body) as LogMessage[]
         : { error: errMsg(logsRes) },
+      processStepLogs: stepLogs.map((s) => ({
+        processTsn: s.step.processTsn,
+        processTypeDescription: s.step.processTypeDescription,
+        processStatus: s.step.processStatus,
+        ...(s.logs ? { logs: s.logs } : { error: s.error }),
+      })),
     }, null, 2);
   }
 
@@ -253,7 +292,6 @@ export async function bwGetRequest(
   // Section 3 — process steps
   lines.push('');
   if (processesRes.status === 'fulfilled') {
-    const processes = JSON.parse(processesRes.value.body) as ProcessStep[];
     lines.push(`── Process Steps (${processes.length}) ──`);
     for (const step of processes) {
       lines.push(`  ${step.processTsnExternal ?? ''} — ${step.processTypeDescription ?? ''}`);
@@ -267,13 +305,17 @@ export async function bwGetRequest(
 
   // Section 4 — message log. longText is SAPscript-to-HTML; its only added value over
   // message is the "Meldungsnr. {MSGID}" — extract that and append it, drop the raw HTML.
+  const formatLog = (log: LogMessage): string => {
+    const msgNo = log.longText?.match(/Meldungsnr\.\s*([A-Z0-9_\/]+)/)?.[1];
+    return `  [${log.severity ?? ''}] ${log.message ?? ''}${msgNo ? ` (${msgNo})` : ''}`;
+  };
+
   lines.push('');
   if (logsRes.status === 'fulfilled') {
     const logs = JSON.parse(logsRes.value.body) as LogMessage[];
     lines.push(`── Message Log (${logs.length}) ──`);
     for (const log of logs) {
-      const msgNo = log.longText?.match(/Meldungsnr\.\s*([A-Z0-9_\/]+)/)?.[1];
-      lines.push(`  [${log.severity ?? ''}] ${log.message ?? ''}${msgNo ? ` (${msgNo})` : ''}`);
+      lines.push(formatLog(log));
     }
   } else {
     // Not the storage-code hint used for the other sections: this endpoint takes no storage
@@ -281,6 +323,33 @@ export async function bwGetRequest(
     lines.push('── Message Log ──');
     const reason = errMsg(logsRes).split('\n').map((l) => l.trim()).filter(Boolean).join(' — ');
     lines.push(`  (no message log for this request: ${reason})`);
+  }
+
+  // Section 5 — message log of each process step that runs under its own TSN
+  for (const { step, logs, error } of stepLogs) {
+    const title =
+      `${step.processTypeDescription ?? step.processType ?? 'Process'} ` +
+      `${step.processTsnExternal ?? step.processTsn ?? ''} ` +
+      `— ${decodeStatus(processStatus, step.processStatus)}`;
+    lines.push('');
+    if (logs) {
+      lines.push(`── Message Log: ${title} (${logs.length}) ──`);
+      for (const log of logs) {
+        lines.push(formatLog(log));
+      }
+    } else {
+      lines.push(`── Message Log: ${title} ──`);
+      const reason = (error ?? '').split('\n').map((l) => l.trim()).filter(Boolean).join(' — ');
+      lines.push(`  (not available: ${reason})`);
+    }
+  }
+
+  if (ownTsnSteps.length > stepLogs.length) {
+    lines.push('');
+    lines.push(
+      `(${ownTsnSteps.length - stepLogs.length} further process step(s) have their own log; ` +
+      `only the first ${MAX_STEP_LOGS} are read per call)`
+    );
   }
 
   return lines.join('\n');
@@ -324,5 +393,214 @@ export async function bwActivateRequest(
     message:
       `Data activation started for request ${requestTsn} (storage ${storage.toUpperCase()}). ` +
       `Activation runs asynchronously; monitor completion via bw_list_requests / bw_get_request.`,
+  });
+}
+
+// Storage codes that hold activated data. A request in one of these is an activation
+// request, which the delete endpoint rejects ("Request ist kein löschbarer Request") —
+// it has to be rolled back instead, which also removes the load request underneath it.
+const ACTIVATED_STORAGES = new Set(['AT', 'AX']);
+
+interface DeleteResultEntry {
+  storage?: string;
+  request?: string;
+  requestExternal?: string;
+}
+
+interface DeleteResponse {
+  status?: string;
+  successfulRequests?: DeleteResultEntry[];
+  failedRequests?: DeleteResultEntry[];
+  messages?: LogMessage[];
+}
+
+interface RequestRef {
+  tsn: string;
+  storage: string;
+  external?: string;
+}
+
+async function listRequestRefs(
+  client: BwClient,
+  target: string,
+  targetType: string,
+  top: number,
+): Promise<RequestRef[]> {
+  const url =
+    `/sap/bc/http/sap/bw4/v1/manage/requests` +
+    `?tlogo=${encodeURIComponent(targetType.toLowerCase())}` +
+    `&datatarget=${encodeURIComponent(target.toLowerCase())}` +
+    `&storage=AQ,AX,AT` +
+    `&latestrequests=${top}&top=${top}` +
+    `&status=N,GG,GR,YG,RR,YR,RG,U,Y,X`;
+
+  const result = await client.rawGet(url, GET_HEADERS);
+  const rows = JSON.parse(result.body) as RequestListItem[];
+  return rows
+    .filter((r) => r.requestTsn && r.storage)
+    .map((r) => ({
+      tsn: r.requestTsn!,
+      storage: r.storage!.toUpperCase(),
+      external: r.requestTsnExternal,
+    }));
+}
+
+/** POST .../manage/requests/{tsn}/{storage}/rollback — undo an activation. */
+async function rollbackRequest(
+  client: BwClient,
+  ref: RequestRef,
+  csrfToken: string,
+): Promise<void> {
+  const url =
+    `/sap/bc/http/sap/bw4/v1/manage/requests/${encodeURIComponent(ref.tsn)}` +
+    `/${ref.storage.toLowerCase()}/rollback`;
+  await client.rawPost(url, '', {
+    'Content-Type': 'application/json',
+    'Accept': '*/*',
+    'x-csrf-token': csrfToken,
+  });
+}
+
+/** POST .../manage/requests/delete — batch-delete load requests. */
+async function deleteRequests(
+  client: BwClient,
+  refs: RequestRef[],
+  csrfToken: string,
+): Promise<DeleteResponse> {
+  const body = JSON.stringify({
+    asynchronous: true,
+    requests: refs.map((r) => ({ request: r.tsn, storage: r.storage })),
+  });
+  const res = await client.rawPost('/sap/bc/http/sap/bw4/v1/manage/requests/delete', body, {
+    'Content-Type': 'application/json',
+    'Accept': '*/*',
+    'x-csrf-token': csrfToken,
+  });
+  return JSON.parse(res.body) as DeleteResponse;
+}
+
+/**
+ * bw_delete_request — remove load requests from an InfoProvider.
+ *
+ * BW splits this into two endpoints that the caller should not have to know about, so this
+ * tool picks the right one per request:
+ *
+ *   load request (inbound, AQ)      POST .../manage/requests/delete
+ *                                   body {asynchronous, requests:[{request, storage}]}
+ *   activation request (AT/AX)      POST .../manage/requests/{tsn}/{storage}/rollback
+ *
+ * Calling the delete endpoint with an activation request answers HTTP 400 "not a deletable
+ * request". A rollback undoes the activation of that request AND every later one, and takes
+ * the load request underneath it with it — so clearing a provider means rolling back the
+ * OLDEST activation request once, then deleting whatever is left in the inbound queue.
+ *
+ * That sequence is what all_requests does, which is the regular case before switching a DTP
+ * from delta to full: BW refuses the extraction-mode change while delta requests remain.
+ *
+ * Runs in a fresh session (createClientFromEnv()) like the other runtime write tools, to
+ * avoid a stale shared-session buffer and cross-call CSRF collisions.
+ */
+export async function bwDeleteRequest(
+  client: BwClient,
+  requestTsn?: string,
+  storage: string = 'AQ',
+  target?: string,
+  targetType: string = 'ADSO',
+  allRequests: boolean = false,
+): Promise<string> {
+  if (!allRequests && !requestTsn) {
+    throw new Error('bw_delete_request needs either request_tsn or all_requests=true with target.');
+  }
+  if (allRequests && !target) {
+    throw new Error('bw_delete_request with all_requests=true needs target (and target_type).');
+  }
+
+  const runClient = createClientFromEnv();
+  const csrfToken = await runClient.getCsrfToken();
+
+  const rolledBack: RequestRef[] = [];
+  const deleted: DeleteResultEntry[] = [];
+  const failed: DeleteResultEntry[] = [];
+  const notes: string[] = [];
+
+  if (!allRequests) {
+    const ref: RequestRef = { tsn: requestTsn!, storage: storage.toUpperCase() };
+    if (ACTIVATED_STORAGES.has(ref.storage)) {
+      // Snapshot first so the caller learns which requests the cascade took with it.
+      const before = target ? await listRequestRefs(client, target, targetType, 50) : [];
+      await rollbackRequest(runClient, ref, csrfToken);
+      rolledBack.push(ref);
+      if (target) {
+        const after = await listRequestRefs(client, target, targetType, 50);
+        const left = new Set(after.map((r) => `${r.tsn}/${r.storage}`));
+        for (const b of before) {
+          if (!left.has(`${b.tsn}/${b.storage}`) && b.tsn !== ref.tsn) {
+            deleted.push({ request: b.tsn, storage: b.storage, requestExternal: b.external });
+          }
+        }
+      } else {
+        notes.push(
+          'Rollback also removes later activation requests and the load request underneath; ' +
+          'pass target to have the tool report exactly which ones went.',
+        );
+      }
+    } else {
+      const res = await deleteRequests(runClient, [ref], csrfToken);
+      deleted.push(...(res.successfulRequests ?? []));
+      failed.push(...(res.failedRequests ?? []));
+    }
+  } else {
+    const refs = await listRequestRefs(client, target!, targetType, 200);
+    if (refs.length === 0) {
+      return JSON.stringify({
+        success: true,
+        target: target!.toUpperCase(),
+        deleted_requests: [],
+        message: `${target!.toUpperCase()} holds no requests — nothing to delete.`,
+      });
+    }
+
+    // Oldest first: rolling back the oldest activation cascades through every later one.
+    const activated = refs
+      .filter((r) => ACTIVATED_STORAGES.has(r.storage))
+      .sort((a, b) => a.tsn.localeCompare(b.tsn));
+
+    if (activated.length > 0) {
+      await rollbackRequest(runClient, activated[0], csrfToken);
+      rolledBack.push(...activated);
+    }
+
+    // The rollback returns its load requests to the inbound queue, so re-read instead of
+    // deleting the pre-rollback list.
+    const remaining = await listRequestRefs(client, target!, targetType, 200);
+    const deletable = remaining.filter((r) => !ACTIVATED_STORAGES.has(r.storage));
+    if (deletable.length > 0) {
+      const res = await deleteRequests(runClient, deletable, csrfToken);
+      deleted.push(...(res.successfulRequests ?? []));
+      failed.push(...(res.failedRequests ?? []));
+    }
+
+    const stillThere = await listRequestRefs(client, target!, targetType, 200);
+    if (stillThere.length > 0) {
+      notes.push(
+        `${stillThere.length} request(s) still present after the run: ` +
+        stillThere.map((r) => `${r.tsn} (${r.storage})`).join(', ') +
+        '. Deletion is asynchronous — re-check with bw_list_requests before concluding it failed.',
+      );
+    }
+  }
+
+  return JSON.stringify({
+    success: failed.length === 0,
+    target: target ? target.toUpperCase() : undefined,
+    rolled_back_requests: rolledBack.map((r) => ({ request: r.tsn, storage: r.storage })),
+    deleted_requests: deleted,
+    failed_requests: failed,
+    notes: notes.length > 0 ? notes : undefined,
+    message:
+      `Deletion started: ${rolledBack.length} activation request(s) rolled back, ` +
+      `${deleted.length} request(s) deleted` +
+      (failed.length > 0 ? `, ${failed.length} failed` : '') +
+      '. BW runs the deletion asynchronously; confirm with bw_list_requests.',
   });
 }

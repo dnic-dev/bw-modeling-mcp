@@ -32,7 +32,8 @@ Two role collections ship in `xs-security.json`:
 
 | Collection | Scope | Gets |
 |---|---|---|
-| **BW MCP Reader** | `read` | the 41 read tools |
+| **BW MCP Reader** | `read` | the 45 read tools — modelling objects, flows, routines, monitoring and query data |
+| **BW MCP Analyst** | `analyst` | 14 reporting tools: run a query or a provider, and find and understand what to run. A subset of `read`, meant as a small client for business users rather than as a narrower permission |
 | **BW MCP Developer** | `read` + `write` | all 83 |
 
 A reader does not merely get errors from the write tools — they are filtered out of
@@ -161,6 +162,7 @@ KBA **3361376259** (propagation over HTTPS), **3367280** (401 / credential popup
 | `BW_ALLOWED_ORIGINS` | CORS allowlist for browser-based MCP clients |
 | `BW_MCP_SERVER_NAME` | server name in the MCP handshake (default `bw-modeling-mcp`); make it unique per instance |
 | `BW_MCP_SYSTEM_LABEL` | free-text system label (e.g. `AP4 (BW production, read-only)`) shown at the top of the server instructions |
+| `BW_PLATFORM` | `auto` (default), `classic`, `bw4` — platform detection for the tool surface; `classic` forces the classic verdict, `bw4` turns the filter off |
 
 With `BW_PP_ENABLED=true` the server refuses to start if `BW_USER`, `BW_PASSWORD` or
 `BW_COOKIE_FILE` is also set: BW ties a session to whoever opened it, so one leftover

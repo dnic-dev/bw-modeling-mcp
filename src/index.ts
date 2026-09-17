@@ -14,7 +14,14 @@ import { createRequire } from 'node:module';
 
 import { createClientFromEnv, type BwClient } from './bw-client.js';
 import { currentClient } from './request-context.js';
-import { filterToolsByScope, hasScope, requiredScope } from './scopes.js';
+import { filterToolsByScope, mayCall, scopesFor } from './scopes.js';
+import {
+  cachedPlatform,
+  ensurePlatform,
+  filterToolsByPlatform,
+  platformInstructions,
+  unavailableReason,
+} from './platform.js';
 import { bwGetAdso, bwCreateAdso, FieldDef, bwUpdateAdso, bwUpdateAdsoAddPureField, bwUpdateAdsoSettings, AdsoSettings, bwUpdateAdsoManageKeys, bwUpdateAdsoFieldProperties, FieldProperties } from './tools/adso.js';
 import { bwGetInfoObject, bwCreateInfoObject, bwUpdateInfoObject, AttributeDef } from './tools/infoobject.js';
 import { bwGetTransformation, bwUpdateTransformation, bwCreateTransformation, bwSetTransformationRuntime, bwSetTransformationRoutine, bwDeleteTransformationRoutine, bwSetTransformationRoutineFields, bwSetTransformationExpertRoutine } from './tools/transformation.js';
@@ -44,6 +51,18 @@ import {
 import { bwUpdateCompositeProvider, CompositeProviderFieldAction } from './tools/composite_provider_update.js';
 import { bwGetCkf, bwGetRkf, bwGetStructure } from './tools/cp_components.js';
 import { bwCreateRkf, CreateRkfArgs } from './tools/rkf_create.js';
+import {
+  bwCreateCkf,
+  bwUpdateCkf,
+  bwUpdateRkf,
+  bwCreateStructure,
+  bwUpdateStructure,
+  CreateCkfArgs,
+  UpdateCkfArgs,
+  UpdateRkfArgs,
+  CreateStructureArgs,
+  UpdateStructureArgs,
+} from './tools/elem_write.js';
 import { bwListContents } from './tools/repository.js';
 import { bwListSourceSystems, bwListDatasources, bwGetSourceSystem, bwGetDatasource, bwPreviewDatasource, bwListRemoteEntities, bwCreateDatasource, bwChangeDatasourceDelta, bwSetDatasourceFields } from './tools/datasource.js';
 import { bwGetDataflow } from './tools/dataflow.js';
@@ -51,7 +70,7 @@ import { bwQueryData, bwGetFilterValues, InfoObjectState, VariableInput, DrillOp
 import { bwGetRoles, bwGetQueryRoles, bwSetQueryRoles, bwGetRoleQueries } from './tools/roles.js';
 import { bwGetProcessChain } from './tools/processchain.js';
 import { bwGetProcessVariant } from './tools/processvariant.js';
-import { bwListRequests, bwGetRequest, bwActivateRequest } from './tools/request_monitor.js';
+import { bwListRequests, bwGetRequest, bwActivateRequest, bwDeleteRequest } from './tools/request_monitor.js';
 import {
   bwListRemodelingRequests,
   bwGetRemodelingRequest,
@@ -479,6 +498,15 @@ const TOOL_DEFINITIONS = [
             type: 'boolean',
             description: 'CHA only. Generate text tables. Default false.',
           },
+          lower_case: {
+            type: 'boolean',
+            description:
+              'CHA only. Allow lower case letters (RSDCHABAS-LOWERCASE). Default false. ' +
+              'Set true for characteristics whose values may contain lower case letters or ' +
+              'characters outside the permitted character set (RSKC), such as umlauts — the flag ' +
+              'switches off that check for this characteristic. Without it, a load carrying such ' +
+              'values is accepted but fails later during request activation.',
+          },
           referenced_infoobject: {
             type: 'string',
             description: 'CHA only. Reference to an existing InfoObject (e.g. "IOBJ_NAME"). Omit withMasterData/withTexts — they are inherited. Default "".',
@@ -695,8 +723,8 @@ const TOOL_DEFINITIONS = [
     {
       name: 'bw_update_infoobject',
       description:
-        'Update a Characteristic InfoObject: change description and/or replace the attribute list. ' +
-        'Replaces all existing attributes with the supplied list (pass an empty array to remove all). ' +
+        'Update a Characteristic InfoObject: change description, the lower case flag, and/or replace the attribute list. ' +
+        'Supplying attributes replaces all existing ones (pass an empty array to remove all); omitting them leaves the list untouched. ' +
         'Also supports Key Figure (KYF) updates: set fixed_unit or fixed_currency. ' +
         'Sequence: lock → GET → PUT → activate → unlock — all in one call.',
       inputSchema: {
@@ -709,6 +737,15 @@ const TOOL_DEFINITIONS = [
           description: {
             type: 'string',
             description: 'New short and long description text. Omit to keep existing.',
+          },
+          lower_case: {
+            type: 'boolean',
+            description:
+              'CHA only. Allow lower case letters (RSDCHABAS-LOWERCASE). Omit to keep existing. ' +
+              'Set true for characteristics whose values may contain lower case letters or characters ' +
+              'outside the permitted character set (RSKC), such as umlauts. Changing the flag on a ' +
+              'characteristic already used by a provider that holds data is accepted; a load that ' +
+              'failed activation on such a value can then simply be activated again.',
           },
           transport: {
             type: 'string',
@@ -724,7 +761,7 @@ const TOOL_DEFINITIONS = [
           },
           attributes: {
             type: 'array',
-            description: 'New attribute list. Omit or pass [] to remove all attributes.',
+            description: 'New attribute list, replacing all existing ones. Pass [] to remove all attributes; omit to leave them unchanged.',
             items: {
               type: 'object',
               properties: {
@@ -769,10 +806,11 @@ const TOOL_DEFINITIONS = [
         'Map a source field to a target InfoObject in a Transformation, or convert an existing rule to a field routine (StepRoutine) or formula rule (StepFormula). ' +
         'rule_type="direct" (default): changes a StepNoUpdate/StepInitial rule to StepDirect. ' +
         'rule_type="routine": converts an existing StepDirect, StepInitial, or StepNoUpdate rule to StepRoutine (AMDP field routine). ' +
-        'rule_type="formula": converts an existing rule to StepFormula — no ABAP class generated, BW evaluates the formula natively. ' +
+        'rule_type="formula": writes the rule as StepFormula whatever step type it has now, including an existing formula rule whose text is to be changed — no ABAP class generated, BW evaluates the formula natively. ' +
+        'Every operand of the expression is registered as a source of the rule, so a formula over several source fields works; the operands are read out of the formula and need not be listed. ' +
         'rule_type="constant": sets a fixed constant value on the target field — no source field needed. ' +
-        'For routine/formula on StepNoUpdate rules, source_field is required. ' +
-        'For routine/formula on StepDirect/StepInitial rules, source_field is ignored (field is already mapped). ' +
+        'For routine on StepNoUpdate rules, source_field is required. ' +
+        'For routine on StepDirect/StepInitial rules, source_field is ignored (field is already mapped). ' +
         'source_field is always ignored for rule_type="constant". ' +
         'rule_type="direct" with unit_source_field set: creates a COMBINED key-figure + unit/currency ' +
         'direct rule (multi-source/target) — maps a quantity together with its unit (or an amount with ' +
@@ -803,7 +841,7 @@ const TOOL_DEFINITIONS = [
             description:
               'Rule type to assign. "direct" (default): maps source field directly (StepDirect). ' +
               '"routine": converts the rule to an AMDP field routine (StepRoutine) — the server generates the ABAP class automatically. ' +
-              '"formula": converts the rule to a formula rule (StepFormula) — requires the formula parameter. ' +
+              '"formula": writes the rule as a formula rule (StepFormula) — requires the formula parameter; also used to change the formula text of an existing formula rule. ' +
               '"constant": sets a fixed constant value (StepConstant) — requires the constant_value parameter, source_field is ignored. ' +
               '"lookup": converts the rule to a StepRead (Lookup) rule — requires lookup_object and lookup_object_type. ' +
               '"no_update": reverts any existing mapping back to StepNoUpdate (no mapping, field stays empty). ' +
@@ -816,7 +854,9 @@ const TOOL_DEFINITIONS = [
               'Source fields are referenced by their technical field name: use /BIC/FIELDNAME for custom InfoObjects (e.g. "/BIC/FIELD_NAME + 10"), ' +
               'or the direct field name for standard InfoObjects. ' +
               'Operators: +, -, *, /. Functions: IF, ABS, CONCATENATE, DATE_YEAR, etc. ' +
-              'Comparison operators < > <= >= <> are supported (will be XML-escaped automatically).',
+              'Comparison operators < > <= >= <> are supported (escaping is handled automatically, in either spelling). ' +
+              'Every operand of the expression is wired up as a source of the rule; operands that name a source-segment ' +
+              'field are recognised in the expression itself, so a multi-operand formula works without listing them.',
           },
           constant_value: {
             type: 'string',
@@ -839,8 +879,9 @@ const TOOL_DEFINITIONS = [
             items: { type: 'string' },
             description:
               'Additional source fields for rule_type="formula" when the formula references more than one source field. ' +
-              'Combined with source_field, all listed fields are registered as inputs on the StepFormula rule. ' +
-              'Example: ["QUANTITY_SOLD", "COST_PER_UNIT"].',
+              'Combined with source_field, all listed fields are registered as inputs on the StepFormula rule — alongside ' +
+              'the operands read out of the formula itself, so this is only needed for a field the expression does not name ' +
+              'under its source-segment name. Example: ["QUANTITY_SOLD", "COST_PER_UNIT"].',
           },
           unit_source_field: {
             type: 'string',
@@ -1457,6 +1498,59 @@ const TOOL_DEFINITIONS = [
       },
     },
     {
+      name: 'bw_delete_request',
+      description:
+        'Delete load requests from an InfoProvider, removing the data they brought in along ' +
+        'with their entry in the request management. This is the precondition BW demands ' +
+        'before several follow-up steps — above all switching a DTP from delta to full ' +
+        'extraction, which BW refuses while delta requests remain in the target. ' +
+        'NOT the same as selective deletion of records by condition, which removes rows but ' +
+        'leaves the request. ' +
+        'Handles both kinds of request: a load request in the inbound queue is deleted, an ' +
+        'activation request is rolled back instead — a rollback also undoes every later ' +
+        'activation and removes the load request underneath it. ' +
+        'Use all_requests=true with target to clear a provider completely, which is the ' +
+        'regular case before an extraction-mode change. ' +
+        'Asynchronous: a successful call starts the deletion; confirm with bw_list_requests. ' +
+        'Returns which requests were rolled back and which were deleted.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          request_tsn: {
+            type: 'string',
+            description:
+              'Request TSN to delete (from bw_list_requests / bw_run_dtp output). ' +
+              'Omit when using all_requests.',
+          },
+          storage: {
+            type: 'string',
+            description:
+              'Storage area code the request lives in (default "AQ"). Take it from the ' +
+              '"Storage" line of bw_list_requests. AT/AX mark an activation request, which ' +
+              'is rolled back rather than deleted.',
+          },
+          target: {
+            type: 'string',
+            description:
+              'Target InfoProvider technical name (e.g. "OBJECT_NAME"). Required with ' +
+              'all_requests; optional with request_tsn, where it lets the tool report which ' +
+              'further requests a rollback cascade took with it.',
+          },
+          target_type: {
+            type: 'string',
+            description: 'Target object type (default "ADSO").',
+          },
+          all_requests: {
+            type: 'boolean',
+            description:
+              'Delete every request of target in one run (default false): roll back the ' +
+              'activations, then delete what is left in the inbound queue.',
+          },
+        },
+        required: [],
+      },
+    },
+    {
       name: 'bw_list_remodeling_requests',
       description:
         'List remodeling requests from the remodeling monitor, with decoded status, last run ' +
@@ -1794,6 +1888,9 @@ const TOOL_DEFINITIONS = [
       description:
         'Read a BW Query definition — variables, filter, layout (rows/columns/free characteristics), ' +
         'calculated and restricted measures, exceptions, and cell definitions. ' +
+        'Structure members are reported with their properties: input readiness and disaggregation ' +
+        '(the planning settings), decimals, scaling, sign inversion, constant selection, position, ' +
+        'nested child members and the inverse formulas that make an input-ready formula writable. ' +
         'Tries the active version first; falls back to the inactive version if not found. ' +
         'format="text" (default): compact human-readable output. format="raw": full parsed JSON.',
       inputSchema: {
@@ -2075,8 +2172,9 @@ const TOOL_DEFINITIONS = [
       description:
         'Manage the key figure structure of an existing BW Query: add basic key figures, add references ' +
         'to reusable CKFs/RKFs (with optional local restrictions), add local formula members (recursive ' +
-        'operator/operand tree), set member display properties (decimals, hidden, sign inversion) and ' +
-        'exception aggregation, and remove members. All operations are applied in a single save. ' +
+        'operator/operand tree), set member display and planning properties (decimals, hidden, sign ' +
+        'inversion, input readiness, disaggregation, constant selection) and exception aggregation, and ' +
+        'remove members. All operations are applied in a single save. ' +
         'Member operations also apply to a reusable key figure structure referenced via ' +
         'bw_update_query_layout add_structure. ' +
         'All names must be technical names (e.g. "IOBJ_NAME", "CKF_NAME", "QUERY_NAME").',
@@ -2111,8 +2209,9 @@ const TOOL_DEFINITIONS = [
                     'add_key_figure: add a basic key figure (infoobject). add_ckf / add_rkf: add a reference ' +
                     'to a reusable calculated / restricted key figure (component_name). add_formula: add a local ' +
                     'formula member (description + formula). remove_member: remove a member matched by member_id, ' +
-                    'description, and/or component_name. set_member_properties: change display properties / ' +
-                    'exception aggregation of a matched member.',
+                    'description, and/or component_name. set_member_properties: change properties, exception ' +
+                    'aggregation, the inverse formula, or the place in the structure (parent / position) of a ' +
+                    'matched member. Members are matched at any depth, so a nested child can be targeted too.',
                 },
                 infoobject: {
                   type: 'string',
@@ -2174,8 +2273,8 @@ const TOOL_DEFINITIONS = [
                 properties: {
                   type: 'object',
                   description:
-                    'Member display properties (for "set_member_properties"; also allowed on "add_formula"). ' +
-                    'Only the provided fields are changed.',
+                    'Member display and planning properties. Accepted on "set_member_properties" and on ' +
+                    'every add action. Only the provided fields are changed.',
                   properties: {
                     decimals: { type: 'integer', minimum: 0, maximum: 9, description: 'Number of decimal places (0-9).' },
                     hidden: {
@@ -2187,7 +2286,70 @@ const TOOL_DEFINITIONS = [
                         'Exception aggregation { "type": "AVG", "reference_characteristic": "IOBJ_NAME" }, or false to reset it.',
                     },
                     description: { type: 'string', description: 'New member description text.' },
+                    input_mode: {
+                      description:
+                        'Input readiness — required for a member to be writable in a planning query. ' +
+                        '"inputReady" turns input on, "not" turns it explicitly off, false restores the ' +
+                        'default (also not input-ready). The lock flag is derived by the backend and is ' +
+                        'deliberately not settable.',
+                    },
+                    disaggregation: {
+                      description:
+                        'How an entered value is distributed: "copy", "no", "absolute", or false to restore ' +
+                        'the default.',
+                    },
+                    disaggregation_reference: {
+                      type: 'string',
+                      description:
+                        'Reference member for disaggregation "absolute", by member id or description.',
+                    },
+                    constant_selection: {
+                      type: 'boolean',
+                      description: 'Constant selection on the member itself.',
+                    },
                   },
+                },
+                parent: {
+                  type: 'string',
+                  description:
+                    'Nest the member under this one, by member id or description. On an add action the new ' +
+                    'member is created as a child; on "set_member_properties" an existing member is moved ' +
+                    'there. A member that is already nested can be moved to a different parent or reordered ' +
+                    'within its parent, but cannot be lifted back to the top level — remove and re-add it ' +
+                    'for that.',
+                },
+                position: {
+                  type: 'integer',
+                  minimum: 0,
+                  description:
+                    'Position among the siblings (0 inserts before the first). Appends when omitted. ' +
+                    'On "set_member_properties" without "parent" the member stays on its current level.',
+                },
+                inverse: {
+                  type: 'object',
+                  description:
+                    'Inverse formula of an input-ready formula member (for "add_formula" and ' +
+                    '"set_member_properties"). Without it the backend refuses input readiness on a formula ' +
+                    'while still storing the flag, leaving a member that cannot be planned on.',
+                  properties: {
+                    target: {
+                      type: 'string',
+                      description:
+                        'Member an entered value is written back to, by member id or description — ' +
+                        'normally the plannable child of the formula.',
+                    },
+                    formula: {
+                      type: 'object',
+                      description:
+                        'How the written-back value is derived; same node shape as "formula". Defaults to a ' +
+                        'reference to the formula member itself.',
+                    },
+                    description: {
+                      type: 'string',
+                      description: 'Description of the inverse formula member.',
+                    },
+                  },
+                  required: ['target'],
                 },
                 restrictions: {
                   type: 'array',
@@ -2660,21 +2822,47 @@ const TOOL_DEFINITIONS = [
         'for which no release ships a REST resource. ' +
         'Use bw_system_profile to see which endpoints a system publishes. ' +
         'Supported object_type: TRFN (transformation incl. start/end/expert and field routine source code), ' +
-        'DTPA (data transfer process), ODSO (classic DataStore Object), CUBE (InfoCube), MPRO (MultiProvider) ' +
+        'DTPA (data transfer process), ADSO (load history only — structure and settings come from bw_get_adso), ' +
+        'ODSO (classic DataStore Object), CUBE (InfoCube), MPRO (MultiProvider) ' +
         'and RSPC (process chain: steps with their variant parameters, in execution order — every step follows its ' +
         'predecessors, but branches that run in parallel have no order among themselves, so read the "After" line ' +
         'of each step for the actual dependency). ' +
+        'Planning objects: PLSE (planning function: type, aggregation level, characteristic usage, conditions and ' +
+        'the full parameter tree with its selections; FOX formula lines come back as source code, and a customer ' +
+        'function type names its exit class), PLSQ (planning sequence: steps in execution order with aggregation ' +
+        'level, function and filter), PLCR (planning properties of an InfoProvider: key date, save strategy and the ' +
+        'characteristic relationships) and PLDS (data slices of an InfoProvider — no release publishes a REST ' +
+        'resource for those, so this is the only route to them on any platform). ' +
+        'PLCR and PLDS are keyed by the InfoProvider, not by the aggregation level. ' +
+        'ANPR reads an analysis process (APD): its nodes in execution order with the object each source reads and each target writes, the edges between them, filters, formulas and the ABAP of a routine node. No release publishes a REST resource for it and BW/4HANA dropped the object type, so this is the only route on any platform. A node type this reader does not know is still listed with its category and attributes rather than dropped. ' +
+        'RSPCLOG reads process chain *runs* (the definition is RSPC) and answers three questions ' +
+        'from one type, told apart by what object_name is: a chain name returns the run history ' +
+        'newest first plus the steps of the newest run; a 25-character log id returns the steps of ' +
+        'that run with status, start, duration and the process variant behind each; a pattern with ' +
+        '* returns the last status of every matching chain. Status codes come back as the raw code ' +
+        'plus its colour and meaning. The message log of a failed step is an application log and is ' +
+        'not readable through table access. ' +
+        'ADSO, ODSO, CUBE and MPRO end with the load history of the provider — request, status, update mode, ' +
+        'start, user, duration, records and source — which on a classic release is the only route to load ' +
+        'status, since the BW/4HANA request monitor API does not exist there. ' +
         'Requires ADT authorization for the calling user. Prefer bw_get_transformation where the REST endpoint exists.',
       inputSchema: {
         type: 'object',
         properties: {
           object_type: {
             type: 'string',
-            description: 'Object type to read. Supported: TRFN, DTPA, ODSO, CUBE, MPRO, RSPC.',
+            description:
+              'Object type to read. Supported: TRFN, DTPA, ADSO (load history only), ODSO, CUBE, MPRO, RSPC, ' +
+              'PLSE (planning function), PLSQ (planning sequence), PLCR (planning properties and characteristic ' +
+              'relationships of an InfoProvider), PLDS (data slices of an InfoProvider), RSPCLOG ' +
+              '(process chain runs) and ANPR (analysis process / APD).',
           },
           object_name: {
             type: 'string',
-            description: 'Technical name of the object (for TRFN the UUID-like transformation ID).',
+            description:
+              'Technical name of the object (for TRFN the UUID-like transformation ID; for PLCR and PLDS the ' +
+              'InfoProvider, not the aggregation level; for RSPCLOG a chain name, a run log id, or a ' +
+              'pattern such as "Z*" for the last status per chain).',
           },
         },
         required: ['object_type', 'object_name'],
@@ -2965,7 +3153,8 @@ const TOOL_DEFINITIONS = [
       name: 'bw_get_ckf',
       description:
         'Read a global Calculated Key Figure (CKF) defined at CompositeProvider level. ' +
-        'Returns technical name, description, formula (recursively resolved), metadata, ' +
+        'Returns technical name, description, the formula both as a rendered string and as a ' +
+        'structured tree (formula_tree) that bw_create_ckf and bw_update_ckf take back unchanged, metadata, ' +
         'and the full dependency graph of referenced CKF/RKF sub-components.',
       inputSchema: {
         type: 'object',
@@ -3095,6 +3284,215 @@ const TOOL_DEFINITIONS = [
           },
         },
         required: ['provider_name', 'technical_name', 'description', 'base_key_figure', 'restrictions'],
+      },
+    },
+    {
+      name: 'bw_create_ckf',
+      description:
+        'Create a reusable Calculated Key Figure (CKF) on an InfoProvider. The formula is passed ' +
+        'as an operator/operand tree in the same node syntax `bw_update_query_key_figures` uses for ' +
+        '"add_formula", so a tree read back from `bw_get_ckf` (field formula_tree) can be written ' +
+        'again unchanged. Records to a transport when package and transport_request are given, and ' +
+        'reports in "recorded_in" where the entry actually landed.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          provider_name: {
+            type: 'string',
+            description: 'InfoProvider the CKF is defined on (e.g. a CompositeProvider).',
+          },
+          technical_name: { type: 'string', description: 'Technical name of the new CKF.' },
+          description: { type: 'string', description: 'Description of the CKF.' },
+          formula: { type: 'object', description: "Formula tree. A node is one of: {\"type\":\"operator\",\"code\":\"+\",\"operands\":[...]} (codes as in the BW formula editor: + - * / , NDIV0, IF, MAX, %A, …); {\"type\":\"component\",\"component_name\":\"...\"} for a reusable CKF/RKF; {\"type\":\"key_figure\",\"name\":\"...\"} for a basic key figure InfoObject; {\"type\":\"constant\",\"value\":100}. Operand counts are checked against the operator catalog before anything is written." },
+          decimals: { type: 'integer', description: 'Number of decimal places (0-9). Server default when omitted.' },
+          info_area: { type: 'string', description: 'InfoArea the CKF is filed under.' },
+          package: { type: 'string', description: 'Development package (default "$TMP").' },
+          transport_request: { type: 'string', description: 'Transport request to record the CKF in.' },
+        },
+        required: ['provider_name', 'technical_name', 'description', 'formula'],
+      },
+    },
+    {
+      name: 'bw_update_ckf',
+      description:
+        'Change a reusable Calculated Key Figure. Two call forms: pass "formula" to replace the whole ' +
+        'expression, or "operations" for targeted edits that leave the rest of the formula untouched — ' +
+        'the usual case being "add another summand to a sum" without having to know or rebuild the ' +
+        'existing formula. All operations are applied to one document and written in a single save, so ' +
+        'a rejected operation leaves the stored formula unchanged rather than half edited.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          component_name: { type: 'string', description: 'Technical name of the CKF.' },
+          description: { type: 'string', description: 'New description.' },
+          formula: {
+            type: 'object',
+            description: 'Replacement formula tree (mutually exclusive with "operations"). ' + "Formula tree. A node is one of: {\"type\":\"operator\",\"code\":\"+\",\"operands\":[...]} (codes as in the BW formula editor: + - * / , NDIV0, IF, MAX, %A, …); {\"type\":\"component\",\"component_name\":\"...\"} for a reusable CKF/RKF; {\"type\":\"key_figure\",\"name\":\"...\"} for a basic key figure InfoObject; {\"type\":\"constant\",\"value\":100}. Operand counts are checked against the operator catalog before anything is written.",
+          },
+          decimals: { type: 'integer', description: 'Number of decimal places (0-9).' },
+          operations: {
+            type: 'array',
+            description: 'Targeted edits on the existing formula, applied in order.',
+            items: {
+              type: 'object',
+              properties: {
+                action: {
+                  type: 'string',
+                  enum: ['append_operand', 'remove_operand'],
+                  description:
+                    'append_operand: join an operand to the existing formula. remove_operand: drop the ' +
+                    'operand referencing a given component. In BW a sum of N summands is a left-nested ' +
+                    'chain of binary operators, so appending wraps the existing formula rather than ' +
+                    'adding a third operand, and removing replaces the operator holding the operand ' +
+                    'with its sibling. Both keep every other operand and their order intact.',
+                },
+                operand: { type: 'object', description: 'Operand to add (append_operand). ' + "Formula tree. A node is one of: {\"type\":\"operator\",\"code\":\"+\",\"operands\":[...]} (codes as in the BW formula editor: + - * / , NDIV0, IF, MAX, %A, …); {\"type\":\"component\",\"component_name\":\"...\"} for a reusable CKF/RKF; {\"type\":\"key_figure\",\"name\":\"...\"} for a basic key figure InfoObject; {\"type\":\"constant\",\"value\":100}. Operand counts are checked against the operator catalog before anything is written." },
+                operator: {
+                  type: 'string',
+                  description: 'Operator joining the new operand to the formula (append_operand). Default "+".',
+                },
+                before: {
+                  type: 'boolean',
+                  description: 'Put the new operand left of the operator instead of right (append_operand).',
+                },
+                component_name: {
+                  type: 'string',
+                  description: 'Component whose operand is removed (remove_operand).',
+                },
+              },
+              required: ['action'],
+            },
+          },
+          transport_request: { type: 'string', description: 'Transport request to record the change in.' },
+        },
+        required: ['component_name'],
+      },
+    },
+    {
+      name: 'bw_update_rkf',
+      description:
+        'Change a reusable Restricted Key Figure in place: description, base key figure and/or ' +
+        'restrictions. The UID stays the same, so references from CKFs, structures and queries stay ' +
+        'intact — unlike the delete-and-recreate that was the only correction path before, which is ' +
+        'impossible once the RKF is referenced anywhere and blocked entirely on tiers where deletion ' +
+        'is disabled. "restrictions" replaces the full set of characteristic restrictions when given.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          component_name: { type: 'string', description: 'Technical name of the RKF.' },
+          description: { type: 'string', description: 'New description.' },
+          base_key_figure: { type: 'string', description: 'New base key figure InfoObject.' },
+          restrictions: {
+            type: 'array',
+            description:
+              'Replaces ALL characteristic restrictions. Every value is validated against the ' +
+              'InfoProvider and mapped to its internal key before anything is written.',
+            items: {
+              type: 'object',
+              properties: {
+                characteristic: { type: 'string', description: 'Characteristic InfoObject to restrict on.' },
+                operator: {
+                  type: 'string',
+                  enum: ['Equal', 'Between', 'LessThan', 'GreaterThan', 'LessEqual', 'GreaterEqual', 'Contains'],
+                  description: 'Comparison operator (default "Equal").',
+                },
+                exclude: { type: 'boolean', description: 'Exclude the listed values instead of including them.' },
+                values: {
+                  type: 'array',
+                  description: 'Values to restrict to. "high" is required for operator "Between".',
+                  items: {
+                    type: 'object',
+                    properties: {
+                      low: { type: 'string', description: 'Value, or lower bound of a range.' },
+                      high: { type: 'string', description: 'Upper bound (operator "Between").' },
+                    },
+                    required: ['low'],
+                  },
+                },
+              },
+              required: ['characteristic', 'values'],
+            },
+          },
+          transport_request: { type: 'string', description: 'Transport request to record the change in.' },
+        },
+        required: ['component_name'],
+      },
+    },
+    {
+      name: 'bw_create_structure',
+      description:
+        'Create a reusable key figure structure on an InfoProvider — the object reporting queries ' +
+        'embed as an axis, so that one definition drives all of them. Members reference a reusable ' +
+        'CKF/RKF or a basic key figure and can carry their own text.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          provider_name: { type: 'string', description: 'InfoProvider the structure is defined on.' },
+          technical_name: { type: 'string', description: 'Technical name of the new structure.' },
+          description: { type: 'string', description: 'Description of the structure.' },
+          members: {
+            type: 'array',
+            description: 'Members, in display order. Can be added later with bw_update_structure.',
+            items: {
+              type: 'object',
+              properties: {
+                component_name: { type: 'string', description: 'Reusable CKF/RKF the member shows.' },
+                key_figure: { type: 'string', description: 'Basic key figure InfoObject the member shows.' },
+                description: { type: 'string', description: 'Member text (defaults to the referenced name).' },
+                properties: { type: 'object', description: 'Display and planning properties of the member.' },
+              },
+            },
+          },
+          info_area: { type: 'string', description: 'InfoArea the structure is filed under.' },
+          package: { type: 'string', description: 'Development package (default "$TMP").' },
+          transport_request: { type: 'string', description: 'Transport request to record the structure in.' },
+        },
+        required: ['provider_name', 'technical_name', 'description'],
+      },
+    },
+    {
+      name: 'bw_update_structure',
+      description:
+        'Change a reusable structure: add, remove or re-configure members. The change reaches every ' +
+        'query that embeds the structure — which is the point, and the reason this goes at the ' +
+        'structure itself rather than through one query that happens to use it. All operations are ' +
+        'applied to one document and written in a single save.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          component_name: { type: 'string', description: 'Technical name of the structure.' },
+          description: { type: 'string', description: 'New description of the structure itself.' },
+          operations: {
+            type: 'array',
+            description: 'Member operations, applied in order.',
+            items: {
+              type: 'object',
+              properties: {
+                action: {
+                  type: 'string',
+                  enum: ['add_member', 'remove_member', 'set_member_properties'],
+                  description:
+                    'add_member: insert a member showing component_name or key_figure. remove_member / ' +
+                    'set_member_properties: act on an existing member, matched by member_id, description ' +
+                    'or component_name.',
+                },
+                component_name: { type: 'string', description: 'Reusable CKF/RKF the member shows, or matches on.' },
+                key_figure: { type: 'string', description: 'Basic key figure the member shows (add_member).' },
+                member_id: { type: 'string', description: 'Member id — the unambiguous matcher.' },
+                description: { type: 'string', description: 'Member text (set on add, matches on the others).' },
+                properties: {
+                  type: 'object',
+                  description: 'Display and planning properties. Only the fields given are changed.',
+                },
+                parent: { type: 'string', description: 'Nest the new member under this one, by id or description.' },
+                position: { type: 'integer', description: 'Position among the siblings (0-based). Appends when omitted.' },
+              },
+              required: ['action'],
+            },
+          },
+          transport_request: { type: 'string', description: 'Transport request to record the change in.' },
+        },
+        required: ['component_name', 'operations'],
       },
     },
     {
@@ -4531,8 +4929,12 @@ async function handleToolCall(
   const { name, arguments: args } = request.params;
 
   // Deny before doing any work. stdio has no authInfo and nothing to check.
-  if (!hasScope(extra.authInfo, requiredScope(name))) {
-    throw new McpError(ErrorCode.InvalidRequest, `Tool '${name}' requires the '${requiredScope(name)}' scope.`);
+  if (!mayCall(name, extra.authInfo)) {
+    // Naming every scope that would admit the tool, because two of them overlap: a query
+    // definition is readable under 'read' and under 'analyst', and a caller told only about
+    // one of them would ask for the wrong role.
+    const admitted = scopesFor(name).map((s) => `'${s}'`).join(' or ');
+    throw new McpError(ErrorCode.InvalidRequest, `Tool '${name}' requires the ${admitted} scope.`);
   }
 
   // HTTP: the per-request client, whose identity came from XSUAA and the destination.
@@ -4541,6 +4943,15 @@ async function handleToolCall(
 
   try {
     await ensureMediaTypes(client);
+
+    // A client that cached the tool list before detection, or from another instance, can
+    // still call a tool this system cannot answer. Say so instead of sending the request
+    // to BW, where it would come back as an ICF error page.
+    const unavailable = unavailableReason(name, await ensurePlatform(client));
+    if (unavailable) {
+      return { content: [{ type: 'text', text: unavailable }], isError: true };
+    }
+
     let text: string;
 
     switch (name) {
@@ -4665,6 +5076,7 @@ async function handleToolCall(
           conversion_routine: args?.conversion_routine as string | undefined,
           with_master_data: args?.with_master_data as boolean | undefined,
           with_texts: args?.with_texts as boolean | undefined,
+          lower_case: args?.lower_case as boolean | undefined,
           referenced_infoobject: args?.referenced_infoobject as string | undefined,
           compound_infoobjects: args?.compound_infoobjects as string[] | undefined,
           object_specific_data_type: args?.object_specific_data_type as string | undefined,
@@ -4730,8 +5142,8 @@ async function handleToolCall(
         break;
 
       case 'bw_update_infoobject': {
-        const rawAttrs = (args?.attributes as Array<Record<string, unknown>> | undefined) ?? [];
-        const attrDefs: AttributeDef[] = rawAttrs.map((a) => ({
+        const rawAttrs = args?.attributes as Array<Record<string, unknown>> | undefined;
+        const attrDefs: AttributeDef[] | undefined = rawAttrs?.map((a) => ({
           name: a['name'] as string,
           type: a['type'] as 'DIS' | 'NAV',
           timeDependent: a['time_dependent'] as boolean | undefined,
@@ -4742,6 +5154,7 @@ async function handleToolCall(
           name: args?.name as string,
           attributes: attrDefs,
           description: args?.description as string | undefined,
+          lower_case: args?.lower_case as boolean | undefined,
           fixed_unit: args?.fixed_unit as string | undefined,
           fixed_currency: args?.fixed_currency as string | undefined,
           transport: args?.transport as string | undefined,
@@ -4957,6 +5370,17 @@ async function handleToolCall(
         );
         break;
 
+      case 'bw_delete_request':
+        text = await bwDeleteRequest(
+          client,
+          args?.request_tsn as string | undefined,
+          args?.storage as string | undefined ?? 'AQ',
+          args?.target as string | undefined,
+          args?.target_type as string | undefined ?? 'ADSO',
+          args?.all_requests as boolean | undefined ?? false,
+        );
+        break;
+
       case 'bw_list_remodeling_requests':
         text = await bwListRemodelingRequests(
           client,
@@ -5129,7 +5553,7 @@ async function handleToolCall(
         break;
 
       case 'bw_system_profile':
-        text = await bwSystemProfile(client);
+        text = await bwSystemProfile(client, TOOL_DEFINITIONS.map((t) => t.name));
         break;
 
       case 'bw_list_source_systems':
@@ -5324,6 +5748,26 @@ async function handleToolCall(
 
       case 'bw_create_rkf':
         text = await bwCreateRkf(client, args as unknown as CreateRkfArgs);
+        break;
+
+      case 'bw_create_ckf':
+        text = await bwCreateCkf(client, args as unknown as CreateCkfArgs);
+        break;
+
+      case 'bw_update_ckf':
+        text = await bwUpdateCkf(client, args as unknown as UpdateCkfArgs);
+        break;
+
+      case 'bw_update_rkf':
+        text = await bwUpdateRkf(client, args as unknown as UpdateRkfArgs);
+        break;
+
+      case 'bw_create_structure':
+        text = await bwCreateStructure(client, args as unknown as CreateStructureArgs);
+        break;
+
+      case 'bw_update_structure':
+        text = await bwUpdateStructure(client, args as unknown as UpdateStructureArgs);
         break;
 
       case 'bw_query_data': {
@@ -5682,6 +6126,11 @@ const { version: VERSION } = createRequire(import.meta.url)('../package.json') a
  * different BW systems (dev/QA/prod), and some clients show an opaque connector id instead
  * of the advertised server name — the label is then the only thing that tells the model
  * which system it is talking to, without a probing tool call.
+ *
+ * On a classic BW release a paragraph naming the route that does work is appended. It uses
+ * the cached platform verdict and never detects on its own: this runs while the server is
+ * being built, before any client exists. stdio detects at startup and the HTTP transport
+ * per request before it builds the server, so the verdict is there by the time it matters.
  */
 function buildInstructions(): string {
   const label = process.env.BW_MCP_SYSTEM_LABEL;
@@ -5694,6 +6143,7 @@ function buildInstructions(): string {
     'definitions on this system.',
     '',
     'One BW system per instance: there is no system selector, by design.',
+    ...platformInstructions(cachedPlatform()),
   ].join('\n');
 }
 
@@ -5712,10 +6162,19 @@ export function createServer(): Server {
     { capabilities: { tools: {} }, instructions: buildInstructions() }
   );
 
-  server.setRequestHandler(ListToolsRequestSchema, async (_request, extra) => ({
-    // Hide what the caller may not invoke, so a model never proposes a denied call.
-    tools: filterToolsByScope(TOOL_DEFINITIONS, extra.authInfo),
-  }));
+  server.setRequestHandler(ListToolsRequestSchema, async (_request, extra) => {
+    // Two independent filters: what the caller may not invoke (scope), and what this system
+    // cannot answer (platform). A model never proposes a call that is denied or must fail.
+    // Listing must never fail on account of detection — an unconfigured or unreachable
+    // system yields the cached verdict if there is one, and otherwise no platform filter.
+    let profile;
+    try {
+      profile = await ensurePlatform(currentClient() ?? createClientFromEnv());
+    } catch {
+      profile = cachedPlatform();
+    }
+    return { tools: filterToolsByPlatform(filterToolsByScope(TOOL_DEFINITIONS, extra.authInfo), profile) };
+  });
 
   server.setRequestHandler(CallToolRequestSchema, handleToolCall);
 
@@ -5747,6 +6206,17 @@ export function ensureMediaTypes(client: BwClient): Promise<void> {
 // ── Start (stdio) ─────────────────────────────────────────────────────────────
 
 export async function startStdio(): Promise<void> {
+  // Detect the platform before the server is built, so the instructions sent with the
+  // very first handshake already name the right route. One process, one BW system, and
+  // credentials are present at startup here — unlike the HTTP transport, where they
+  // arrive with the request.
+  try {
+    const profile = await ensurePlatform(createClientFromEnv());
+    process.stderr.write(`[bw-modeling-mcp] Platform: ${profile.detail}\n`);
+  } catch (err) {
+    process.stderr.write(`[bw-modeling-mcp] Warning: platform detection skipped (${err})\n`);
+  }
+
   const transport = new StdioServerTransport();
   await createServer().connect(transport);
   // Log to stderr only (stdout is used for MCP protocol messages)

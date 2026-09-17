@@ -1,6 +1,6 @@
 # Tools Reference
 
-Every tool the server exposes — 99 in total — with what it does and the parameters that matter.
+Every tool the server exposes — 105 in total — with what it does and the parameters that matter.
 Tools marked _(Read only)_ change nothing in BW; everything else writes, activates, runs, or unlocks.
 
 For what the server can do as a whole, see [What it can do](README.md#what-it-can-do) in the README.
@@ -20,12 +20,12 @@ For the architecture and the full endpoint list, see [ARCHITECTURE.md](ARCHITECT
 - [DataSource & Source Systems](#datasource--source-systems) — 9 tools
 - [CompositeProvider](#compositeprovider) — 3 tools
 - [Open Hub Destination](#open-hub-destination) — 1 tool
-- [BW Query — modeling](#bw-query--modeling) — 12 tools
+- [BW Query — modeling](#bw-query--modeling) — 17 tools
 - [BW Query — data & roles](#bw-query--data--roles) — 6 tools
 - [Integrated Planning](#integrated-planning) — 6 tools
 - [Process Chains — authoring](#process-chains--authoring) — 13 tools
 - [Process Chains — monitoring](#process-chains--monitoring) — 3 tools
-- [Requests, Runtime & Remodeling](#requests-runtime--remodeling) — 6 tools
+- [Requests, Runtime & Remodeling](#requests-runtime--remodeling) — 7 tools
 - [Push API](#push-api) — 2 tools
 - [General](#general) — 3 tools
 
@@ -42,10 +42,10 @@ Find all objects that reference a given BW object (where-used analysis). Use thi
 For DataSources (`object_type=RSDS`): pass `source_system` — the correctly space-padded objectName is built automatically.
 
 ### `bw_system_profile` _(Read only)_
-Report what the connected BW system is and which tool groups work on it. Distinguishes SAP BW/4HANA from classic SAP BW via the system's own `b4hanamode` flag, lists which REST endpoint groups the system publishes, and verifies three preconditions: whether `Accept`-header handling works (a broken one makes almost every call fail with HTTP 406 on BW 7.5 — see [docs/BW75-SUPPORT.md](docs/BW75-SUPPORT.md)), whether the ADT DataPreview service is reachable for this user, and whether the BICS reporting resource is implemented (classic BW publishes the endpoint without implementing it). Call it before planning work on a system whose release is not already known: the answer says which tool groups are available and, where they are not, which route to take instead.
+Report what the connected BW system is and which tool groups work on it. Distinguishes SAP BW/4HANA from classic SAP BW via the system's own `b4hanamode` flag, lists which REST endpoint groups the system publishes, and verifies three preconditions: whether `Accept`-header handling works (a broken one makes almost every call fail with HTTP 406 on BW 7.5 — see [docs/BW75-SUPPORT.md](docs/BW75-SUPPORT.md)), whether the ADT DataPreview service is reachable for this user, and whether the BICS reporting resource is implemented (classic BW publishes the endpoint without implementing it). Call it before planning work on a system whose release is not already known: the answer says which tool groups are available and, where they are not, which route to take instead. It also lists every tool the platform verdict hides, with the reason — the same verdict `tools/list` is filtered by, so the two cannot disagree.
 
 ### `bw_read_metadata_tables` _(Read only)_
-Read an object definition directly from its metadata tables, via the ADT DataPreview service. Read-only fallback for the object types a system publishes no REST resource for — on classic SAP BW typically transformations and DTPs, and on every release the classic providers. Supported `object_type`: `TRFN` (including start, end, expert and field routine source code), `DTPA`, `ODSO`, `CUBE`, `MPRO` and `RSPC` — a process chain comes back with its steps, their variant parameters and the dependencies between them, resolved into the order the chain actually runs (the tables return the rows in no particular order, and a collector has one row per incoming link). InfoCubes and DataStore objects additionally report their **load history**: request, status, update mode, start time, user, duration, records transferred and added, and the source. On classic BW that is the only way to see load status at all, since the manage API behind `bw_list_requests` does not exist there. Requires ADT authorization for the calling user; prefer `bw_get_transformation` where the REST endpoint exists.
+Read an object definition directly from its metadata tables, via the ADT DataPreview service. Read-only fallback for the object types a system publishes no REST resource for — on classic SAP BW typically transformations and DTPs, and on every release the classic providers. Supported `object_type`: `TRFN` (including start, end, expert and field routine source code), `DTPA`, `ADSO` (load history only — structure and settings come from `bw_get_adso`), `ODSO`, `CUBE`, `MPRO`, `RSPC`, `RSPCLOG` (chain runs), `ANPR` (analysis process), and the planning objects `PLSE`, `PLSQ`, `PLCR` and `PLDS` — a process chain comes back with its steps, their variant parameters and the dependencies between them, resolved into the order the chain actually runs (the tables return the rows in no particular order, and a collector has one row per incoming link). The planning objects come through the same tool: `PLSE` (planning function — function type and its exit class, aggregation level, characteristic usage, conditions, and the parameter tree with its selections, with variable references resolved and a FOX formula returned as source code), `PLSQ` (planning sequence — steps in execution order with aggregation level, function and filter), `PLCR` (planning properties of an InfoProvider — key date, save strategy and the characteristic relationships) and `PLDS` (data slices of an InfoProvider; no release publishes a REST resource for those, so this is the only route to them on any platform). `PLCR` and `PLDS` are keyed by the InfoProvider, not by the aggregation level. `ANPR` reads an **analysis process** (APD): nodes in execution order with the object each source reads and each target writes, the edges between them, filters, formulas and the ABAP of a routine node — no release publishes a REST resource for it and BW/4HANA dropped the object type, so this is the only route on any platform. `RSPCLOG` reads process chain **runs** (the definition stays `RSPC`): a chain name gives the run history newest first plus the steps of the newest run, a 25-character log id gives that run's steps with status, start, duration and process variant, and a pattern such as `Z*` gives the last status of every matching chain. Status codes come back as the raw letter plus its colour and meaning. InfoCubes and DataStore objects additionally report their **load history**: request, status, update mode, start time, user, duration, records transferred and added, and the source. On classic BW that is the only way to see load status at all, since the manage API behind `bw_list_requests` does not exist there. Requires ADT authorization for the calling user; prefer `bw_get_transformation` where the REST endpoint exists.
 
 ### `bw_list_contents` _(Read only)_
 Navigate the BW repository tree. Pass a path such as `""` (all InfoAreas), `"area/MYAREA"` (InfoArea contents), `"hcpr/CP_NAME"` (CP sub-folders), or `"adso/ADSO_NAME/trfn"` (Transformations on an aDSO). Each entry includes `children_path` to drill down further.
@@ -84,13 +84,22 @@ Read an InfoObject definition (Characteristic or Key Figure).
 
 ### `bw_create_infoobject`
 Create a new InfoObject. Supports:
-- **Characteristic (CHA):** all data types (CHAR, NUMC, DATS, TIMS, SNUMC), with or without master data and texts, with compound parent InfoObjects, with referenced InfoObject
+- **Characteristic (CHA):** all data types (CHAR, NUMC, DATS, TIMS, SNUMC), with or without master data and texts, with compound parent InfoObjects, with referenced InfoObject, and the lower case flag (`lower_case`)
 - **Key Figure (KYF):** all types (NUM, AMT, QTY, DAT, INT), all aggregations (SUM, MAX, MIN)
 
 Created as inactive — activate with `bw_activate`.
 
+`lower_case` switches off the permitted-character check (RSKC) for the characteristic, which is
+what makes values holding lower case letters or umlauts loadable at all. Without it such a value
+passes the load itself — a push even answers HTTP 204 — and is only rejected later, when the
+request is activated.
+
 ### `bw_update_infoobject`
-Add or remove display (`DIS`) and navigation (`NAV`) attributes on an existing Characteristic.
+Change the description, the lower case flag (`lower_case`), or the attribute list of an existing
+Characteristic; set `fixed_unit` / `fixed_currency` on a Key Figure. Supplying `attributes`
+replaces the whole list (`[]` removes all of them); omitting it leaves the attributes untouched.
+The lower case flag can be changed on a characteristic that is already used by a provider holding
+data — a request that failed activation on such a value can then be activated again.
 
 ---
 
@@ -140,7 +149,7 @@ Create a new Transformation. Supports all source types (aDSO, InfoSource, DataSo
 ### `bw_update_transformation`
 Modify field mappings in an existing Transformation:
 - Map source field to target InfoObject (StepDirect)
-- Set formula rule for a target field (StepFormula)
+- Set or change the formula rule of a target field (StepFormula) — every operand of the expression is registered as a source of the rule, so a formula over several source fields works, and the formula text of an existing formula rule can be replaced
 
 ### `bw_set_transformation_routine`
 Set a field routine, start routine, or end routine on a Transformation. Supports both ABAP and AMDP (SQLScript). The routine code is written in combination with an ADT MCP server.
@@ -272,6 +281,21 @@ Read a global Structure — all members with type (Formula/Selection), reference
 ### `bw_create_rkf`
 Create one reusable Restricted Key Figure (TLOGO ELEM) on an InfoProvider from a base key figure plus one or more characteristic restrictions. Built for mass creation (one RKF per call); each restriction value is validated against the InfoProvider and mapped to its internal key before the write, and the RKF is written consistent (no separate activation step). Supports `Equal` / `Between` / `LessThan` / `GreaterThan` / `LessEqual` / `GreaterEqual` / `Contains` operators and exclusions, an optional InfoArea, and a transport request for transportable packages.
 
+### `bw_update_rkf`
+Change a reusable Restricted Key Figure in place — description, base key figure and/or restrictions. The UID stays the same, so references from CKFs, structures and queries survive; the alternative before was delete and recreate, which BW refuses once the RKF is referenced anywhere. Restriction values are validated against the InfoProvider and mapped to their internal key before the write, as with `bw_create_rkf`.
+
+### `bw_create_ckf`
+Create a reusable Calculated Key Figure (TLOGO ELEM) on an InfoProvider. The formula is passed as an operator/operand tree in the same node syntax `bw_update_query_key_figures` uses for `add_formula`, so a tree read back from `bw_get_ckf` (field `formula_tree`) can be written again unchanged — which is what makes copying a definition between systems possible. Records to a transport when package and transport request are given.
+
+### `bw_update_ckf`
+Change a reusable Calculated Key Figure. Two call forms: pass `formula` to replace the whole expression, or `operations` for targeted edits that leave the rest untouched — the usual case being "add another summand to a sum" without having to know or rebuild what is already there. All operations are applied to one document and written in a single save.
+
+### `bw_create_structure`
+Create a reusable key figure structure on an InfoProvider — the object reporting queries embed as an axis, so that one definition drives all of them. Members reference a reusable CKF or RKF or a basic key figure, and can carry their own text.
+
+### `bw_update_structure`
+Change a reusable structure: add, remove or re-configure members. The change reaches every query that embeds the structure, which is the point of the object and the reason this goes at the structure rather than through one query that happens to use it. All operations are applied to one document and written in a single save.
+
 ---
 
 ## BW Query — data & roles
@@ -383,10 +407,13 @@ The execution detail of one run — every process step with type, variant, statu
 ## Requests, Runtime & Remodeling
 
 ### `bw_list_requests` _(Read only)_
-List load requests for a target InfoProvider via the BW/4HANA manage API — status, last process status and last action, record count, timestamp, user, and TSN. The TSN feeds `bw_get_request`.
+List load requests for a target InfoProvider via the BW/4HANA manage API — status, last process status and last action, record count, timestamp, user, and TSN. The TSN feeds `bw_get_request`. On classic SAP BW (7.5 and lower) the manage API does not exist, so this tool is not offered there — use `bw_read_metadata_tables` on the provider (`ADSO`, `ODSO`, `CUBE`, `MPRO`) for the load history instead.
 
 ### `bw_get_request` _(Read only)_
-Full status analysis of one load request in a single call — request header, DTP information (start/finish/duration), process step chain, and message log. Output format: `text` (default) or `raw` (parsed JSON of all four payloads).
+Full status analysis of one load request in a single call — request header, DTP information (start/finish/duration), process step chain, the request message log, and the message log of each process step that runs under its own TSN. That last part is where a failed request activation keeps its reason: the request-level log carries only the messages of the load itself, so the activation step would otherwise appear as a red line with no error text anywhere. Output format: `text` (default) or `raw` (parsed JSON of all payloads).
+
+### `bw_delete_request`
+Delete load requests from an InfoProvider, removing the data they brought in along with their entry in request management. This is the precondition BW demands before several follow-up steps — above all switching a DTP from delta to full extraction, which BW refuses while delta requests remain in the target. Not the same as selective deletion of records by condition, which removes rows but leaves the request. Both kinds of request are handled as BW handles them: a load request in the inbound queue is deleted, an activation request is rolled back — and a rollback also undoes every later activation and removes the load request underneath it. `all_requests=true` with `target` clears a provider completely, the regular case before an extraction-mode change. Asynchronous: a successful call starts the deletion, confirm with `bw_list_requests`.
 
 ### `bw_activate_request`
 Activate loaded data (DSO request activation) — move a finished load from the inbound table into the active data table and change log. This is the runtime request activation (BW/4HANA manage API), distinct from the modeling-object activation done by `bw_activate`; it applies only to aDSOs that have an activation step and runs asynchronously.

@@ -189,7 +189,7 @@ function buildLocalMemberMap(members: unknown[]): Map<string, string> {
       const id = m['@_id'] as string | undefined;
       const desc = ((m['Qry:description'] as Record<string, unknown> | undefined)?.['@_value'] as string) ?? id ?? '';
       if (id) map.set(id, desc);
-      const children = ensureArray(m['Qry:childMembers']);
+      const children = [...ensureArray(m['Qry:childMembers']), ...ensureArray(m['Qry:childFormulas'])];
       if (children.length > 0) collect(children);
     }
   }
@@ -241,6 +241,57 @@ function parseSelectionGroups(
   });
 }
 
+/** True when a settings element is absent or carries the server's default marker. */
+function isDefaultSetting(node: Record<string, unknown> | undefined): boolean {
+  if (!node) return true;
+  return node['@_default'] === 'true' || node['@_default'] === true;
+}
+
+/**
+ * Collect the explicitly set attributes of a settings element (all attributes
+ * except the `default` marker), or undefined when the element is at its default.
+ * Used for settings whose attribute set is not fully known from observed
+ * documents, so that whatever the server writes is reported rather than dropped.
+ */
+function explicitSettingAttrs(node: Record<string, unknown> | undefined): Record<string, unknown> | undefined {
+  if (isDefaultSetting(node)) return undefined;
+  const out: Record<string, unknown> = {};
+  for (const [k, v] of Object.entries(node!)) {
+    if (k === '@_default' || !k.startsWith('@_')) continue;
+    out[k.slice(2)] = v;
+  }
+  return Object.keys(out).length > 0 ? out : undefined;
+}
+
+/**
+ * Planning properties of a structure member: input readiness and disaggregation.
+ * Input readiness is what makes a member usable in a planning query; it is carried
+ * by a nested Qry:planning element, not by an attribute on the member itself.
+ * Both settings report "default" when the server marks them as such.
+ *
+ * The lock flag is deliberately not reported as a separate property: it is not in
+ * the document at all, and a metadata-table cross-check over input-ready and
+ * locked members of a live planning query showed it following input readiness
+ * without exception. The same check showed the "no subtotals" flag set on every
+ * member including generated ones, so it is server-derived rather than modelled.
+ */
+export function parseMemberPlanning(
+  member: Record<string, unknown>,
+  localMemberMap?: Map<string, string>
+): Record<string, unknown> | undefined {
+  const planningNode = member['Qry:planning'] as Record<string, unknown> | undefined;
+  if (!planningNode) return undefined;
+  const inputModeNode = planningNode['Qry:inputMode'] as Record<string, unknown> | undefined;
+  const disaggNode = planningNode['Qry:disaggregation'] as Record<string, unknown> | undefined;
+  const planning: Record<string, unknown> = {
+    inputMode: isDefaultSetting(inputModeNode) ? 'default' : ((inputModeNode!['@_type'] as string) ?? 'default'),
+    disaggregation: isDefaultSetting(disaggNode) ? 'default' : ((disaggNode!['@_type'] as string) ?? 'default'),
+  };
+  const disaggRef = disaggNode?.['@_reference'] as string | undefined;
+  if (disaggRef) planning['disaggregationReference'] = localMemberMap?.get(disaggRef) ?? disaggRef;
+  return planning;
+}
+
 function parseMemberRecursive(
   member: Record<string, unknown>,
   variableMap: Map<string, { technicalName: string }>,
@@ -254,16 +305,40 @@ function parseMemberRecursive(
   const desc = (descNode?.['@_value'] as string) ?? '';
   const shortDesc = descNode?.['@_shortValue'] as string | undefined;
   const visibility = ((member['Qry:hidden'] as Record<string, unknown> | undefined)?.['@_type'] as string) ?? 'showAlways';
+  const isFormula = mType === 'Qry:MemberFormula' || mType === 'Qry:MemberFormulaInverse';
 
   const result: Record<string, unknown> = {
     id,
-    type: mType === 'Qry:MemberFormula' ? 'MemberFormula' : 'MemberSelection',
+    type: isFormula ? mType.replace('Qry:', '') : 'MemberSelection',
     description: desc,
     visibility,
   };
   if (shortDesc) result['shortDescription'] = shortDesc;
 
-  if (mType === 'Qry:MemberFormula') {
+  // An inverse formula names the member the entered value is written back to.
+  if (mType === 'Qry:MemberFormulaInverse') {
+    const inverseFor = member['@_member'] as string | undefined;
+    if (inverseFor) result['inverseFor'] = localMemberMap.get(inverseFor) ?? inverseFor;
+  }
+
+  const flatPosition = member['@_flatPosition'];
+  if (flatPosition !== undefined) result['flatPosition'] = Number(flatPosition);
+  if (member['@_constSelection'] !== undefined) {
+    result['constantSelection'] = member['@_constSelection'] === 'true' || member['@_constSelection'] === true;
+  }
+
+  const decimalsNode = member['Qry:decimals'] as Record<string, unknown> | undefined;
+  if (!isDefaultSetting(decimalsNode)) result['decimals'] = Number(decimalsNode!['@_number']);
+  const signInversionNode = member['Qry:signInversion'] as Record<string, unknown> | undefined;
+  if (!isDefaultSetting(signInversionNode)) {
+    result['signInversion'] = signInversionNode!['@_invert'] === 'true' || signInversionNode!['@_invert'] === true;
+  }
+  const scaling = explicitSettingAttrs(member['Qry:scaling'] as Record<string, unknown> | undefined);
+  if (scaling) result['scaling'] = scaling;
+  const planning = parseMemberPlanning(member, localMemberMap);
+  if (planning) result['planning'] = planning;
+
+  if (isFormula) {
     const formulaDef = member['Qry:formulaDefinition'] as Record<string, unknown> | undefined;
     const formulaToken = formulaDef?.['Qry:formulaToken'] as Record<string, unknown> | undefined;
     result['formula'] = formulaToken ? renderFormula(formulaToken, variableMap, ckfMap, rkfMap, localMemberMap) : '';
@@ -291,6 +366,15 @@ function parseMemberRecursive(
   if (childMembersRaw.length > 0) {
     result['childMembers'] = childMembersRaw.map((cm) =>
       parseMemberRecursive(cm, variableMap, ckfMap, rkfMap, localMemberMap)
+    );
+  }
+
+  // Inverse formulas sit beside the child members and carry the write-back rule an
+  // input-ready formula needs; without them an input-ready formula cannot be posted to.
+  const childFormulasRaw = ensureArray(member['Qry:childFormulas']) as Record<string, unknown>[];
+  if (childFormulasRaw.length > 0) {
+    result['childFormulas'] = childFormulasRaw.map((cf) =>
+      parseMemberRecursive(cf, variableMap, ckfMap, rkfMap, localMemberMap)
     );
   }
 
@@ -332,6 +416,39 @@ function parseDimElement(
   };
   if (infoObjectTypeKv) result.infoObjectType = infoObjectTypeKv['@_value'];
   return result;
+}
+
+/**
+ * Render the members of a structure as indented lines, one per member, with the
+ * child members and inverse formulas nested underneath. Only explicitly set
+ * properties are appended, so a line stays short unless the member actually
+ * deviates from the server defaults.
+ */
+function renderMemberLines(members: unknown[], indent: string, lines: string[]): void {
+  for (const m of members as Record<string, unknown>[]) {
+    const flags: string[] = [];
+    if (m['visibility'] && m['visibility'] !== 'showAlways') flags.push(`visibility=${m['visibility']}`);
+    const planning = m['planning'] as Record<string, unknown> | undefined;
+    if (planning && planning['inputMode'] !== 'default') flags.push(`inputMode=${planning['inputMode']}`);
+    if (planning && planning['disaggregation'] !== 'default') {
+      const ref = planning['disaggregationReference'];
+      flags.push(`disaggregation=${planning['disaggregation']}${ref ? ` → ${ref}` : ''}`);
+    }
+    if (m['decimals'] !== undefined) flags.push(`decimals=${m['decimals']}`);
+    // The server writes an explicit "not inverted" on every member; only the
+    // inverting case carries information for a reader.
+    if (m['signInversion'] === true) flags.push('signInversion=true');
+    if (m['constantSelection'] === true) flags.push('constantSelection=true');
+    if (m['inverseFor']) flags.push(`inverseFor=${m['inverseFor']}`);
+    const label = m['description'] ? String(m['description']) : String(m['id'] ?? '');
+    lines.push(`${indent}${label}  [${m['type']}]${flags.length > 0 ? '  ' + flags.join('  ') : ''}`);
+    if (m['formula']) lines.push(`${indent}  Formula: ${m['formula']}`);
+    const children = [
+      ...((m['childMembers'] as unknown[]) ?? []),
+      ...((m['childFormulas'] as unknown[]) ?? []),
+    ];
+    if (children.length > 0) renderMemberLines(children, indent + '  ', lines);
+  }
 }
 
 function renderQueryText(q: Record<string, unknown>): string {
@@ -407,20 +524,20 @@ function renderQueryText(q: Record<string, unknown>): string {
     return '1KYFNM structure';
   };
 
+  const dimLine = (d: Record<string, unknown>) => {
+    lines.push(`    ${dimLabel(d)}  ${s(d['description'])}  [${s(d['type'])}]`);
+    const members = (d['members'] as unknown[]) ?? [];
+    if (members.length > 0) renderMemberLines(members, '      ', lines);
+  };
+
   lines.push('');
   lines.push('── Layout ──');
   lines.push(`  ROWS (${rows.length}):`);
-  for (const r of rows as Record<string, unknown>[]) {
-    lines.push(`    ${dimLabel(r)}  ${s(r['description'])}  [${s(r['type'])}]`);
-  }
+  for (const r of rows as Record<string, unknown>[]) dimLine(r);
   lines.push(`  COLUMNS (${columns.length}):`);
-  for (const c of columns as Record<string, unknown>[]) {
-    lines.push(`    ${dimLabel(c)}  ${s(c['description'])}  [${s(c['type'])}]`);
-  }
+  for (const c of columns as Record<string, unknown>[]) dimLine(c);
   lines.push(`  FREE (${free.length}):`);
-  for (const f of free as Record<string, unknown>[]) {
-    lines.push(`    ${dimLabel(f)}  ${s(f['description'])}  [${s(f['type'])}]`);
-  }
+  for (const f of free as Record<string, unknown>[]) dimLine(f);
 
   const ckfs = q['calculatedMeasures'] as unknown[] ?? [];
   if (ckfs.length > 0) {
