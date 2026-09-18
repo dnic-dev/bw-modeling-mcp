@@ -217,6 +217,7 @@ export async function bwCreateRkf(client: BwClient, args: CreateRkfArgs): Promis
     Accept: `${queryWriteMediaType()}, ${QUERY_ACCEPT_LIST}`,
     'bwmt-level': '50',
     'x-csrf-token': await clientA.getCsrfToken(),
+    'X-sap-adt-sessiontype': 'stateful',
   });
   const lockHandleA = lockA.body.match(/<LOCK_HANDLE>([^<]+)<\/LOCK_HANDLE>/)?.[1];
   if (!lockHandleA) {
@@ -227,6 +228,7 @@ export async function bwCreateRkf(client: BwClient, args: CreateRkfArgs): Promis
     await clientA.rawPost(`${enqPath}?action=unlock&compuid=${elemUid}`, '', {
       'bwmt-level': '50',
       'x-csrf-token': await clientA.getCsrfToken(),
+      'X-sap-adt-sessiontype': 'stateful',
     });
   };
 
@@ -320,6 +322,7 @@ export async function bwCreateRkf(client: BwClient, args: CreateRkfArgs): Promis
     Accept: RKF_ACCEPT_LIST,
     'bwmt-level': '50',
     'x-csrf-token': await clientB.getCsrfToken(),
+    'X-sap-adt-sessiontype': 'stateful',
   });
   const lockHandleB = lockB.body.match(/<LOCK_HANDLE>([^<]+)<\/LOCK_HANDLE>/)?.[1];
   if (!lockHandleB) {
@@ -446,6 +449,7 @@ ${groupsXml.join('\n')}
       await clientB.rawPost(`${basePath}?action=unlock`, '', {
         'bwmt-level': '50',
         'x-csrf-token': await clientB.getCsrfToken(),
+        'X-sap-adt-sessiontype': 'stateful',
       });
     } catch (unlockErr) {
       process.stderr.write(`Warning: failed to release edit lock for rkf/${nameLower}: ${unlockErr}\n`);

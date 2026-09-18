@@ -174,6 +174,7 @@ export async function bwCreateVariable(
     Accept: `${queryWriteMediaType()}, ${QUERY_ACCEPT_LIST}`,
     'bwmt-level': '50',
     'x-csrf-token': await client.getCsrfToken(),
+    'X-sap-adt-sessiontype': 'stateful',
   });
   const lockHandle = lockResult.body.match(/<LOCK_HANDLE>([^<]+)<\/LOCK_HANDLE>/)?.[1];
   if (!lockHandle) {
@@ -253,6 +254,7 @@ export async function bwCreateVariable(
       await client.rawPost(`${enqPath}?action=unlock&compuid=${elemUid}`, '', {
         'bwmt-level': '50',
         'x-csrf-token': await client.getCsrfToken(),
+        'X-sap-adt-sessiontype': 'stateful',
       });
     } catch (unlockErr) {
       process.stderr.write(

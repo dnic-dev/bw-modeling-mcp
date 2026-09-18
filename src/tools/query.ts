@@ -1032,6 +1032,7 @@ export async function bwCreateQuery(
       'Accept': QUERY_ACCEPT_LIST,
       'bwmt-level': '50',
       'x-csrf-token': csrfToken,
+      'X-sap-adt-sessiontype': 'stateful',
     });
   const lockHandleMatch = lockResponse.body.match(/<LOCK_HANDLE>([^<]+)<\/LOCK_HANDLE>/);
   if (!lockHandleMatch) {
@@ -1044,7 +1045,7 @@ export async function bwCreateQuery(
     await client.rawPost(
       `/sap/bw/modeling/comp/enq/${bwSeg(nameLower)}?action=unlock&compuid=${elemuid}`,
       '',
-      { 'bwmt-level': '50', 'x-csrf-token': await client.getCsrfToken() });
+      { 'bwmt-level': '50', 'x-csrf-token': await client.getCsrfToken(), 'X-sap-adt-sessiontype': 'stateful', });
   };
 
   try {

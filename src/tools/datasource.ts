@@ -697,6 +697,7 @@ export async function bwCreateDatasource(
     'activity_context': 'CREA',
     'Accept': RSDS_ACCEPT,
     'x-csrf-token': csrf,
+    'X-sap-adt-sessiontype': 'stateful',
   });
   const lockHandle = lockResponse.body.match(/<LOCK_HANDLE>([^<]+)<\/LOCK_HANDLE>/)?.[1] ?? '';
   if (!lockHandle) {
@@ -738,6 +739,7 @@ export async function bwCreateDatasource(
       'Content-Type': MEDIA_TYPES['rsds'],
       'Accept': MEDIA_TYPES['rsds'],
       'x-csrf-token': csrf,
+      'X-sap-adt-sessiontype': 'stateful',
     });
   }
 
@@ -912,7 +914,7 @@ export async function bwChangeDatasourceDelta(
   const lockUrl = `/sap/bw/modeling/rsds/${bwSeg(dsLower)}/${ssUpper}?action=lock`;
   const unlockUrl = `/sap/bw/modeling/rsds/${bwSeg(dsLower)}/${ssUpper}?action=unlock`;
   const csrf = await client.getCsrfToken();
-  const lockRes = await client.rawPost(lockUrl, '', { Accept: RSDS_ACCEPT, 'x-csrf-token': csrf });
+  const lockRes = await client.rawPost(lockUrl, '', { Accept: RSDS_ACCEPT, 'x-csrf-token': csrf, 'X-sap-adt-sessiontype': 'stateful', });
   const lockHandle = lockRes.body.match(/<LOCK_HANDLE>([^<]+)<\/LOCK_HANDLE>/)?.[1] ?? '';
   if (!lockHandle) {
     return JSON.stringify({
@@ -957,7 +959,7 @@ export async function bwChangeDatasourceDelta(
   } finally {
     // 5. Release the enqueue (best-effort, also on failure).
     try {
-      await client.rawPost(unlockUrl, '', { Accept: RSDS_ACCEPT, 'x-csrf-token': csrf });
+      await client.rawPost(unlockUrl, '', { Accept: RSDS_ACCEPT, 'x-csrf-token': csrf, 'X-sap-adt-sessiontype': 'stateful', });
     } catch {
       // ignore unlock failure
     }
@@ -1061,7 +1063,7 @@ export async function bwSetDatasourceFields(
   const lockUrl = `/sap/bw/modeling/rsds/${bwSeg(dsLower)}/${ssUpper}?action=lock`;
   const unlockUrl = `/sap/bw/modeling/rsds/${bwSeg(dsLower)}/${ssUpper}?action=unlock`;
   const csrf = await client.getCsrfToken();
-  const lockRes = await client.rawPost(lockUrl, '', { Accept: RSDS_ACCEPT, 'x-csrf-token': csrf });
+  const lockRes = await client.rawPost(lockUrl, '', { Accept: RSDS_ACCEPT, 'x-csrf-token': csrf, 'X-sap-adt-sessiontype': 'stateful', });
   const lockHandle = lockRes.body.match(/<LOCK_HANDLE>([^<]+)<\/LOCK_HANDLE>/)?.[1] ?? '';
   if (!lockHandle) {
     return JSON.stringify({
@@ -1104,7 +1106,7 @@ export async function bwSetDatasourceFields(
     return JSON.stringify(result, null, 2);
   } finally {
     try {
-      await client.rawPost(unlockUrl, '', { Accept: RSDS_ACCEPT, 'x-csrf-token': csrf });
+      await client.rawPost(unlockUrl, '', { Accept: RSDS_ACCEPT, 'x-csrf-token': csrf, 'X-sap-adt-sessiontype': 'stateful', });
     } catch {
       // ignore unlock failure
     }

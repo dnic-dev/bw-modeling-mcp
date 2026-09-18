@@ -95,13 +95,17 @@ export async function bwCreateTransformation(
   const masterSystem = await resolveMasterSystem(client);
   const responsible  = (process.env.BW_USER ?? '').toUpperCase();
 
-  // Step 2: Lock with CREA — exact Eclipse header set, no SAP session headers
+  // Step 2: Lock with CREA. rawPost() wipes the instance defaults, so the session type is
+  // declared here: without it the lock request is stateless, the server ends the session it
+  // opened for the enqueue at the end of the request, and the POST below fails with
+  // "423 Invalid Lock Handle".
   const csrfToken = await client.getCsrfToken();
   const lockPath = `/sap/bw/modeling/trfn/${bwSeg(trfnLower)}?action=lock`;
   const lockResponse = await client.rawPost(lockPath, '', {
     'activity_context': 'CREA',
     'Accept': trfnAccept(),
     'x-csrf-token': csrfToken,
+    'X-sap-adt-sessiontype': 'stateful',
   });
   const lockHandleMatch = lockResponse.body.match(/<LOCK_HANDLE>([^<]+)<\/LOCK_HANDLE>/);
   if (!lockHandleMatch) {
