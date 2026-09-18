@@ -447,6 +447,9 @@ function renderQueryDataText(xml: string, isGet: boolean): string {
 
   // 4. Result table
   lines.push('');
+  // The audit sink reads the row count back out of this line (ROW_COUNT in ../audit.ts):
+  // it is the only place a tool states how many rows it returned. Changing the wording
+  // costs the audit trail that number, so change both or neither.
   lines.push(`── Result (${rs.rowTuples.length} rows × ${rs.columnTuples.length} columns) ──`);
 
   if (rs.columnTuples.length === 0 && rs.rowTuples.length === 0) {

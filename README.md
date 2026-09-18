@@ -28,12 +28,62 @@ stdio is unchanged — `npm start` behaves exactly as before. Setup:
 | **Several analysts, one server** | not possible, no central auth | all log in via BTP, each caller's identity reaches BW |
 | **Tool permissions** | none — whoever runs it can call every tool | granted per role, **independent of BW authorizations**: a BW developer can be read-only in the MCP, or the querying tools can be withheld from someone who may otherwise view data |
 | **BW authorizations** | enforced through the user's own credentials | unchanged, still fully enforced — with principal propagation each caller acts as themselves, never as a shared identity |
-| **Audit trail** | limited | XSUAA logs every login; with principal propagation the BW session log shows the real user |
+| **Audit trail** | limited | XSUAA logs every login; with principal propagation the BW session log shows the real user; optionally every tool call is written to the **BTP Audit Log** (below) |
 
 A new tool stays unavailable to read-only callers until it is explicitly classified as a
 read, so the surface never widens by accident; `write` implies `read`, never the reverse.
 The two role collections are a starting point and can be split further in `xs-security.json`.
 Principal propagation additionally needs a certificate rule and ICM trust on the BW side.
+
+### Optional: BTP Audit Log
+
+Bind an `auditlog` service instance and the server records **every tool call** — caller,
+tool, arguments, outcome and duration — in SAP's Audit Log, retained centrally and readable
+without a BW logon. Denied calls are recorded as security events. BW's own session log still
+shows what the ABAP user did; this adds who asked for it through the MCP, in one place.
+
+Calls are categorised from the same classification that governs scopes, so a new tool is
+filed correctly without touching the audit code: reads become `data-accesses`, writes
+`data-modifications`, and activation/transport/package tools `configuration-changes`.
+
+A record holds the **request**, never the response: the tool, the caller, the arguments, the
+outcome and the duration — plus how much came back, as `resultChars`, `resultLines` and, for
+`bw_query_data`, the `resultRows` it states above its table. Without those a call that read
+one row and one that read two hundred thousand look identical. The returned data itself stays
+out: it would put business data in a second store with a different set of readers, and a
+result would blow the Write API's 10 KB message limit anyway.
+
+Writes are fire-and-forget: a slow or broken audit backend never delays or fails a tool call;
+failures are warned about at most once a minute.
+
+**The premium plan is mTLS-only.** It issues no client secret, so both the instance and the
+binding must be created with x509 parameters — a plain `cf create-service` plus
+`cf bind-service` produces a `binding-secret` binding that can never authenticate:
+
+```bash
+cf create-service auditlog premium bwmcp-auditlog -c '{
+  "xs-security": { "xsappname": "bwmcp-auditlog-<unique-per-subaccount>",
+    "oauth2-configuration": { "credential-types": ["x509"], "grant-types": ["client_credentials"] } } }'
+
+cf bind-service bw-mcp-server bwmcp-auditlog -c '{
+  "xsuaa": { "credential-type": "x509",
+    "x509": { "key-length": 2048, "validity": 2, "validity-type": "MONTHS" } } }'
+
+cf restart bw-mcp-server
+```
+
+Note the nesting: the binding parameters go under `xsuaa`. The broker accepts a wrongly
+shaped `-c` payload — `{"credential-type": "x509"}` at the top level, say — without
+complaining, and hands out a `binding-secret` binding anyway.
+
+The server refuses a non-x509 binding at startup, naming the missing fields, rather than
+reporting auditing as enabled and then dropping every event. The broker cannot *update* an
+existing instance's `xs-security`, so changing it means deleting and re-creating the instance.
+
+**The binding certificate expires** after `validity`. When it does, writes fail and the only
+signal is that warning — rotate with `cf unbind-service` + `cf bind-service` + `cf restart`
+before the date, and confirm afterwards that records arrive (Audit Log Viewer, or the Audit
+Log Retrieval API). Without a binding, nothing changes and auditing stays off.
 
 ---
 
