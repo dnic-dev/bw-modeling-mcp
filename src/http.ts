@@ -4,8 +4,8 @@
  *
  * Adds an authenticated, multi-user front end to the same tools stdio exposes:
  *
- *   XSUAA decides who may call this server, and whether they may write
- *     (`read` / `write` scopes, mapped to two role collections).
+ *   XSUAA decides who may call this server, and what it offers them
+ *     (`read` / `analyst` / `write` scopes, mapped to three role collections).
  *   The BTP destination decides who they are to BW. With
  *     Authentication=PrincipalPropagation each caller reaches BW as themselves and
  *     BW applies their own authorizations; with BasicAuthentication everyone shares
@@ -85,9 +85,14 @@ async function main(): Promise<void> {
         // then falls back to the JWT `scope` claim — an array on XSUAA — and crashes
         // with `scope.split is not a function` (fixed upstream in vscode#325344, but
         // the Eclipse Language Server lags behind). Also narrows the verifier's
-        // accepted scopes from the arc-1 default set to the two this server defines.
+        // accepted scopes from the arc-1 default set to the three this server defines.
         scopesSupported: ['read', 'analyst', 'write'],
-        requiredScopes: ['read'],
+        // Deliberately no `requiredScopes`. `requireBearerAuth` demands *every* scope
+        // listed, so any blanket gate shuts out a caller holding one of the others:
+        // `['read']` rejected the analyst role with a bare 403 before a tool was ever
+        // reached, which made the role unusable. Authentication stays mandatory through
+        // `required: true` below; authorisation belongs to `mayCall()`, which knows the
+        // scope lattice and names the scopes that would admit the call.
       },
       allowedOrigins: process.env.BW_ALLOWED_ORIGINS?.split(',').map((s) => s.trim()).filter(Boolean),
       // Never start open: an unauthenticated MCP server in front of a Cloud Connector
