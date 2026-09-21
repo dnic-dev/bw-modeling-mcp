@@ -5,6 +5,8 @@ import {
   freshRead,
   resolveMasterSystem,
   bwSeg,
+  ECLIPSE_USER_AGENT,
+  adtRequestId,
 } from '../bw-client.js';
 import { parseInfoObjectProps } from './infoobject.js';
 import { parseActivationMessages, parseDtpsDeactivated, bwActivate } from './activation.js';
@@ -44,6 +46,11 @@ export interface CreateTransformationArgs {
   // object type is IOBJ. Selects the InfoObject facet (text table, attributes, hierarchy).
   source_object_subtype?: string;
   target_object_subtype?: string;
+  // Transport request (corrNr). Required for a transportable package: without it the
+  // system records the new object on a request of its own choosing.
+  transport?: string;
+  // Activate right after creation (bw_activate flow, fresh session).
+  activate?: boolean;
 }
 
 /**
@@ -53,6 +60,7 @@ export interface CreateTransformationArgs {
  * 1. GET 8TRANSIENT → server generates the Transformation name
  * 2. Lock (CREA)    → lockHandle
  * 3. POST minimal XML (manually constructed, per payloads/trfn_create.md)
+ * 4. Optional: activate (reuses the CREA lock handle; the unlock happens there)
  *
  * Returns the generated Transformation name for use with bw_activate.
  */
@@ -102,6 +110,11 @@ export async function bwCreateTransformation(
     'activity_context': 'CREA',
     'Accept': trfnAccept(),
     'x-csrf-token': csrfToken,
+    // Eclipse sends these three on the lock as well; rawPost() wipes the instance defaults,
+    // so they are repeated here to match the traced wire format.
+    'User-Agent': ECLIPSE_USER_AGENT,
+    'sap-adt-request-id': adtRequestId(),
+    'X-sap-adt-profiling': 'server-time',
   });
   const lockHandleMatch = lockResponse.body.match(/<LOCK_HANDLE>([^<]+)<\/LOCK_HANDLE>/);
   if (!lockHandleMatch) {
@@ -110,6 +123,11 @@ export async function bwCreateTransformation(
   const lockHandle = lockHandleMatch[1];
 
   // Step 3: POST minimal XML (manually constructed — see payloads/trfn_create.md)
+  // adtcore:createdAt / createdBy and the packageRef are part of what the Eclipse BWMT
+  // create wizard sends; Eclipse sets the creation date at midnight UTC, not the current time.
+  const createdAt = new Date().toISOString().slice(0, 10) + 'T00:00:00Z';
+  const packageUri = `/sap/bc/adt/packages/${encodeURIComponent(pkg.toLowerCase())}`;
+
   const postBody = `<?xml version="1.0" encoding="UTF-8"?>
 <trfn:transformation
   xmlns:adtcore="http://www.sap.com/adt/core"
@@ -121,6 +139,8 @@ export async function bwCreateTransformation(
   name="${trfnName}"
   startRoutine="">
   <tlogoProperties
+    adtcore:createdAt="${createdAt}"
+    adtcore:createdBy="${responsible}"
     adtcore:language="${language}"
     adtcore:name="${trfnName}"
     adtcore:type="TRFN"
@@ -132,6 +152,7 @@ export async function bwCreateTransformation(
       href="/sap/bw/modeling/trfn/${bwSeg(trfnLower)}/m"
       rel="self"
       type="application/vnd.sap-bw-modeling.trfn+xml"/>
+    <adtcore:packageRef adtcore:name="${pkg}" adtcore:type="DEVC/K" adtcore:uri="${packageUri}"/>
     <objectVersion>M</objectVersion>
     <objectStatus>inactive</objectStatus>
     <contentState>NEW</contentState>
@@ -143,9 +164,31 @@ export async function bwCreateTransformation(
   const copyParams = args.copy_from_transformation
     ? `&copyFromObjectName=${args.copy_from_transformation.toUpperCase()}&copyFromObjectType=TRFN`
     : '';
-  const createPath = `/sap/bw/modeling/trfn/${bwSeg(trfnLower)}?lockHandle=${lockHandle}${copyParams}`;
+  const corrNrPrefix = args.transport ? `corrNr=${encodeURIComponent(args.transport)}&` : '';
+  const createPath = `/sap/bw/modeling/trfn/${bwSeg(trfnLower)}?${corrNrPrefix}lockHandle=${lockHandle}${copyParams}`;
 
-  // Session B: eigene Session + CSRF-Token, POST mit lockHandle aus Session A
+  // Between lock and create, Eclipse announces the object to CTS
+  // (BwTransportService.ensureLockedOnTransport). Failures are non-fatal: on $TMP the check
+  // is a formality, and a hard error here would block a creation that can still succeed.
+  // It runs in a session of its own, as in Eclipse: issued from the locking client it would
+  // arrive stateless on that client's cookies and end the very session holding the lock.
+  const ctsBody = `<?xml version="1.0" encoding="UTF-8" ?><asx:abap version="1.0" xmlns:asx="http://www.sap.com/abapxml"><asx:values><DATA><PGMID></PGMID><OBJECT>TRFN</OBJECT><OBJECTNAME>${trfnName}</OBJECTNAME><DEVCLASS>${pkg}</DEVCLASS><SUPER_PACKAGE></SUPER_PACKAGE><RECORD_CHANGES></RECORD_CHANGES><OPERATION>I</OPERATION><URI>/sap/bw/modeling/trfn/${bwSeg(trfnLower)}</URI></DATA></asx:values></asx:abap>`;
+  const ctsType = 'application/vnd.sap.as+xml; charset=UTF-8; dataname=com.sap.adt.transport.service.checkData';
+  try {
+    const ctsClient = createClientFromEnv();
+    await ctsClient.rawPost('/sap/bc/adt/cts/transportchecks', ctsBody, {
+      'Content-Type': ctsType,
+      'Accept': ctsType,
+      'x-csrf-token': await ctsClient.getCsrfToken(),
+      'User-Agent': ECLIPSE_USER_AGENT,
+      'sap-adt-request-id': adtRequestId(),
+      'X-sap-adt-profiling': 'server-time',
+    });
+  } catch (ctsErr) {
+    process.stderr.write(`Warning: CTS transport check for trfn/${trfnLower} failed: ${ctsErr}\n`);
+  }
+
+  // Session B: own session and CSRF token, POST with the lockHandle from session A
   const client2 = createClientFromEnv();
   await client2.getCsrfToken();
   await client2.postWithCsrf(
@@ -167,7 +210,25 @@ export async function bwCreateTransformation(
     );
   }
 
-  // Step 5: Unlock (CREA lock is no longer needed after successful creation)
+  // Step 5a: Optional activation. bwActivate runs in a fresh session, passes corrNr and
+  // releases the CREA lock through the lock-holding client — no separate unlock here.
+  if (args.activate) {
+    const activationResult = JSON.parse(await bwActivate(client, 'trfn', trfnLower, lockHandle, args.transport));
+    return JSON.stringify({
+      success: activationResult.success === true,
+      transformation_name: trfnName,
+      source: { type: srcType, name: srcName },
+      target: { type: tgtType, name: tgtName },
+      package: pkg,
+      ...(args.transport ? { transport: args.transport } : {}),
+      activation: activationResult,
+      message: activationResult.success === true
+        ? `Transformation '${trfnName}' created and activated.`
+        : `Transformation '${trfnName}' created inactive, but activation reported errors — see activation.messages.`,
+    });
+  }
+
+  // Step 5b: Unlock (CREA lock is no longer needed after successful creation)
   try {
     await client.unlock('trfn', trfnLower);
   } catch (unlockErr) {
@@ -180,6 +241,7 @@ export async function bwCreateTransformation(
     source: { type: srcType, name: srcName },
     target: { type: tgtType, name: tgtName },
     package: pkg,
+    ...(args.transport ? { transport: args.transport } : {}),
     message: `Transformation '${trfnName}' created inactive. Call bw_activate with object_type "trfn" to activate.`,
   });
 }
