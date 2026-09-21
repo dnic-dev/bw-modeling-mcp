@@ -1,4 +1,4 @@
-import { BwClient, MEDIA_TYPES, bwSeg, stripInfoAreaSentinel } from '../bw-client.js';
+import { BwClient, MEDIA_TYPES, bwSeg, decodeXmlEntities, stripInfoAreaSentinel } from '../bw-client.js';
 
 // ── bwMoveObject ──────────────────────────────────────────────────────────────
 
@@ -160,6 +160,27 @@ export async function bwGetInfoarea(client: BwClient, name: string): Promise<str
 
     return JSON.stringify({ name: infoAreaName, label, parent_area: parentArea || null, object_status: objectStatus }, null, 2);
   } catch {
-    return JSON.stringify({ raw: body });
+    // Classic releases answer this resource in XML where BW/4HANA answers in JSON. Without
+    // the second reader the tool handed back the whole document as `raw` and left the
+    // caller to parse it — the same four fields are in there, just spelled differently.
+    return parseInfoAreaXml(body, name);
   }
+}
+
+/** The four fields of `bw_get_infoarea`, read out of the XML form of the resource. */
+function parseInfoAreaXml(xml: string, requestedName: string): string {
+  const attr = (name: string) => xml.match(new RegExp(`\\b${name}="([^"]*)"`))?.[1];
+  const element = (name: string) => xml.match(new RegExp(`<${name}>([^<]*)</${name}>`))?.[1];
+
+  const infoAreaName = attr('name') ?? requestedName.toUpperCase();
+  const label = decodeXmlEntities(element('longDescription') ?? '');
+  // The parent is an attribute on the root here, not a nested <infoArea> element.
+  const parentArea = stripInfoAreaSentinel(decodeXmlEntities(attr('parentInfoArea') ?? '')) || null;
+  const objectStatus = element('objectStatus') ?? '';
+
+  return JSON.stringify(
+    { name: infoAreaName, label, parent_area: parentArea, object_status: objectStatus },
+    null,
+    2,
+  );
 }

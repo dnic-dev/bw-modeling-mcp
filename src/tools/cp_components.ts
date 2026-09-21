@@ -1,6 +1,6 @@
 import { XMLParser } from 'fast-xml-parser';
 import { BwClient, bwSeg, stripInfoAreaSentinel } from '../bw-client.js';
-import { ckfAccept, rkfAccept, structureAccept } from './query.js';
+import { ckfAccept, rkfAccept, structureAccept, variableAccept } from './query.js';
 
 // ── XML Parser ───────────────────────────────────────────────────────────────
 
@@ -187,6 +187,16 @@ function extractMetadata(
     package: (packageRef?.['@_adtCore:name'] as string) ?? '',
     info_area: infoArea,
   };
+}
+
+/**
+ * Text content of an element the parser may have returned as a string, as an object with
+ * attributes, or as an empty element (`<Qry:hierarchyName/>` parses to an empty string).
+ */
+function textOf(node: unknown): string {
+  if (node === undefined || node === null) return '';
+  if (typeof node === 'object') return String((node as Record<string, unknown>)['#text'] ?? '');
+  return String(node);
 }
 
 function componentDescription(comp: Record<string, unknown>): string {
@@ -461,6 +471,76 @@ export async function bwGetStructure(client: BwClient, componentName: string): P
       members,
       dependency_count: dependencies.length,
       dependencies,
+    },
+    null,
+    2
+  );
+}
+
+// ── bw_get_variable ──────────────────────────────────────────────────────────
+
+/**
+ * Read a reusable BW Variable off its own modeling resource.
+ *
+ * The reason this reader exists is verification, not convenience. The modeling API
+ * accepts an enum literal it does not know, stores its default and still reports the
+ * object as consistent (see references/bw-enum-literale-und-stille-coercion.md), and
+ * bw_create_variable passes five such literals. Without a way to read the object back,
+ * a processing type that quietly fell back to the default is invisible, and reading the
+ * variable through a query does not help: bw_get_query resolves the technical name of a
+ * variable reference, never its definition.
+ *
+ * A variable that BW considers inconsistent answers the GET with HTTP 500 and names the
+ * component in the message, so the failure is reported as it comes rather than smoothed
+ * over — an inconsistent variable is a finding, not a read error.
+ */
+export async function bwGetVariable(
+  client: BwClient,
+  variableName: string,
+  format: 'text' | 'raw' = 'text'
+): Promise<string> {
+  const path = `/sap/bw/modeling/variable/${bwSeg(variableName.toLowerCase())}/a`;
+  const { body } = await client.get(path, variableAccept());
+  if (format === 'raw') return body;
+
+  const parser = makeParser();
+  const parsed = parser.parse(body);
+  const root = parsed['Qry:queryResource'] as Record<string, unknown>;
+  const mainComp = root['Qry:mainComponent'] as Record<string, unknown> | undefined;
+  if (!mainComp) {
+    throw new Error(`Response for variable '${variableName.toUpperCase()}' has no main component.`);
+  }
+
+  const replacementPath = mainComp['Qry:replacementPath'] as Record<string, unknown> | undefined;
+  const replacementPathType = replacementPath?.['@_type'] as string | undefined;
+
+  // Hierarchy details only carry meaning on a hierarchy variable; on a characteristic
+  // value variable the backend fills them with empty elements and a zero date. The date
+  // arrives as "00000000" and the parser reads it as a number, so the all-zero check runs
+  // on the digits rather than on the string the document carried.
+  const hierarchyName = textOf(mainComp['Qry:hierarchyName']);
+  const hierarchyVersion = textOf(mainComp['Qry:version']);
+  const rawDateTo = textOf(mainComp['Qry:dateTo']);
+  const hierarchyDateTo = /^0*$/.test(rawDateTo) ? '' : rawDateTo;
+
+  return JSON.stringify(
+    {
+      object_type: 'variable',
+      technical_name: (mainComp['@_technicalName'] as string) ?? variableName.toUpperCase(),
+      description: componentDescription(mainComp),
+      info_object: (mainComp['@_infoObject'] as string) ?? '',
+      variable_type: textOf(mainComp['Qry:type']),
+      processing_type: textOf(mainComp['Qry:procType']),
+      represents: textOf(mainComp['Qry:represents']),
+      input_type: textOf(mainComp['Qry:inputType']),
+      ready_for_input: mainComp['@_readyForInput'] === 'true' || mainComp['@_readyForInput'] === true,
+      reusable: mainComp['@_reusable'] === 'true' || mainComp['@_reusable'] === true,
+      ...(replacementPathType ? { replacement_path: replacementPathType } : {}),
+      ...(hierarchyName ? { hierarchy_name: hierarchyName } : {}),
+      ...(hierarchyVersion ? { hierarchy_version: hierarchyVersion } : {}),
+      ...(hierarchyDateTo ? { hierarchy_date_to: hierarchyDateTo } : {}),
+      uid: (mainComp['@_id'] as string) ?? '',
+      ...extractMetadata(mainComp),
     },
     null,
     2

@@ -216,7 +216,7 @@ client resolves through the discovery document at runtime.
 
 ---
 
-## What works after the fix
+## What works after the fix — reads
 
 Verified against a BW 7.5 system:
 
@@ -233,6 +233,122 @@ Verified against a BW 7.5 system:
 The client reconciles resource versions automatically: the discovery document is read at startup and
 overrides the hardcoded media type defaults, including downgrades (a 7.5 backend serving an older
 resource version rejects a higher one with HTTP 415).
+
+That reconciliation keys on the **collection name in the discovery document**, and the name is not
+stable across releases: a classic system publishes InfoObjects as `infoobject` where BW/4HANA
+publishes them as `iobj`. Until the two spellings were mapped onto each other, the discovered
+`iobj-v1_8_0` was filed under a key nothing looked up, the hardcoded `v2_2_0` stayed in place, and
+every InfoObject write was rejected at the lock with HTTP 415 — while the reads went through,
+because the read path sent a list of versions rather than one.
+
+---
+
+## What works after the fix — writes
+
+Every write tool has been run against a classic system (SAP_BASIS 750, `bw.b4hanamode =
+STANDARD`) with its result read back afterwards: InfoAreas, InfoObjects (characteristic and key
+figure), aDSOs with field, key and settings changes, InfoSources, CompositeProviders, queries with
+all five update tools, variables (created and changed in place), restricted and calculated key
+figures, reusable structures, aggregation levels, activation, move, unlock and delete. One write is
+refused by the backend — `bw_create_datasource`, see below.
+
+`bw_system_profile` names the status of each write tool on a classic system, generated from
+`src/classic-writes.ts`, so the tool surface and the statement about it cannot drift apart. This
+section adds what the tool does not print: **what a classic release needs that BW/4HANA does
+not.** Anyone writing against both platforms runs into the same three things.
+
+### What a classic release does differently
+
+| Where it shows | What classic needs |
+|---|---|
+| Every lock — InfoAreas, queries, the reusable query components, `bw_delete` for those types | **The lock must run as plain `stateful`.** A classic backend validates the lock handle against the ADT session that took it, and keeps that session alive only when the lock asks for one. With `stateful_enqueue` — which BW/4HANA accepts — or with no session type at all, the lock returns a handle and the very next request is refused with `ExceptionResourceInvalidLockHandle`, "lock handle … could not be created". The message names the enqueue; the cause is the session. BW/4HANA keeps exactly what the caller asked for. |
+| `bw_create_variable`, `bw_create_rkf`, `bw_create_ckf`, `bw_create_structure` | **Every request between lock and write must carry that session type too.** These flows call `/sap/bc/adt/cts/transportchecks` in between, and a request that declares no session type ends a stateful one — the same 423, one step later. |
+| `bw_create_infoobject`, `bw_update_infoobject`, `bw_activate` for `iobj` | **The write has to leave the session that holds the lock, and the create has to carry the whole object.** This is the one that produces no error at all. See the section below. |
+
+### The InfoObject, and the third cause
+
+`bw_create_infoobject`, `bw_update_infoobject` and `bw_activate` for `iobj` were the last to fall,
+and they needed a trace to settle. After the media type fix the lock succeeded, so the request
+reached the resource — and the backend then accepted both the POST and the PUT, answered
+*"Objekt … wurde erfolgreich geändert"*, and applied nothing. A key figure body produced a
+characteristic, CHAR(5) with ALPHA; a PUT that changed only the description did not arrive either.
+No error, nothing to work from.
+
+An ADT communication trace of Eclipse BWMT creating the same InfoObject on 7.5 showed what the
+messages could not: **BWMT uses its stateful enqueue session for the lock and the unlock and for
+nothing else.** The create POST, every read, the PUT and the activation each go out on a session of
+their own. Over JCo that separation is free, which is why it is invisible in the client and why
+nothing documents it. Over HTTP it has to be asked for — and sending the identical write from a
+second session, quoting the same lock handle, applies it in full.
+
+Two things follow, and both are in the server now:
+
+- The **InfoObject write runs in its own session** on a classic release. Deliberately not every
+  type: an InfoSource PUT applies from the lock session, and once it is sent from elsewhere the
+  activation — which must stay in the lock session, because any other is refused by the
+  InfoProvider lock — checks the state from before the write and reports an empty field list. The
+  types that need the separate session are listed, and a type earns its place by being observed.
+- The **create carries the whole object** on classic. BW/4HANA ignores the create body and takes
+  its values from the PUT that follows, so this server posted a stub; a classic release reads the
+  body and rejects a stub outright ("the object name must not be empty"). The full document is
+  posted there, and the GET and PUT that follow still apply everything it does not carry.
+
+Verified afterwards: a characteristic CHAR(10) with texts and a DEC key figure, both created,
+activated, read back with the values they were given — length 10 rather than the server's 5, the
+text table active — the description changed through `bw_update_infoobject`, and both deleted again.
+
+### The DataSource — one resource moved, one call still refused
+
+**The remote entity value help is published here, at a different address.** It had been written
+off as missing: `bw_list_remote_entities` went to `rsdsint/values/hanaentity` and collected an
+HTTP 404. A BWMT trace shows the classic client asking `is/values/hanaentity` instead, with
+`pattern` and `maxrows` where BW/4HANA takes `searchPattern` and `resultSize`, and answering in a
+different shape — a `<valueHelpCatalog>` naming the columns and rows of bare `<value>` elements,
+positional, rather than one `<technicalName>` plus attributes per row. The tool now speaks both.
+`bw_preview_datasource` still answers 404; it uses `rsdsint/dataprev`, and the trace does not
+cover a preview, so its classic address is unknown.
+
+**`bw_create_datasource` is refused, and this one is not a protocol difference.** The lock returns
+a handle, and the create POST that quotes it comes back `ExceptionResourceInvalidLockHandle`,
+"lock handle for object RSDS … could not be created". The traced BWMT sequence was compared call
+by call and every difference adopted: the package reference in the body, a real application
+component instead of the tree placeholder, the transport check between lock and write, the name
+validation before it, and each of the four lock/write session combinations. The request now
+matches the traced one in URL, headers, content type and body, and the lock answers exactly as it
+does there, `IS_LOCAL=X` included. What remains is outside the protocol: BWMT talks JCo, where the
+lock and the write are two sessions of one connection, and over HTTP they are two logons.
+
+`bw_set_datasource_fields` and `bw_change_datasource_delta` are a different story — they change an
+existing DataSource, and one that nothing uses can be found by reading `RSDS` and checking each
+candidate with `bw_xref`. Both were then exercised for real, and both were broken:
+
+- The **PUT pinned the resource version** (`rsds-v1_1_0`) instead of taking the one discovery
+  resolved, so the backend rejected it with HTTP 415 naming both versions. The same defect as the
+  InfoObject media type, in a second hardcoded spot. Now taken from `MEDIA_TYPES`.
+- `bw_change_datasource_delta` **could set a delta but never remove one**: the empty string the
+  tool documents for "remove the delta process" was checked against the list of admissible values,
+  which never contains it, so the documented way back was refused every time. This one is not
+  release-specific — it was equally broken on BW/4HANA.
+
+Verified on both platforms afterwards, each step read back and every change reversed: a field
+switched off and on again, and a delta process set and removed.
+
+### Modelling differences that are not defects
+
+Three activation failures during this pass came from BW itself, not from the server, and the same
+call behaves the same way on BW/4HANA where the platform allows it at all:
+
+- An aDSO carrying a **pure (non-InfoObject) field**, or one with the **change log switched off**,
+  cannot be used as a CompositeProvider part provider. The aDSO activation says so.
+- A **planning-enabled** aDSO must be direct-update without a change log on a classic release; a
+  standard aDSO with `planning_mode` on activates but is refused as a planning provider. On
+  BW/4HANA the standard aDSO is accepted.
+- An **aggregation level** must expose every key field of its provider, and the currency or unit
+  characteristic has to be a key field there.
+
+A fourth is worth knowing because it looks like a defect: a CompositeProvider over an amount key
+figure reports *"Keine Währungsinformationen für Betragskennzahl"* on activation. That happens on
+BW/4HANA in exactly the same shape, so it is how the tool behaves everywhere, not a 7.5 gap.
 
 ---
 
@@ -252,7 +368,7 @@ collections the system publishes. Both are read once per process, before the fir
 `/sap/bw/modeling` collection is offered exactly where that collection is published, so the
 system itself decides rather than a hardcoded release list. The `/sap/bw4/…` APIs and the
 monitoring OData services are not in the discovery document; those follow the platform
-verdict. On a 7.5 system 44 of the tools drop out — transformations, DTPs, process chains,
+verdict. On a 7.5 system 45 of the tools drop out — transformations, DTPs, process chains,
 transport operations, planning functions and sequences, query data, the data flow graph, the
 request monitor, push, process variants, and the two monitoring OData families. The planning
 reads among those now have a route through the metadata tables; the writes do not.

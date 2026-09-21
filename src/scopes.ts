@@ -69,6 +69,7 @@ const READ_TOOLS = new Set([
   'bw_get_source_system',
   'bw_get_structure',
   'bw_get_transformation',
+  'bw_get_variable',
   'bw_list_changeable_transports',
   'bw_list_contents',
   'bw_list_datasources',

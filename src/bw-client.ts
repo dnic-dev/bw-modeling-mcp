@@ -3,6 +3,8 @@ import https from 'https';
 import { randomUUID } from 'crypto';
 import * as fs from 'fs';
 import { currentClient } from './request-context.js';
+// Value import, but no cycle at runtime: platform.ts takes BwClient as a type only.
+import { cachedPlatform } from './platform.js';
 
 const ECLIPSE_USER_AGENT =
   'Eclipse/4.38.0.v20251201-0920 (win32; x86_64; Java 21.0.9) ADT/3.56.0 (devedition)';
@@ -26,8 +28,71 @@ export const MEDIA_TYPES: Record<string, string> = {
   valuehelp: 'application/vnd.sap-bw-modeling.valuehelp2-v1_1_0+xml',
 };
 
+/**
+ * Discovery collection keys that name the same resource as a different `MEDIA_TYPES` key.
+ *
+ * The key comes from the last segment of the collection href, and that segment is not
+ * stable across releases: a classic system publishes InfoObjects as `infoobject` while
+ * BW/4HANA publishes them as `iobj`. Without the alias the discovered media type is filed
+ * under a key nothing asks for, the hardcoded default stays in place, and every write is
+ * rejected with HTTP 415 "requested content type does not match the backend content type".
+ */
+const COLLECTION_KEY_ALIASES: Record<string, string> = {
+  infoobject: 'iobj',
+};
+
 // DTPs do not need an unlock request after activation
 const NO_UNLOCK_TYPES = new Set(['dtpa']);
+
+/**
+ * The ADT session type a lock request runs under.
+ *
+ * A classic backend validates a lock handle against the ADT session that took it, and it
+ * only keeps that session alive when the lock request asks for one. Without it the lock
+ * itself succeeds and returns a handle, but the very next request — the create POST — is
+ * refused: `ExceptionResourceInvalidLockHandle`, "lock handle for object … could not be
+ * created", which reads like an enqueue problem and is not one. `stateful_enqueue` fails
+ * the same way there, so on classic every lock runs as plain `stateful`.
+ *
+ * BW/4HANA takes the handle without any of this and is left exactly as it was: what the
+ * caller asked for is what it gets.
+ */
+export function lockSessionType(requested?: string): string | undefined {
+  if (cachedPlatform()?.platform !== 'classic') return requested;
+  return 'stateful';
+}
+
+/** `lockSessionType` as a header object, for the lock endpoints that build headers by hand. */
+export function lockSessionHeader(requested?: string): Record<string, string> {
+  const type = lockSessionType(requested);
+  return type ? { 'X-sap-adt-sessiontype': type } : {};
+}
+
+/**
+ * Object types whose writes a classic backend drops when they arrive in the session that
+ * holds the lock.
+ *
+ * The InfoObject resource answers such a POST or PUT with `200` and "object changed
+ * successfully" and applies nothing: a key figure payload produced a characteristic, and a
+ * PUT that changed only the description did not arrive. The identical request sent from a
+ * second session, quoting the same lock handle, applies in full. Eclipse BWMT does exactly
+ * that on 7.5 — it uses its stateful enqueue session for the lock and the unlock and
+ * nothing else, and every read, write and activation goes out on a stateless one, which
+ * JCo hands it for free and HTTP has to be asked for.
+ *
+ * Why a list rather than "every type on classic": the other resources do not behave this
+ * way, and for some the separate session is actively wrong. An InfoSource PUT applies from
+ * the lock session, and once it is sent from elsewhere the activation — which has to stay
+ * in the lock session, because any other is refused by the InfoProvider lock — checks the
+ * state from before the write and reports an empty field list. So the type goes in here
+ * when it has been observed to need it, not by release.
+ */
+const CLASSIC_OWN_SESSION_WRITE = new Set(['iobj']);
+
+/** Must a write to this object type run in a session of its own? */
+export function writeNeedsOwnSession(type: string): boolean {
+  return cachedPlatform()?.platform === 'classic' && CLASSIC_OWN_SESSION_WRITE.has(type.toLowerCase());
+}
 
 function resolveMediaType(type: string): string {
   const mt = MEDIA_TYPES[type.toLowerCase()];
@@ -35,6 +100,50 @@ function resolveMediaType(type: string): string {
     throw new Error(`Object type '${type}' is not supported on this system (not found in Discovery)`);
   }
   return mt;
+}
+
+/** `application/vnd.sap.bw.modeling.adso-v1_2_0+xml` → `{ prefix, major, minor }`. */
+function splitMediaType(mediaType: string): { prefix: string; major: number; minor: number } | null {
+  const m = mediaType.trim().match(/^(.*-v)(\d+)_(\d+)_\d+\+xml$/);
+  return m ? { prefix: m[1], major: parseInt(m[2]), minor: parseInt(m[3]) } : null;
+}
+
+/**
+ * Every resource version up to and including `mediaType`, lowest first.
+ *
+ * An `Accept` header may name several versions and the backend picks the one it serves;
+ * a `Content-Type` may not, so writes keep using the single resolved media type. The two
+ * hand-written lists this replaces — the all-versions list for InfoObjects on the read
+ * path and the two-version list for InfoAreas on the lock path — existed because one
+ * hardcoded version is wrong on a release that serves an older one. Deriving the range
+ * keeps the reads working even when discovery could not be reached and the fallback
+ * default is ahead of the backend.
+ */
+export function acceptRange(mediaType: string): string {
+  const parts = splitMediaType(mediaType);
+  if (!parts) return mediaType;
+  const versions: string[] = [];
+  for (let major = 1; major <= parts.major; major++) {
+    const lastMinor = major === parts.major ? parts.minor : 9;
+    for (let minor = 0; minor <= lastMinor; minor++) {
+      versions.push(`${parts.prefix}${major}_${minor}_0+xml`);
+    }
+  }
+  return versions.join(', ');
+}
+
+/** Expand every versioned media type in an `Accept` header into its version range. */
+export function expandAccept(accept: string): string {
+  const seen = new Set<string>();
+  const out: string[] = [];
+  for (const entry of accept.split(',').map((e) => e.trim()).filter(Boolean)) {
+    for (const mt of acceptRange(entry).split(', ')) {
+      if (seen.has(mt)) continue;
+      seen.add(mt);
+      out.push(mt);
+    }
+  }
+  return out.join(', ');
 }
 
 /**
@@ -186,6 +295,8 @@ export class BwClient {
   private http: AxiosInstance;
   private csrfToken: string | null = null;
   private csrfTokenFetchedAt: number = 0;
+  /** In-flight token fetch, shared by every caller that asks while it runs. */
+  private csrfFetch: Promise<void> | null = null;
   // SAP sessions time out after ~5 minutes of inactivity; refresh the token before that.
   private static readonly CSRF_TOKEN_TTL_MS = 4 * 60 * 1000;
   private cookies: Map<string, string> = new Map();
@@ -429,19 +540,30 @@ export class BwClient {
     this.updateCookies(response);
     const token = response.headers['x-csrf-token'] as string | undefined;
     if (!token || token.toLowerCase() === 'fetch') {
-      if (this.basicAuth) {
-        throw new Error(
-          `Failed to fetch CSRF token (HTTP ${response.status}). Check BW_URL, BW_USER, BW_PASSWORD, BW_CLIENT.`
-        );
-      } else {
-        throw new Error(
-          `Failed to fetch CSRF token (HTTP ${response.status}). ` +
-          `Cookie mode in use — refresh cookies in BW_COOKIE_FILE and restart the MCP server.`
-        );
-      }
+      throw new Error(
+        `Failed to fetch CSRF token (HTTP ${response.status}). ${this.csrfFailureHint()}`
+      );
     }
     this.csrfToken = token;
     this.csrfTokenFetchedAt = Date.now();
+  }
+
+  // Each auth mode fails for its own reasons, and naming the wrong one sends the reader
+  // after a credential that is not involved: under principal propagation an expired trust
+  // chain on the ABAP side surfaces as a plain 401, which looks exactly like a stale cookie.
+  private csrfFailureHint(): string {
+    switch (this.opts.auth.kind) {
+      case 'basic':
+        return 'Check BW_URL, BW_USER, BW_PASSWORD, BW_CLIENT.';
+      case 'cookies':
+        return 'Cookie mode in use — refresh cookies in BW_COOKIE_FILE and restart the MCP server.';
+      case 'pp':
+        return 'Principal propagation in use — no cookie or password is involved. ' +
+          'A 401 here is the trust chain: check that the destination still resolves, that ' +
+          'login/certificate_mapping_rulebased is 1 on the backend, and that the Cloud Connector ' +
+          'is listed in icm/trusted_reverse_proxy_<n>. Both parameters are lost on a backend restart ' +
+          'unless they are in the instance profile.';
+    }
   }
 
   private csrfRequest() {
@@ -456,12 +578,27 @@ export class BwClient {
     });
   }
 
+  /**
+   * One token fetch at a time, however many callers ask at once.
+   *
+   * Two requests issued in parallel on the same client both found no token and both went
+   * and fetched one. The second fetch starts a new session, which invalidates the token
+   * the first request is about to send — so the next write came back `HTTP 403 CSRF token
+   * validation failed`, at a point that had nothing to do with the parallel reads. It
+   * looked transient because it depended on which of the two answered first. Platform
+   * detection does exactly this, two reads at once before the first tool call, which is
+   * why the failure liked to appear on the first write of a session.
+   */
   private async ensureCsrf(): Promise<void> {
     const stale = !this.csrfToken ||
       (Date.now() - this.csrfTokenFetchedAt) > BwClient.CSRF_TOKEN_TTL_MS;
-    if (stale) {
-      await this.fetchCsrfToken();
+    if (!stale) return;
+    if (!this.csrfFetch) {
+      this.csrfFetch = this.fetchCsrfToken().finally(() => {
+        this.csrfFetch = null;
+      });
     }
+    await this.csrfFetch;
   }
 
   public clearCsrfToken(): void {
@@ -477,8 +614,7 @@ export class BwClient {
 
   async get(path: string, accept: string): Promise<GetResult> {
     await this.ensureCsrf();
-    const IOBJ_ACCEPT_ALL = 'application/vnd.sap-bw-modeling.iobj-v1_0_0+xml, application/vnd.sap-bw-modeling.iobj-v1_1_0+xml, application/vnd.sap-bw-modeling.iobj-v1_2_0+xml, application/vnd.sap-bw-modeling.iobj-v1_3_0+xml, application/vnd.sap-bw-modeling.iobj-v1_4_0+xml, application/vnd.sap-bw-modeling.iobj-v1_5_0+xml, application/vnd.sap-bw-modeling.iobj-v1_6_0+xml, application/vnd.sap-bw-modeling.iobj-v1_7_0+xml, application/vnd.sap-bw-modeling.iobj-v1_8_0+xml, application/vnd.sap-bw-modeling.iobj-v1_9_0+xml, application/vnd.sap-bw-modeling.iobj-v2_0_0+xml, application/vnd.sap-bw-modeling.iobj-v2_1_0+xml, application/vnd.sap-bw-modeling.iobj-v2_2_0+xml, application/vnd.sap-bw-modeling.iobj-v2_3_0+xml, application/vnd.sap-bw-modeling.iobj-v2_4_0+xml';
-    const resolvedAccept = accept.includes('iobj') ? IOBJ_ACCEPT_ALL : `application/xml, ${accept}`;
+    const resolvedAccept = `application/xml, ${expandAccept(accept)}`;
     const response = await this.http.get(path, {
       headers: {
         Accept: resolvedAccept,
@@ -509,9 +645,7 @@ export class BwClient {
    */
   async lock(type: string, name: string, extraHeaders?: Record<string, string>, sessionType?: string, cleanHeaders?: boolean): Promise<string> {
     await this.ensureCsrf();
-    const accept = type.toLowerCase() === 'area'
-      ? 'application/vnd.sap.bw.modeling.area-v1_0_0+xml, application/vnd.sap.bw.modeling.area-v1_1_0+xml'
-      : resolveMediaType(type);
+    const accept = expandAccept(resolveMediaType(type));
     const headers: Record<string, any> = cleanHeaders
       ? {
           Accept: accept,
@@ -532,7 +666,7 @@ export class BwClient {
           'bwmt-level': '50',
           'X-CSRF-Token': this.csrfToken!,
           ...this.cookieHeaders(),
-          ...(sessionType ? { 'X-sap-adt-sessiontype': sessionType } : {}),
+          ...lockSessionHeader(sessionType),
           ...extraHeaders,
         };
     const response = await this.http.post(
@@ -583,24 +717,28 @@ export class BwClient {
     extraHeaders?: Record<string, string>,
     extraQuery?: Record<string, string>
   ): Promise<string> {
-    await this.ensureCsrf();
+    // The lock handle is quoted in the URL and is session-independent, so the write can be
+    // sent from anywhere — and on a classic release it has to be. See writeNeedsOwnSession.
+    const session = writeNeedsOwnSession(type) ? createClientFromEnv() : this;
+    await session.ensureCsrf();
     const mediaType = resolveMediaType(type);
     const query = Object.entries(extraQuery ?? {})
       .map(([k, v]) => `&${k}=${encodeURIComponent(v)}`)
       .join('');
     const path =
       `/sap/bw/modeling/${type.toLowerCase()}/${bwSeg(name)}?lockHandle=${lockHandle}${query}`;
-    const response = await this.http.post(path, body, {
+    const response = await session.http.post(path, body, {
       headers: {
         'Content-Type': `application/xml, ${mediaType}`,
         Accept: mediaType,
-        'X-CSRF-Token': this.csrfToken!,
-        ...this.cookieHeaders(),
+        'X-CSRF-Token': session.csrfToken!,
+        ...session.cookieHeaders(),
         ...extraHeaders,
       },
       responseType: 'text',
     });
-    this.updateCookies(response);
+    session.updateCookies(response);
+    session.csrfToken = null;
     this.csrfToken = null;
     if (response.status >= 400) {
       throw bwHttpError(`POST ${path}`, response.status, response.data);
@@ -622,22 +760,25 @@ export class BwClient {
     corrNr?: string,
     transportLockHolder?: string
   ): Promise<string> {
-    await this.ensureCsrf();
+    // Own session on a classic release, for the same reason as in create().
+    const session = writeNeedsOwnSession(type) ? createClientFromEnv() : this;
+    await session.ensureCsrf();
     const mediaType = resolveMediaType(type);
     const corrNrPrefix = corrNr ? `corrNr=${corrNr}&` : '';
     const path = `/sap/bw/modeling/${type.toLowerCase()}/${bwSeg(name)}/m?${corrNrPrefix}lockHandle=${lockHandle}`;
-    const response = await this.http.put(path, body, {
+    const response = await session.http.put(path, body, {
       headers: {
         'Content-Type': `application/xml, ${mediaType}`,
         Accept: mediaType,
-        'X-CSRF-Token': this.csrfToken!,
-        ...this.cookieHeaders(),
+        'X-CSRF-Token': session.csrfToken!,
+        ...session.cookieHeaders(),
         ...(timestamp ? { timestamp } : {}),
         ...(transportLockHolder ? { 'Transport-Lock-Holder': transportLockHolder } : {}),
       },
       responseType: 'text',
     });
-    this.updateCookies(response);
+    session.updateCookies(response);
+    session.csrfToken = null;
     this.csrfToken = null;
     if (response.status >= 400) {
       throw bwHttpError(`PUT ${path}`, response.status, response.data);
@@ -657,7 +798,7 @@ export class BwClient {
       '',
       {
         headers: {
-          Accept: mediaType,
+          Accept: expandAccept(mediaType),
           'bwmt-level': '50',
           'X-CSRF-Token': this.csrfToken!,
           ...this.cookieHeaders(),
@@ -717,7 +858,8 @@ export class BwClient {
    * lockHandle is empty string for DTP activation.
    */
   async activate(type: string, name: string, lockHandle: string, corrNr?: string, sourceSystem?: string): Promise<string> {
-    await this.ensureCsrf();
+    const session = this;
+    await session.ensureCsrf();
     const mediaType = resolveMediaType(type);
     const typeLower = type.toLowerCase();
     // RSDS (DataSource) has a compound key (DataSource + source system) and uses an
@@ -734,17 +876,33 @@ export class BwClient {
     <atom:link href="${href}" type="application/*" rel="self"/>
   </atom:entry>
 </atom:feed>`;
+    // Activation stays in the session that holds the lock — a second session is refused by
+    // the InfoProvider lock, whatever handle it quotes. But on classic the write it is
+    // about to check arrived from elsewhere, so this session's model buffer is one step
+    // behind and the activation would check the state from before it: "the field list of
+    // InfoSource … is empty" on an InfoSource whose fields a fresh read shows. Re-reading
+    // the object here refreshes that buffer first. Best effort — a failed read must not
+    // take the activation with it, and the object may legitimately have no /m version.
+    if (writeNeedsOwnSession(type)) {
+      try {
+        await this.get(`${href}?forceCacheUpdate=true`, mediaType);
+      } catch {
+        /* the activation reports what it finds */
+      }
+    }
+
     const corrNrParam = corrNr ? `?corrNr=${corrNr}` : '';
-    const response = await this.http.post(`/sap/bw/modeling/activation${corrNrParam}`, body, {
+    const response = await session.http.post(`/sap/bw/modeling/activation${corrNrParam}`, body, {
       headers: {
         'Content-Type': 'application/atom+xml;type=entry',
         Accept: 'application/atom+xml;type=feed',
-        'X-CSRF-Token': this.csrfToken!,
-        ...this.cookieHeaders(),
+        'X-CSRF-Token': session.csrfToken!,
+        ...session.cookieHeaders(),
       },
       responseType: 'text',
     });
-    this.updateCookies(response);
+    session.updateCookies(response);
+    session.csrfToken = null;
     this.csrfToken = null;
     if (response.status >= 400) {
       throw bwHttpError(`Activation of ${type}/${name}`, response.status, response.data);
@@ -1010,9 +1168,11 @@ export class BwClient {
     for (const segment of segments) {
       const hrefMatch = segment.match(/^<app:collection\b[^>]*?\shref="([^"]+)"/);
       if (!hrefMatch) continue;
-      // Extract last URL segment as the key (e.g. ".../adso" → "adso")
-      const key = hrefMatch[1].split('/').pop()?.toLowerCase();
-      if (!key) continue;
+      // Extract last URL segment as the key (e.g. ".../adso" → "adso"), then map the
+      // release-specific spelling of that segment onto the key the server addresses.
+      const rawKey = hrefMatch[1].split('/').pop()?.toLowerCase();
+      if (!rawKey) continue;
+      const key = COLLECTION_KEY_ALIASES[rawKey] ?? rawKey;
       // Consider only versioned XML modeling media types ("...-vX_Y_Z+xml").
       // Sub-resource accepts (e.g. "jobs.job+xml") and +json variants score 0.
       const versioned = [...segment.matchAll(/<app:accept>([^<]+)<\/app:accept>/g)]

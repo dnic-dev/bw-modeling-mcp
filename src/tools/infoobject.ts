@@ -1,4 +1,56 @@
 import { BwClient, MEDIA_TYPES, createClientFromEnv, freshRead, bwSeg } from '../bw-client.js';
+import { cachedPlatform } from '../platform.js';
+
+/**
+ * The full characteristic document a classic backend expects in the create POST.
+ *
+ * BW/4HANA ignores the create body and takes its values from the PUT that follows; a
+ * classic release reads the body and refuses a stub. The element order and the empty
+ * elements are not decoration — they are the document the resource validates against,
+ * taken from an Eclipse BWMT trace of the same operation on 7.5.
+ */
+function characteristicCreateXml(o: {
+  name: string;
+  infoArea: string;
+  description: string;
+  dataType: string;
+  length: number;
+  conversionRoutine: string;
+  withMasterData: boolean;
+  withTexts: boolean;
+  language: string;
+  responsible: string;
+}): string {
+  const conv = o.conversionRoutine ? ` conversionRoutine="${o.conversionRoutine}"` : '';
+  return `<?xml version="1.0" encoding="UTF-8"?>
+<InfoObject:infoObject xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xmlns:InfoObject="http://www.sap.com/bw/modeling/BwIobj.ecore" xmlns:adtcore="http://www.sap.com/adt/core" xsi:type="InfoObject:Characteristic" name="${o.name}" shortDescriptionSet="false"${conv} objectSpecificDataType="${o.dataType}">
+  <infoObjectType>CHA</infoObjectType>
+  <dataElement/>
+  <dataType>${o.dataType}</dataType>
+  <longDescription>${o.description}</longDescription>
+  <shortDescription>${o.description}</shortDescription>
+  <tlogoProperties adtcore:language="${o.language}" adtcore:name="${o.name}" adtcore:type="IOBJ" adtcore:masterLanguage="${o.language}" adtcore:responsible="${o.responsible}">
+    <infoArea>${o.infoArea}</infoArea>
+  </tlogoProperties>
+  <referencedInfoObject/>
+  <length>${o.length}</length>
+  <displayProperties><display>2</display><selection>0</selection></displayProperties>
+  <queryFilterValue forQueryDefinition="D"/>
+  <baseUnitOfMeasure/>
+  <unitsOfMeasureForCharacteristic/>
+  <currencyAttribute/>
+  <dataStoreObjectForAuthorityCheck/>
+  <masterDataProperties withMasterData="${o.withMasterData}"><timeDependentAttributeSIDTable/><attributeSIDTable/><xxlAttributeTable/><masterDataView/><masterDataTable/><timeDependentMasterDataTable/></masterDataProperties>
+  <textProperties languageDependentTextAvailable="false" shortTextAvailable="${o.withTexts}" withTexts="${o.withTexts}"><textTable/></textProperties>
+  <masterDataAccess readClass="" sapHanaPackage="" sapHanaView=""/>
+  <hierarchyProperties/>
+  <bexMap><geographicalAttribute/></bexMap>
+  <externalSAPHANAView><masterDataView/><infoProviderView/></externalSAPHANAView>
+  <runtimeProperties/>
+  <sidTable/>
+  <masterDataRoutine/>
+</InfoObject:infoObject>`;
+}
 
 // ── KYF: objectSpecificDataType → keyfigureType / semantics ──────────────────
 
@@ -188,8 +240,28 @@ export async function bwCreateInfoObject(
   // ── CHA: POST body ignored — GET + PUT required ────────────────────────────
 
   // Step 2: Create-POST — API ignores body, creates object with defaults
+  //
+  // Except on a classic release, which reads it: there the minimal body is rejected
+  // outright ("the object name must not be empty"), because nothing can be derived from
+  // it. The wizard in Eclipse BWMT posts the whole object on 7.5, so this does too — the
+  // GET and PUT below still run and apply everything this body does not carry.
   const minimalXml = `<?xml version="1.0" encoding="UTF-8"?><iobj:infoObject xmlns:iobj="http://www.sap.com/bw/modeling/BwIobj.ecore" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:type="iobj:Characteristic" name="${nameUpper}"/>`;
-  await client.create('iobj', nameLower, lockHandle, minimalXml, { 'Development-Class': pkg });
+  const createXml = cachedPlatform()?.platform === 'classic'
+    ? characteristicCreateXml({
+        name: nameUpper,
+        infoArea,
+        description: desc,
+        dataType: (args.data_type ?? 'CHAR').toUpperCase(),
+        length: args.length ?? 10,
+        conversionRoutine: args.conversion_routine
+          ?? (((args.data_type ?? 'CHAR').toUpperCase() === 'CHAR' || (args.data_type ?? 'CHAR').toUpperCase() === 'NUMC') ? 'ALPHA' : ''),
+        withMasterData: args.with_master_data ?? false,
+        withTexts: args.with_texts ?? false,
+        language: process.env.BW_LANGUAGE ?? 'DE',
+        responsible: (process.env.BW_USER ?? '').toUpperCase(),
+      })
+    : minimalXml;
+  await client.create('iobj', nameLower, lockHandle, createXml, { 'Development-Class': pkg });
 
   // Step 3: GET server-created object (defaults) to obtain enriched XML + timestamp
   const getResult = await client.get(`/sap/bw/modeling/iobj/${bwSeg(nameLower)}/m`, MEDIA_TYPES['iobj']);

@@ -1,4 +1,4 @@
-import { BwClient, createClientFromEnv, bwSeg } from '../bw-client.js';
+import { BwClient, createClientFromEnv, bwSeg, lockSessionHeader } from '../bw-client.js';
 import { QUERY_ACCEPT_LIST, queryAccept, queryWriteMediaType, variableAccept, ckfAccept, rkfAccept, structureAccept } from './query.js';
 
 /**
@@ -464,6 +464,7 @@ export async function withQueryDocument(
     'Accept': QUERY_ACCEPT_LIST,
     'bwmt-level': '50',
     'x-csrf-token': csrf,
+    ...lockSessionHeader(),
   });
   const lockMatch = lockResponse.body.match(/<LOCK_HANDLE>([^<]+)<\/LOCK_HANDLE>/);
   if (!lockMatch) {

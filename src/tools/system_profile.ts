@@ -1,5 +1,6 @@
 import { BwClient } from '../bw-client.js';
 import { ensurePlatform, hiddenTools, parseDiscoveryCollections, parseSysProps } from '../platform.js';
+import { CLASSIC_WRITE_HEADINGS, CLASSIC_WRITE_STATUS, type ClassicWriteVerdict } from '../classic-writes.js';
 
 /**
  * Object types this server addresses through the BW modeling REST API, grouped by
@@ -203,6 +204,24 @@ export async function bwSystemProfile(client: BwClient, toolNames: readonly stri
       if (plain.length > 0) out.push(`    ${plain.join(', ')}`);
       for (const { name, route } of tools.filter((t) => t.route)) {
         out.push(`    ${name} → use ${route}`);
+      }
+    }
+  }
+
+  if (!isBw4) {
+    const offered = new Set(toolNames);
+    const shown = Object.entries(CLASSIC_WRITE_STATUS).filter(([name]) => offered.size === 0 || offered.has(name));
+    if (shown.length > 0) {
+      out.push('');
+      out.push(`── Write tools on this platform (${shown.length}) ──`);
+      // Silence would read as "everything not hidden works", so each write names its verdict.
+      for (const verdict of ['verified', 'blocked', 'untested'] as ClassicWriteVerdict[]) {
+        const group = shown.filter(([, s]) => s.verdict === verdict);
+        if (group.length === 0) continue;
+        out.push(`  ${CLASSIC_WRITE_HEADINGS[verdict]}`);
+        for (const [name, status] of group) {
+          out.push(status.note ? `    ${name} — ${status.note}` : `    ${name}`);
+        }
       }
     }
   }

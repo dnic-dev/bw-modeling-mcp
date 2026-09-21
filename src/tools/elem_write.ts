@@ -1,6 +1,13 @@
 import { XMLParser } from 'fast-xml-parser';
-import { BwClient, createClientFromEnv, bwSeg } from '../bw-client.js';
-import { ckfAccept, rkfAccept, structureAccept, QUERY_ACCEPT_LIST, queryWriteMediaType } from './query.js';
+import { BwClient, createClientFromEnv, bwSeg, lockSessionHeader } from '../bw-client.js';
+import {
+  ckfAccept,
+  rkfAccept,
+  structureAccept,
+  variableAccept,
+  QUERY_ACCEPT_LIST,
+  queryWriteMediaType,
+} from './query.js';
 import {
   escapeXml,
   FORMULA_OPERATOR_ARITY,
@@ -94,11 +101,12 @@ export async function recordedIn(client: BwClient, elemUid: string): Promise<str
   }
 }
 
-type ElemResource = 'ckf' | 'rkf' | 'structure';
+type ElemResource = 'ckf' | 'rkf' | 'structure' | 'variable';
 
 function acceptFor(resource: ElemResource): string {
   if (resource === 'ckf') return ckfAccept();
   if (resource === 'rkf') return rkfAccept();
+  if (resource === 'variable') return variableAccept();
   return structureAccept();
 }
 
@@ -131,6 +139,7 @@ async function withElementDocument(
     Accept: accept,
     'bwmt-level': '50',
     'x-csrf-token': await client.getCsrfToken(),
+    ...lockSessionHeader(),
   });
   const lockHandle = lockResponse.body.match(/<LOCK_HANDLE>([^<]+)<\/LOCK_HANDLE>/)?.[1];
   if (!lockHandle) {
@@ -405,6 +414,7 @@ export async function bwCreateCkf(client: BwClient, args: CreateCkfArgs): Promis
     Accept: `${queryWriteMediaType()}, ${QUERY_ACCEPT_LIST}`,
     'bwmt-level': '50',
     'x-csrf-token': await client.getCsrfToken(),
+    ...lockSessionHeader(),
   });
   const lockHandleA = lockA.body.match(/<LOCK_HANDLE>([^<]+)<\/LOCK_HANDLE>/)?.[1];
   if (!lockHandleA) throw new Error(`No <LOCK_HANDLE> in CREA lock response:\n${lockA.body}`);
@@ -428,6 +438,7 @@ export async function bwCreateCkf(client: BwClient, args: CreateCkfArgs): Promis
       'Content-Type':
         'application/vnd.sap.as+xml; charset=UTF-8; dataname=com.sap.adt.transport.service.checkData',
       'x-csrf-token': await client.getCsrfToken(),
+      ...lockSessionHeader(),
     });
     if (transportResult.body.match(/<RESULT>([^<]*)<\/RESULT>/)?.[1] === 'E') {
       throw new Error(`transportchecks failed for package '${pkg}':\n${transportResult.body}`);
@@ -1316,6 +1327,7 @@ export async function bwCreateStructure(client: BwClient, args: CreateStructureA
     Accept: `${queryWriteMediaType()}, ${QUERY_ACCEPT_LIST}`,
     'bwmt-level': '50',
     'x-csrf-token': await client.getCsrfToken(),
+    ...lockSessionHeader(),
   });
   const lockHandleA = lockA.body.match(/<LOCK_HANDLE>([^<]+)<\/LOCK_HANDLE>/)?.[1];
   if (!lockHandleA) throw new Error(`No <LOCK_HANDLE> in CREA lock response:\n${lockA.body}`);
@@ -1338,6 +1350,7 @@ export async function bwCreateStructure(client: BwClient, args: CreateStructureA
       'Content-Type':
         'application/vnd.sap.as+xml; charset=UTF-8; dataname=com.sap.adt.transport.service.checkData',
       'x-csrf-token': await client.getCsrfToken(),
+      ...lockSessionHeader(),
     });
     if (transportResult.body.match(/<RESULT>([^<]*)<\/RESULT>/)?.[1] === 'E') {
       throw new Error(`transportchecks failed for package '${pkg}':\n${transportResult.body}`);
@@ -1613,6 +1626,187 @@ export async function bwUpdateStructure(client: BwClient, args: UpdateStructureA
       ...(recorded ? { recorded_in: recorded } : {}),
       consistency_messages: messages,
       message: `Structure '${nameUpper}' updated.`,
+    },
+    null,
+    2
+  );
+}
+
+// ── bw_update_variable ───────────────────────────────────────────────────────
+
+export interface UpdateVariableArgs {
+  variable_name: string;
+  description?: string;
+  ready_for_input?: boolean;
+  input_type?: 'Optional' | 'MandatoryWithInitial' | 'MandatoryWithoutInitial';
+  represents?: 'Interval' | 'SingleValue' | 'SeveralSingleValues' | 'SelectionOption';
+  processing_type?: 'UserEntry' | 'CustomerExit' | 'Authorization' | 'ReplacementPath';
+  transport_request?: string;
+}
+
+/** The replacement path block a ReplacementPath variable needs; empty for every other type. */
+const REPLACEMENT_PATH_CURRENT_MEMBER =
+  '<Qry:replacementPath type="CurrentMember" asBoolean="false" offsetStart="0000"' +
+  ' offsetLength="0000" calculateBeforeNonCum="false"/>';
+
+/**
+ * Apply the requested changes to a variable document.
+ *
+ * Separate from the save cycle so the shape of the edit can be checked without a system,
+ * and because one detail is easy to get wrong in a way nothing reports: `<Qry:type>` exists
+ * twice in the document. The second one belongs to `<Qry:defaultHint>`, and a replacement
+ * that lands on it turns the hint into a constant — the variable still reads back as
+ * consistent, and the damage only surfaces in the value help the variable screen offers.
+ * The enum elements are therefore edited only after `</Qry:entityProperties>`, which is
+ * where all four of them live and where the hint does not reach.
+ */
+export function applyVariableChanges(
+  doc: string,
+  args: UpdateVariableArgs
+): { document: string; applied: string[] } {
+  const applied: string[] = [];
+  const mainStart = doc.indexOf('<Qry:mainComponent');
+  if (mainStart === -1) throw new Error('Document has no <Qry:mainComponent>.');
+  const head = doc.slice(0, mainStart);
+  let main = doc.slice(mainStart);
+
+  if (args.description !== undefined) {
+    const descEsc = escapeXml(args.description);
+    main = main
+      .replace(/<Qry:description\b[^>]*?\/>/, `<Qry:description default="false" value="${descEsc}"/>`)
+      .replace(/(<Qry:entityProperties\b[^>]*?adtCore:description=")[^"]*"/, `$1${descEsc}"`);
+    applied.push(`description set to "${args.description}"`);
+  }
+
+  if (args.ready_for_input !== undefined) {
+    const value = String(args.ready_for_input);
+    main = main.replace(
+      /(<Qry:mainComponent\b[^>]*?\breadyForInput=")[^"]*"/,
+      `$1${value}"`
+    );
+    applied.push(`ready_for_input set to ${value}`);
+  }
+
+  // The enum elements all sit after </Qry:entityProperties>. Splitting there keeps the
+  // replacements off the identically named elements inside <Qry:defaultHint>, where a
+  // <Qry:type> also lives and a stray write turns the hint into a constant.
+  const propsEnd = main.indexOf('</Qry:entityProperties>');
+  if (propsEnd === -1) throw new Error('Document has no </Qry:entityProperties>.');
+  const splitAt = propsEnd + '</Qry:entityProperties>'.length;
+  const beforeEnums = main.slice(0, splitAt);
+  let enums = main.slice(splitAt);
+
+  const setElement = (tag: string, value: string): void => {
+    const re = new RegExp(`<Qry:${tag}>[^<]*</Qry:${tag}>|<Qry:${tag}/>`);
+    if (!re.test(enums)) throw new Error(`Document has no <Qry:${tag}> element.`);
+    enums = enums.replace(re, `<Qry:${tag}>${value}</Qry:${tag}>`);
+  };
+
+  if (args.input_type !== undefined) {
+    setElement('inputType', args.input_type);
+    applied.push(`input_type set to ${args.input_type}`);
+  }
+  if (args.represents !== undefined) {
+    setElement('represents', args.represents);
+    applied.push(`represents set to ${args.represents}`);
+  }
+  if (args.processing_type !== undefined) {
+    setElement('procType', args.processing_type);
+    // The replacement path block belongs to the processing type: a ReplacementPath
+    // variable without it has nothing to replace from, and leaving it behind on a
+    // variable that is no longer one would describe a rule that no longer applies.
+    const replacement =
+      args.processing_type === 'ReplacementPath'
+        ? REPLACEMENT_PATH_CURRENT_MEMBER
+        : '<Qry:replacementPath/>';
+    enums = enums.replace(
+      /<Qry:replacementPath\b[^>]*?(\/>|>[\s\S]*?<\/Qry:replacementPath>)/,
+      replacement
+    );
+    applied.push(`processing_type set to ${args.processing_type}`);
+  }
+
+  return { document: head + beforeEnums + enums, applied };
+}
+
+/**
+ * Change a reusable variable in place.
+ *
+ * Why in place and not delete-and-recreate: BW refuses to delete a variable that a query,
+ * a CKF or a structure references, and deleting the query does not take its reusable
+ * sub-components with it — so a variable created with a wrong literal used to be stuck in
+ * the system with no way to reach it from here. The UID is preserved by editing the live
+ * document rather than rebuilding it, so every reference survives the change.
+ *
+ * Two fields are deliberately not offered, both because the backend does not honour them:
+ *
+ *   - The reference characteristic. A PUT that changes `infoObject` comes back "consistent"
+ *     and the old characteristic is still in place afterwards — the silent coercion this
+ *     tool exists to expose, so it is rejected instead of sent.
+ *   - The variable type (characteristic value / hierarchy / hierarchy nodes). Same picture,
+ *     and the type decides what the rest of the document has to look like.
+ *
+ * Both need a delete and a fresh create, which is possible exactly as long as nothing
+ * references the variable yet.
+ */
+export async function bwUpdateVariable(client: BwClient, args: UpdateVariableArgs): Promise<string> {
+  if (!args.variable_name) throw new Error('variable_name is required.');
+  const extra = args as unknown as Record<string, unknown>;
+  for (const [field, hint] of [
+    ['iobj_name', 'the reference characteristic'],
+    ['variable_type', 'the variable type'],
+  ] as const) {
+    if (extra[field] !== undefined) {
+      throw new Error(
+        `'${field}' cannot be changed on an existing variable: BW accepts the write, reports the ` +
+          `object as consistent and keeps the old value. Delete the variable and create it again to ` +
+          `change ${hint} — which only works while nothing references it yet.`
+      );
+    }
+  }
+  if (
+    args.description === undefined &&
+    args.ready_for_input === undefined &&
+    args.input_type === undefined &&
+    args.represents === undefined &&
+    args.processing_type === undefined
+  ) {
+    throw new Error(
+      'Nothing to do: pass description, ready_for_input, input_type, represents and/or processing_type.'
+    );
+  }
+
+  const nameUpper = args.variable_name.toUpperCase();
+  const applied: string[] = [];
+
+  const { messages, document } = await withElementDocument(
+    client,
+    'variable',
+    nameUpper,
+    (doc) => {
+      const result = applyVariableChanges(doc, args);
+      applied.push(...result.applied);
+      return result.document;
+    },
+    args.transport_request?.toUpperCase()
+  );
+
+  const elemUid = document.match(/<Qry:mainComponent\b[^>]*?\bid="([^"]+)"/)?.[1];
+  const recorded = args.transport_request && elemUid ? await recordedIn(client, elemUid) : undefined;
+
+  return JSON.stringify(
+    {
+      success: true,
+      object_type: 'variable',
+      technical_name: nameUpper,
+      ...(elemUid ? { uid: elemUid } : {}),
+      applied_operations: applied,
+      ...(args.transport_request ? { transport_request: args.transport_request.toUpperCase() } : {}),
+      ...(recorded ? { recorded_in: recorded } : {}),
+      consistency_messages: messages,
+      message:
+        `Variable '${nameUpper}' updated. Read it back with bw_get_variable: the modeling API ` +
+        'stores its default for a literal it does not know and still reports the object as consistent.',
     },
     null,
     2

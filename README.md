@@ -43,7 +43,7 @@ Principal propagation additionally needs a certificate rule and ICM trust on the
 |---|---|
 | SAP BW/4HANA (all versions) | ✅ Full support |
 | SAP BW Bridge (SAP BTP ABAP stack) | ✅ Via cookie authentication (`BW_COOKIE_FILE`) |
-| SAP BW on HANA (7.5) | ✅ Modelling reads after a small ABAP enhancement; the tool surface adjusts to what the system publishes, and the objects without a REST resource — including planning, chain runs and the APD — are read from their metadata tables. See [BW 7.5 Support](docs/BW75-SUPPORT.md) |
+| SAP BW on HANA (7.5) | ✅ Modelling reads after a small ABAP enhancement, and modelling **writes** for every object type except the InfoObject — aDSOs, InfoAreas, InfoSources, CompositeProviders, queries and their reusable components, aggregation levels. The tool surface adjusts to what the system publishes, and the objects without a REST resource — including planning, chain runs and the APD — are read from their metadata tables. `bw_system_profile` states per write tool what was verified there. See [BW 7.5 Support](docs/BW75-SUPPORT.md) |
 
 <p><em><sub>On SAP BW 7.5 the REST framework looks up the <code>Accept</code> header case-sensitively while the kernel delivers header names in lower case, so almost every call fails with HTTP 406. A ~20-line post-exit enhancement (no modification) resolves this and makes all REST endpoints that exist on 7.5 reachable. Objects for which BW 7.5 ships no REST resource at all — transformations, DTPs, process chains and their runs, classic DSOs, InfoCubes, the planning objects and the Analysis Process Designer — are readable through <code>bw_read_metadata_tables</code>, which goes to their metadata tables instead, but they cannot be written; Eclipse opens the embedded SAP GUI for those as well. Details, ABAP code and setup steps: <a href="docs/BW75-SUPPORT.md">docs/BW75-SUPPORT.md</a>.</sub></em></p>
 
@@ -61,227 +61,48 @@ A two-part blog series about this project (both available in German and English)
 
 ---
 
-## 🆕 What's New — v1.5.0
+## 🆕 What's New — v1.6.0
 
-Classic SAP BW 7.5 becomes a first-class system, business users get a client of their own,
-and the reusable query building blocks — calculated key figures, restricted key figures and
-structures — can now be created and changed rather than only read.
+Modelling on a classic **SAP BW 7.5 on HANA** system is verified in both directions — every
+create and update tool was run against a 7.5 backend and read back — and the last of the
+reusable query building blocks, the variable, can now be read back and corrected too.
 
-**🏛️ Classic BW 7.5, properly supported**
+**🏛️ Writing on BW 7.5 on HANA**
 
-- `tools/list` follows the platform: a tool whose resource a 7.5 does not publish is no longer offered there, and each one names the call that answers the same question instead. The platform is detected from the system's own `bw.b4hanamode` flag and its discovery document, so the system decides and not a hardcoded release list. On BW/4HANA nothing changes
-- `bw_read_metadata_tables` gains the object types those hidden tools would have answered for: planning functions, sequences, characteristic relationships and data slices (`PLSE`, `PLSQ`, `PLCR`, `PLDS`), process chain runs with their steps and the process variant behind each (`RSPCLOG`), and the load history of an aDSO (`ADSO`)
-- It also reads the **Analysis Process Designer** (APD, `object_type="ANPR"`) — nodes in execution order with the object each source reads and each target writes, the edges between them, filters, formulas and the ABAP of a routine node. No release ever published a REST resource for it, and BW/4HANA dropped the object type, so this is the only route to one
+- InfoAreas, InfoObjects, aDSOs, InfoSources, CompositeProviders, queries with their
+  reusable components, aggregation levels, activation, move, unlock and delete — each
+  written and read back on a 7.5 system
+- `bw_system_profile` names the status of every write tool on the connected system, so
+  "can I model this here" is answered by the server
 
-**👤 A client for business users**
+**🔤 Variables, read back and corrected**
 
-- The new **BW MCP Analyst** role collection offers 14 tools instead of 105: run a query — or a provider directly — read the characteristic values to filter by, find what there is to ask, and understand what the numbers mean. The size is the point: a client carrying every tool reaches for the wrong one far more often
-- Purely additive. `read` is unchanged and still admits everything it did, `analyst` is a strict subset of it, and a caller may hold both
+- `bw_get_variable` returns what was actually stored. The modelling API accepts an enum
+  literal it does not know, saves its default and still reports the object as consistent,
+  so a create alone proves nothing
+- `bw_update_variable` corrects one with its UID unchanged, so references from queries,
+  CKFs and structures survive — the only path before was delete-and-recreate, which BW
+  refuses once anything references the variable
 
-**🧱 Reusable query building blocks**
-
-- `bw_create_ckf` / `bw_update_ckf` — calculated key figures, with the formula as an operator/operand tree that `bw_get_ckf` hands back unchanged. `update` takes targeted operations, so another summand can be added to a sum without rebuilding the expression
-- `bw_create_structure` / `bw_update_structure` — reusable key figure structures. A change reaches every query that embeds the structure, which is why it happens at the structure rather than through one query that uses it
-- `bw_update_rkf` — a restricted key figure keeps its UID when changed, so references from CKFs, structures and queries survive. Until now the only correction was delete-and-recreate, which is impossible once the RKF is referenced anywhere
-
-**🔑 Client compatibility (hosted instance)**
-
-- The OAuth metadata advertises `scopes_supported`. Without it a client requests no scopes at all, and Copilot's older auth code then fails with `scope.split is not a function` (fixed upstream in vscode#325344, but the Eclipse Language Server lags behind)
-
-**✨ Also new**
-
-- `bw_delete_request` deletes load requests — with the data they brought in and their entry in request management
-- Characteristics can be modelled for values with lower case letters or umlauts (`lower_case`), which previously failed at request activation rather than at load time
-- `bw_get_request` reads the log of each process step, so a failed activation names the value and the characteristic that caused it
+**On BW/4HANA nothing changes** — what a classic release needs is added beside the existing
+behaviour, never in place of it.
 
 ---
 
-**Earlier releases** — the "What's New" notes for v1.4.1 and older are archived in [WHATS_NEW.md](WHATS_NEW.md); the full structured history is in [CHANGELOG.md](CHANGELOG.md).
+**Earlier releases** — the "What's New" notes for v1.5.0 and older are archived in [WHATS_NEW.md](WHATS_NEW.md); the full structured history is in [CHANGELOG.md](CHANGELOG.md).
 
 ---
 
 ## What it can do
 
-An overview by area. Every tool in detail — parameters, behaviour, and the sequences it belongs in — is in the **[Tools Reference](TOOLS.md)** (105 tools).
+An overview by area. Every tool in detail — parameters, behaviour, and the sequences it belongs in — is in the **[Tools Reference](TOOLS.md)** (107 tools).
 
-### Search & Discovery
-- Search BW objects by name or description (wildcards supported), filtered by type
-- Where-used / dependency analysis (xref) for any BW object
-
-### aDSO
-- Read aDSO structure (fields, settings, version state)
-- Create a new aDSO — from an aDSO template, from a DataSource (RSDS) template, or empty
-- Add InfoObject-backed fields or pure (field-based) fields
-- Remove fields
-- Manage key fields
-- Update field properties (aggregation, data type, length, etc.)
-- Place fields in a field group — on creation, so a key figure lands in the key figure group without a second activation, or afterwards to move an existing field between groups
-- Update aDSO settings (type preset, flags, description)
-- Write-interface aDSO support (`pushMode`)
-
-### InfoObject
-- Read InfoObject definition
-- Create Characteristic — all data types (CHAR, NUMC, DATS, TIMS, SNUMC), with or without master data and texts, with referenced InfoObject, with compounding parents
-- Create Key Figure — all types (NUM, AMT, QTY, DAT, INT), all aggregations (SUM, MAX, MIN)
-- Add and remove display and navigation attributes
-
-### InfoArea
-- Read InfoArea definition (name, label, parent area, status)
-- Create a new InfoArea (immediately active, no activation step needed)
-- Move any BW object to a different InfoArea
-
-### InfoSource
-- Read InfoSource structure (fields, key fields, label, InfoArea)
-- Create InfoSource with full field definitions
-
-### Transformation
-- Read Transformation structure (all sources, all targets)
-- Create a Transformation — including InfoObject (IOBJ) sources/targets with an explicit sub-type (text table, attributes/master data, hierarchy)
-- Map source fields to target InfoObjects or plain fields (StepDirect)
-- Set formula rules (StepFormula)
-- Set field routines — ABAP and AMDP (StepRoutine)
-- Set start routines — ABAP and AMDP
-- Set end routines — ABAP and AMDP
-- Set END routine target fields (explicit field list or exclusion list)
-- Switch runtime between ABAP and AMDP
-
-### DTP (Data Transfer Process)
-- Read DTP structure and settings
-- Create DTPs — including DataSource (RSDS) sources and InfoObject targets by sub-type (attributes, texts, hierarchies)
-- Run (execute) a DTP load — returns the run request id for monitoring
-- Update DTP settings and description
-- Switch extraction mode between Full and Delta
-- Set value filters on fields
-- Set routine filters (ABAP code)
-
-### BW Query
-- Read a BW Query — metadata, variables, filter, layout, measures, exceptions, and settings
-- Variables: type, processing type (UserEntry, Authorization, CustomerExit), input behavior
-- Filter: fixed values and variable references fully resolved, including mixed selections
-- Layout: rows, columns, free characteristics with full member lists and nested members
-- Calculated key figures: recursively resolved human-readable formulas
-- Restricted key figures: selection conditions (key figure + characteristic restrictions)
-- Inline local measures inside structures: both formulas and selections
-- Exceptions with alert levels and thresholds, cell definitions for grid layout queries
-- Active version with automatic fallback to inactive
-- Create a new, consistent Query (ELEM) on an InfoProvider — empty, or as a full copy of an existing query (layout, filter, variables, key figures) via `copy_from`
-- Update the layout — rows, columns, structures, and free characteristics
-- Update the filter — fixed values and restrictions
-- Update key figures — basic key figures, references to global RKFs/CKFs, and local formula members with exception aggregation and display properties
-- Build local formula members from the full BW analytic-engine operator catalog — arithmetic, percentage, data, mathematical, trigonometric, and boolean operators plus ternary `IF`; operand counts are validated before saving
-- Update query settings (properties)
-- Update the display and access properties of each characteristic in the layout — display of result rows, display as key/text, access type for result values, sorting, cumulation, display level, and the hierarchy assignment with its display options; in bulk across every characteristic with `"*"`
-- Record query edits on a transport request for queries on a transportable package
-- Delete a query
-- Create characteristic variables — user entry, customer exit, authorization or replacement path; as characteristic value, hierarchy or hierarchy nodes; interval, single value, several single values or comparison operators
-- Create and change **reusable calculated key figures** — the formula as an operator/operand tree that reads back unchanged, and targeted operations for editing one that already exists
-- Create and change **reusable key figure structures** — the object queries embed as an axis, so one definition drives all of them; a change reaches every query that uses it
-- Change a **restricted key figure** in place — the UID survives, so references from CKFs, structures and queries stay intact
-
-### Live Data Querying
-- Execute a BEx Query or preview data from any InfoProvider (aDSO, CompositeProvider) — returns a formatted result table
-- Fill query variables, control axis layout (rows / columns / free), apply characteristic filters with include/exclude and range operators
-- Drill into hierarchy nodes and structure members (expand / collapse by tuple index)
-- Look up valid characteristic values before setting filters or variables — returns both internal and external key formats
-
-### CompositeProvider
-- Read CompositeProvider structure — view node type (Union/Join), source providers (inputs) with mapping count, all fields with dimension classification, join conditions, and temporal join details
-- Create a CompositeProvider — Union or Join node with its source providers attached, or as a copy of an existing one
-- Attach and detach source providers, with their target elements created as needed
-- Replace the field mappings of an input, either explicitly or mapped one to one from the source
-- Set and remove join conditions per input pair, with join type and cardinality
-- Add and remove fields, edit root settings (description, stackable, default node, aggregation behaviour)
-
-### Global CP Components
-- Read global Calculated Key Figure (CKF) — formula recursively resolved to a human-readable string, full dependency graph of all referenced sub-components
-- Read global Restricted Key Figure (RKF) — base measure, all characteristic restriction groups with field and value details
-- Read global Structure — all members with Formula/Selection breakdown, referenced components, characteristic filters, optional child members
-- Create a reusable Restricted Key Figure (RKF) on an InfoProvider — from a base key figure plus characteristic restrictions (built for mass creation, one per call); each value is validated against the InfoProvider and written consistent, no separate activation
-
-### Repository Navigation
-- Navigate the full BW repository tree — drill from InfoArea to type folder to object to sub-folder, mirroring the Eclipse BWMT Project Explorer; each entry returns a `children_path` for seamless drill-down
-
-### Data Flow Navigation
-- Traverse the complete structural data flow graph of any BW object — all connected sources and targets resolved recursively through Transformations, DTPs, InfoSources, aDSOs, DataSources, CompositeProviders, and InfoObjects; mirrors the Eclipse BWMT Transient Data Flow view
-
-### DataSource Navigation & Authoring
-- List all source systems connected to the BW system (ODP_SAP, ODP_CDS, ODP_BW, ODP, FILE, HANA_SDA, HANA_LOCAL)
-- Recursively list all DataSources in a source system with full APCO hierarchy path
-- Read full source system metadata including connection details (ODP context/destination, HANA remote source and schema)
-- Read complete DataSource structure: fields with types, lengths, transfer flags, adapter configuration
-- Discover remote entities (HANA views / virtual tables) exposed by a source system
-- Create a DataSource from a remote entity using the server's field proposal (inactive; activate separately)
-- Change the delta process of a DataSource (`deltaProperties`)
-- Set the transfer flag of DataSource fields and/or the segment language field
-
-### BW Role Management
-- Read the full role hierarchy (ROLE + FOLDER structure)
-- List all queries published per role
-- Check which roles a specific query is assigned to
-- Publish a query into a role or a specific sub-folder
-- Remove a query from a role or folder
-- Move a query between roles (remove from old, add to new)
-
-### Push API
-- Get JSON push schema for a write-interface aDSO
-- Push JSON record arrays directly into an aDSO
-
-### Process Chain Navigation, Authoring & Monitoring
-- Read complete Process Chain definitions — all steps with type, variant, description, and last execution status
-- Conditional flow semantics fully resolved: DECISION branch labels (including ABAP formula expressions), OR/AND join nodes, positive/negative/neutral edge conditions
-- Automatic variant detail per step: ABAP program and selection variant, TRIGGER scheduling parameters, ADSOACT/ADSOREM aDSO targets and cleanup settings, PLSWITCHL/P target aDSO, DECISION branching formulas — all embedded inline in a single tool call
-- Recursive sub-chain expansion: CHAIN-type steps reference other Process Chains — call `bw_get_process_chain` again on any referenced chain name to expand the full hierarchy
-- Generic process variant reader: covers all 93 BW/4HANA process types including custom Z-types; unknown types return oDetail as raw JSON
-- Create a Process Chain from a step and edge list — supported types: `DTP_LOAD`, `ADSOACT`, `ADSOREM` (DSO request cleanup), `ABAP` (execute an ABAP program, optionally with an SE38 selection variant), `CHAIN`, `DECISION`, collectors `AND` / `OR` / `XOR`
-- Replace the step model of an existing chain; activate a chain
-- Incrementally edit an existing chain — insert a DTP load step (optionally with its own DSO activation) or an "Execute ABAP Program" step **in series** before or after any existing step, swap one DTP load variant for another, add on-error (negative) links mirroring the existing success links
-- Repair the wiring of an existing chain — add or remove a single dependency between two steps, or remove a step altogether with the gap bridged automatically
-- Create a DECISION process variant for use as a branch/decision step
-- Monitor execution runs: history with status and timestamps, step-level and message-level run detail, last status per chain across the entire system
-
-### DataSource Data Preview
-- Fetch a live data preview from any DataSource (RSDS) directly from the source system
-- Field names resolved automatically from the DataSource structure; configurable record count (default 20)
-- Rendered as a padded plain-text table with column alignment
-
-### Open Hub Destination
-- Read an Open Hub Destination (DEST): destination type, source object, DB table, InfoArea, package, and status
-- Complete output field list with types, InfoObject binding, conversion routine, compounding, and key flag
-- File properties for FILE-type destinations
-
-### Integrated Planning
-- Create and change Aggregation Levels on an aDSO or a CompositeProvider — over all fields of the provider or a chosen subset
-- Read Aggregation Levels (ALVL) — the planning-enabled view on top of an InfoProvider; characteristics and key figures with full type and semantic detail
-- Read Planning Functions (PLSE) — function type, characteristic usage roles, and parameter tree; FOX code surfaced for FORMULA functions
-- Read Planning Sequences (PLSQ) — ordered step list with aggregation level, planning function, and filter references
-- Read Planning Properties (PLCR) — key-date mode, maximum characteristic combinations, and save strategy for plan-enabled InfoProviders
-- On a system that publishes no planning resources — every classic BW release — the same objects are read from the metadata tables with `bw_read_metadata_tables`, including the **data slices** (`PLDS`) that no release exposes over REST at all
-
-### System Diagnostics & Classic Objects
-- Profile the connected system — BW/4HANA vs classic BW, the REST endpoint groups it publishes and therefore which tool groups work on it, plus three preconditions: `Accept`-header handling, ADT DataPreview access, and whether query reporting is implemented
-- Read objects the connected system publishes no REST resource for, straight from the metadata tables: transformations (including start, end, expert and field routine source code), DTPs, the classic providers — DataStore objects, InfoCubes and MultiProviders — and process chains, whose steps, variant parameters and dependencies are resolved into execution order
-- Read the planning objects the same way — functions, sequences, characteristic relationships and data slices — and the **runs** of a process chain: the history of one chain, the steps of a single run with status, duration and process variant, or the last status of every chain matching a pattern
-- Read an **Analysis Process Designer** process (APD) — nodes in execution order with the object each source reads and each target writes, the edges between them, filters, formulas and routine ABAP. No release publishes a REST resource for it and BW/4HANA dropped the object type, so the metadata tables are the only route on any platform
-- Read the load history of an InfoCube or DataStore object — request, status, update mode, start time, user, duration, records transferred and added, and the source — which on a classic BW system is the only route to load status at all
-- SAP BW 7.5 on HANA is reachable for modeling reads after a small ABAP post-exit — see [docs/BW75-SUPPORT.md](docs/BW75-SUPPORT.md)
-- Adapts its own tool surface to the platform — the server detects BW/4HANA vs classic BW and offers only the tools that release can answer, so a model is never handed a call that must fail; `bw_system_profile` lists what is hidden and why
-
-### Request Monitor & Runtime
-- List load requests for a target InfoProvider — status, last process status/action, record count, timestamp, user, TSN
-- Full status analysis of a single load request — header, DTP information (start/finish/duration), process step chain, and message log in one call
-- Activate loaded data (DSO request activation) — move a finished load from the inbound table into the active data table + change log
-- Delete load requests — with the data they brought in and their entry in request management. An activation request is rolled back instead, together with every later activation on top of it
-- Monitor, diagnose and run remodeling requests — the five processing steps (`CHECK`, `SAVE`, `CONVERT`, `ACTIVATE`, `CLEANUP`) with their individual status and the application log per step, plus execute, restart, reset and reset-step. Running a rule restructures the InfoProvider and converts its data
-- Uses the BW/4HANA `/sap/bc/.../bw4` manage API (the same operations as the BW/4HANA Cockpit)
-- On classic BW, where that API does not exist, these tools are not offered; the load history of a provider is read with `bw_read_metadata_tables` instead, which the server names in place of every tool it hides
-
-### General
-- Search & Where-Used (xref)
-- Activate BW objects (aDSO, InfoObject, Transformation, DTP, DataSource, CompositeProvider)
-- Release locks without activating (discard changes)
-- Delete BW objects
-- Transport request assignment — add a user task (sub-request) to a workbench transport, list changeable transport requests and their tasks
-- Reassign an object to a different package (Development Class) on a transport request
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="docs/landkarte-dark.svg">
+    <img src="docs/landkarte-light.svg" alt="What the server can read, create and run in SAP BW, by object area, and how much of it works on classic SAP BW 7.5 on HANA" width="100%">
+  </picture>
+</p>
 
 ---
 
@@ -297,7 +118,7 @@ The ADT MCP server covers ABAP as a subject in its own right: your own reports, 
 
 ## Requirements
 
-- SAP BW/4HANA system with the internal SAP APIs enabled (SAP BW 7.5 works for modeling reads once the enhancement in [docs/BW75-SUPPORT.md](docs/BW75-SUPPORT.md) is in place)
+- SAP BW/4HANA system with the internal SAP APIs enabled (SAP BW 7.5 works for modeling reads and most modelling writes once the enhancement in [docs/BW75-SUPPORT.md](docs/BW75-SUPPORT.md) is in place)
 - Node.js 18 or later
 - An MCP-compatible AI client (Claude Desktop, Claude Code, etc.)
 

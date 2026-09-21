@@ -1,5 +1,10 @@
-import { BwClient, createClientFromEnv, MEDIA_TYPES, bwSeg } from '../bw-client.js';
-import { QUERY_ACCEPT_LIST, queryWriteMediaType } from './query.js';
+import { BwClient, createClientFromEnv, bwSeg, lockSessionHeader } from '../bw-client.js';
+import {
+  QUERY_ACCEPT_LIST,
+  queryWriteMediaType,
+  variableAccept,
+  variableWriteMediaType,
+} from './query.js';
 
 export interface CreateVariableArgs {
   variable_name: string;
@@ -15,24 +20,6 @@ export interface CreateVariableArgs {
   master_language?: string;
   package?: string;
   transport?: string;
-}
-
-const VARIABLE_V10 = 'application/vnd.sap.bw.modeling.variable-v1_10_0+xml';
-
-const VARIABLE_ACCEPT_LIST =
-  'application/vnd.sap.bw.modeling.variable-v1_8_0+xml, ' +
-  'application/vnd.sap.bw.modeling.variable-v1_9_0+xml, ' +
-  VARIABLE_V10;
-
-/** Accept header for the dedicated /variable/<name>/a resource. */
-export function variableAccept(): string {
-  const discovered = MEDIA_TYPES['variable'];
-  return discovered ? `${discovered}, ${VARIABLE_ACCEPT_LIST}` : VARIABLE_ACCEPT_LIST;
-}
-
-/** Media type for the create POST body. */
-function variableWriteMediaType(): string {
-  return MEDIA_TYPES['variable'] ?? VARIABLE_V10;
 }
 
 function escapeXml(s: string): string {
@@ -174,6 +161,7 @@ export async function bwCreateVariable(
     Accept: `${queryWriteMediaType()}, ${QUERY_ACCEPT_LIST}`,
     'bwmt-level': '50',
     'x-csrf-token': await client.getCsrfToken(),
+    ...lockSessionHeader(),
   });
   const lockHandle = lockResult.body.match(/<LOCK_HANDLE>([^<]+)<\/LOCK_HANDLE>/)?.[1];
   if (!lockHandle) {
@@ -201,6 +189,7 @@ export async function bwCreateVariable(
         'Content-Type':
           'application/vnd.sap.as+xml; charset=UTF-8; dataname=com.sap.adt.transport.service.checkData',
         'x-csrf-token': await client.getCsrfToken(),
+        ...lockSessionHeader(),
       }
     );
     const transportRc = transportResult.body.match(/<RESULT>([^<]*)<\/RESULT>/)?.[1];

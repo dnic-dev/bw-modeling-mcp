@@ -49,7 +49,7 @@ import {
   bwUpdateCompositeProviderSettings,
 } from './tools/composite_provider.js';
 import { bwUpdateCompositeProvider, CompositeProviderFieldAction } from './tools/composite_provider_update.js';
-import { bwGetCkf, bwGetRkf, bwGetStructure } from './tools/cp_components.js';
+import { bwGetCkf, bwGetRkf, bwGetStructure, bwGetVariable } from './tools/cp_components.js';
 import { bwCreateRkf, CreateRkfArgs } from './tools/rkf_create.js';
 import {
   bwCreateCkf,
@@ -57,11 +57,13 @@ import {
   bwUpdateRkf,
   bwCreateStructure,
   bwUpdateStructure,
+  bwUpdateVariable,
   CreateCkfArgs,
   UpdateCkfArgs,
   UpdateRkfArgs,
   CreateStructureArgs,
   UpdateStructureArgs,
+  UpdateVariableArgs,
 } from './tools/elem_write.js';
 import { bwListContents } from './tools/repository.js';
 import { bwListSourceSystems, bwListDatasources, bwGetSourceSystem, bwGetDatasource, bwPreviewDatasource, bwListRemoteEntities, bwCreateDatasource, bwChangeDatasourceDelta, bwSetDatasourceFields } from './tools/datasource.js';
@@ -2015,6 +2017,72 @@ const TOOL_DEFINITIONS = [
           },
         },
         required: ['variable_name', 'iobj_name', 'description'],
+      },
+    },
+    {
+      name: 'bw_get_variable',
+      description:
+        'Read a reusable BW Variable: reference characteristic, description, variable type, ' +
+        'processing type, selection type, input type, input readiness, reusability, package and ' +
+        'InfoArea. Use it after bw_create_variable to confirm what was stored — the modeling API ' +
+        'accepts an enum literal it does not know, saves its default and still reports the object ' +
+        'as consistent, so a create alone proves nothing about the processing or selection type. ' +
+        'Reading the variable through a query does not answer this: a query resolves the technical ' +
+        'name of a variable reference, never its definition.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          variable_name: {
+            type: 'string',
+            description: 'Technical name of the variable (e.g. "VAR_NAME").',
+          },
+          format: {
+            type: 'string',
+            enum: ['text', 'raw'],
+            description: 'Output format: "text" (default) for the parsed definition, "raw" for the unmodified XML.',
+          },
+        },
+        required: ['variable_name'],
+      },
+    },
+    {
+      name: 'bw_update_variable',
+      description:
+        'Change a reusable BW Variable in place: description, input readiness, input type ' +
+        '(optional / mandatory), selection type and processing type. The UID stays the same, so ' +
+        'references from queries, CKFs and structures survive the change — unlike the ' +
+        'delete-and-recreate that was the only correction path before, which BW refuses as soon as ' +
+        'anything references the variable, and deleting a query does not remove its reusable ' +
+        'components either. The reference characteristic and the variable type cannot be changed: ' +
+        'BW accepts such a write, reports it as consistent and keeps the old value, so both are ' +
+        'rejected here instead of being sent. Read the result back with bw_get_variable.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          variable_name: { type: 'string', description: 'Technical name of the variable.' },
+          description: { type: 'string', description: 'New description.' },
+          ready_for_input: {
+            type: 'boolean',
+            description: 'Whether the variable is shown on the variable screen for user input.',
+          },
+          input_type: {
+            type: 'string',
+            enum: ['Optional', 'MandatoryWithInitial', 'MandatoryWithoutInitial'],
+            description: 'Whether a value is required: Optional, MandatoryWithInitial (entry required, initial value allowed) or MandatoryWithoutInitial (entry required, initial value rejected).',
+          },
+          represents: {
+            type: 'string',
+            enum: ['Interval', 'SingleValue', 'SeveralSingleValues', 'SelectionOption'],
+            description: 'Selection type. Interval is a from/to range, SelectionOption allows the full set of comparison operators.',
+          },
+          processing_type: {
+            type: 'string',
+            enum: ['UserEntry', 'CustomerExit', 'Authorization', 'ReplacementPath'],
+            description: 'How the variable is filled. ReplacementPath is limited to the current-member variant, the same one bw_create_variable writes.',
+          },
+          transport_request: { type: 'string', description: 'Transport request to record the change in.' },
+        },
+        required: ['variable_name'],
       },
     },
     {
@@ -5487,6 +5555,18 @@ async function handleToolCall(
           description: args?.description as string | undefined,
           copy_from: args?.copy_from as string | undefined,
         });
+        break;
+
+      case 'bw_get_variable':
+        text = await bwGetVariable(
+          client,
+          args?.variable_name as string,
+          (args?.format as 'text' | 'raw') ?? 'text'
+        );
+        break;
+
+      case 'bw_update_variable':
+        text = await bwUpdateVariable(client, args as unknown as UpdateVariableArgs);
         break;
 
       case 'bw_create_variable':

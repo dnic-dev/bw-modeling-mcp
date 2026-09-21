@@ -1,4 +1,4 @@
-import { BwClient, MEDIA_TYPES, bwSeg, bwSegUpper } from '../bw-client.js';
+import { BwClient, MEDIA_TYPES, bwSeg, bwSegUpper, lockSessionHeader } from '../bw-client.js';
 import { queryAccept, queryWriteMediaType } from './query.js';
 
 function parseAtomTitles(xml: string): string[] {
@@ -31,6 +31,7 @@ async function bwDeleteQuery(
       'activity_context': 'DELE',
       'Accept': queryAccept(),
       'x-csrf-token': csrf,
+      ...lockSessionHeader(),
     });
   const lockMatch = lockResponse.body.match(/<LOCK_HANDLE>([^<]+)<\/LOCK_HANDLE>/);
   if (!lockMatch) {

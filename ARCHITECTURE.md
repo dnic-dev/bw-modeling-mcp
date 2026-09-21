@@ -117,6 +117,7 @@ src/
 ├── request-context.ts    # AsyncLocalStorage holding the per-request BW client under principal propagation
 ├── scopes.ts             # read/write scope classification and tools/list filtering for XSUAA role-based access
 ├── platform.ts           # BW/4HANA vs classic BW detection and the platform half of the tools/list filter
+├── classic-writes.ts     # per-write-tool status on a classic release, printed by bw_system_profile
 ├── bw-client.ts          # HTTP client (CSRF, session, lock/unlock, GET/PUT/POST/rawGet/rawPost/rawPut)
 └── tools/
     ├── activation.ts     # bw_activate, bw_unlock
@@ -124,7 +125,7 @@ src/
     ├── composite_provider.ts # bw_get_composite_provider, bw_create_composite_provider,
     │                     # bw_update_composite_provider — inputs, mappings, joins, settings
     ├── composite_provider_update.ts # bw_update_composite_provider — add_field, remove_field
-    ├── cp_components.ts  # bw_get_ckf, bw_get_rkf, bw_get_structure
+    ├── cp_components.ts  # bw_get_ckf, bw_get_rkf, bw_get_structure, bw_get_variable
     ├── cto.ts            # bw_change_package — package reassignment via /sap/bw/modeling/cto/write;
     │                     # bw_list_changeable_transports — transport state via cto/check
     ├── dataflow.ts       # bw_get_dataflow — transient data flow graph via /sap/bw/modeling/dmod/8TRANSIENT
@@ -133,6 +134,9 @@ src/
     │                     # bw_list_remote_entities, bw_create_datasource,
     │                     # bw_change_datasource_delta, bw_set_datasource_fields
     ├── delete.ts         # bw_delete
+    ├── elem_write.ts     # bw_create_ckf, bw_update_ckf, bw_update_rkf, bw_create_structure,
+    │                     # bw_update_structure, bw_update_variable — the reusable query
+    │                     # components, each on its own resource, written read-modify-write
     ├── dtp.ts            # bw_get_dtp, bw_get_dtps, bw_create_dtp, bw_run_dtp, bw_update_dtp, bw_set_dtp_filter_routine
     ├── infoarea.ts       # bw_get_infoarea, bw_create_infoarea, bw_move_object
     ├── infoobject.ts     # bw_get_infoobject, bw_create_infoobject, bw_update_infoobject
@@ -189,6 +193,8 @@ src/
     ├── system_profile.ts # bw_system_profile — platform, published endpoint groups and the two
     │                     # preconditions (Accept-header handling, ADT DataPreview access)
     ├── transport.ts      # bw_create_transport_task — add a task to a workbench transport
+    ├── variable.ts       # bw_create_variable — create a reusable Variable (ELEM) via comp/enq +
+    │                     # /variable/<name>/a
     └── transformation.ts # bw_get_transformation, bw_create_transformation,
                           # bw_update_transformation, bw_set_transformation_routine,
                           # bw_set_transformation_expert_routine,
@@ -254,6 +260,7 @@ system serves a lower resource version than the fallback.
 |---|---|---|
 | BW Query | `/sap/bw/modeling/query/{compid}/{objvers}` | `query-v1_11_0+xml` |
 | BW Variable | `/sap/bw/modeling/variable/{compid}/{objvers}` | `variable-v1_10_0+xml` |
+| BW Variable — component lock (create) | `/sap/bw/modeling/comp/enq/{compid}` | `query-v1_11_0+xml` |
 | Restricted Key Figure | `/sap/bw/modeling/rkf/{compid}/{objvers}` | `rkf-v1_10_0+xml` |
 | Calculated Key Figure | `/sap/bw/modeling/ckf/{compid}/{objvers}` | `ckf-v1_10_0+xml` |
 | Filter Component | `/sap/bw/modeling/filter/{compid}/{objvers}` | `filter-v1_9_0+xml` |

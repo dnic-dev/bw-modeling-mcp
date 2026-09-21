@@ -2,6 +2,7 @@ import { XMLParser } from 'fast-xml-parser';
 import {
   BwClient,
   createClientFromEnv,
+  lockSessionHeader,
   MEDIA_TYPES,
   resolveMasterSystem,
   bwSeg,
@@ -37,22 +38,38 @@ export function queryAccept(): string {
   return discovered ? `${discovered}, ${QUERY_ACCEPT}` : QUERY_ACCEPT;
 }
 
-// Fallback version range for the variable resource, which has its own media type
-// (a query-media-type Accept is rejected with HTTP 406). Matches the Accept list
-// Eclipse sends (see payloads/trace_20260710.log).
+// Concrete variable media type observed in the wire trace, and the fallback version
+// range built from it. The variable resource has its own media type — a query-media-type
+// Accept is rejected with HTTP 406 — and the range matches the Accept list Eclipse sends
+// (see payloads/trace_20260710.log).
+const VARIABLE_V10 = 'application/vnd.sap.bw.modeling.variable-v1_10_0+xml';
+
 const VARIABLE_ACCEPT =
   'application/vnd.sap.bw.modeling.variable-v1_8_0+xml, ' +
   'application/vnd.sap.bw.modeling.variable-v1_9_0+xml, ' +
-  'application/vnd.sap.bw.modeling.variable-v1_10_0+xml';
+  VARIABLE_V10;
 
 /**
  * Accept header for variable GETs: the discovery-advertised variable media type
  * first (so systems on a higher or lower SP level negotiate correctly), with the
  * static version range kept as a fallback.
+ *
+ * This is the single definition for the variable resource — the read tools, the
+ * create flow and the update flow all negotiate through it, so a system on a
+ * different SP level cannot be right for one of them and wrong for the others.
  */
 export function variableAccept(): string {
   const discovered = MEDIA_TYPES['variable'];
   return discovered ? `${discovered}, ${VARIABLE_ACCEPT}` : VARIABLE_ACCEPT;
+}
+
+/**
+ * Media type for variable write requests (create POST body / update PUT). Same shape
+ * as queryWriteMediaType and rkfWriteMediaType: a Content-Type may name exactly one
+ * version, so it comes from discovery where the backend advertises it.
+ */
+export function variableWriteMediaType(): string {
+  return MEDIA_TYPES['variable'] ?? VARIABLE_V10;
 }
 
 // Fallback version ranges for the CKF and RKF resources (each has its own media
@@ -1032,6 +1049,7 @@ export async function bwCreateQuery(
       'Accept': QUERY_ACCEPT_LIST,
       'bwmt-level': '50',
       'x-csrf-token': csrfToken,
+      ...lockSessionHeader(),
     });
   const lockHandleMatch = lockResponse.body.match(/<LOCK_HANDLE>([^<]+)<\/LOCK_HANDLE>/);
   if (!lockHandleMatch) {

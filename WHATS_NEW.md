@@ -8,6 +8,41 @@ For the complete, structured change history see [CHANGELOG.md](CHANGELOG.md).
 
 ---
 
+## What's New — v1.5.0
+
+Classic SAP BW 7.5 becomes a first-class system, business users get a client of their own,
+and the reusable query building blocks — calculated key figures, restricted key figures and
+structures — can now be created and changed rather than only read.
+
+**🏛️ Classic BW 7.5, properly supported**
+
+- `tools/list` follows the platform: a tool whose resource a 7.5 does not publish is no longer offered there, and each one names the call that answers the same question instead. The platform is detected from the system's own `bw.b4hanamode` flag and its discovery document, so the system decides and not a hardcoded release list. On BW/4HANA nothing changes
+- `bw_read_metadata_tables` gains the object types those hidden tools would have answered for: planning functions, sequences, characteristic relationships and data slices (`PLSE`, `PLSQ`, `PLCR`, `PLDS`), process chain runs with their steps and the process variant behind each (`RSPCLOG`), and the load history of an aDSO (`ADSO`)
+- It also reads the **Analysis Process Designer** (APD, `object_type="ANPR"`) — nodes in execution order with the object each source reads and each target writes, the edges between them, filters, formulas and the ABAP of a routine node. No release ever published a REST resource for it, and BW/4HANA dropped the object type, so this is the only route to one
+
+**👤 A client for business users**
+
+- The new **BW MCP Analyst** role collection offers 14 tools instead of 107: run a query — or a provider directly — read the characteristic values to filter by, find what there is to ask, and understand what the numbers mean. The size is the point: a client carrying every tool reaches for the wrong one far more often
+- Purely additive. `read` is unchanged and still admits everything it did, `analyst` is a strict subset of it, and a caller may hold both
+
+**🧱 Reusable query building blocks**
+
+- `bw_create_ckf` / `bw_update_ckf` — calculated key figures, with the formula as an operator/operand tree that `bw_get_ckf` hands back unchanged. `update` takes targeted operations, so another summand can be added to a sum without rebuilding the expression
+- `bw_create_structure` / `bw_update_structure` — reusable key figure structures. A change reaches every query that embeds the structure, which is why it happens at the structure rather than through one query that uses it
+- `bw_update_rkf` — a restricted key figure keeps its UID when changed, so references from CKFs, structures and queries survive. Until now the only correction was delete-and-recreate, which is impossible once the RKF is referenced anywhere
+
+**🔑 Client compatibility (hosted instance)**
+
+- The OAuth metadata advertises `scopes_supported`. Without it a client requests no scopes at all, and Copilot's older auth code then fails with `scope.split is not a function` (fixed upstream in vscode#325344, but the Eclipse Language Server lags behind)
+
+**✨ Also new**
+
+- `bw_delete_request` deletes load requests — with the data they brought in and their entry in request management
+- Characteristics can be modelled for values with lower case letters or umlauts (`lower_case`), which previously failed at request activation rather than at load time
+- `bw_get_request` reads the log of each process step, so a failed activation names the value and the characteristic that caused it
+
+---
+
 ## What's New — v1.4.1
 
 A maintenance release: the two connectivity fixes that BTP deployments have been running behind a Cloud Connector, instance identity in the handshake, and a set of end-routine defects.

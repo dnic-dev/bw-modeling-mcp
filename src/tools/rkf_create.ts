@@ -1,4 +1,4 @@
-import { BwClient, createClientFromEnv, bwSeg } from '../bw-client.js';
+import { BwClient, createClientFromEnv, bwSeg, lockSessionHeader } from '../bw-client.js';
 import { rkfAccept, rkfWriteMediaType, QUERY_ACCEPT_LIST, queryWriteMediaType } from './query.js';
 import { recordedIn } from './elem_write.js';
 
@@ -217,6 +217,7 @@ export async function bwCreateRkf(client: BwClient, args: CreateRkfArgs): Promis
     Accept: `${queryWriteMediaType()}, ${QUERY_ACCEPT_LIST}`,
     'bwmt-level': '50',
     'x-csrf-token': await clientA.getCsrfToken(),
+    ...lockSessionHeader(),
   });
   const lockHandleA = lockA.body.match(/<LOCK_HANDLE>([^<]+)<\/LOCK_HANDLE>/)?.[1];
   if (!lockHandleA) {
@@ -252,6 +253,7 @@ export async function bwCreateRkf(client: BwClient, args: CreateRkfArgs): Promis
         'Content-Type':
           'application/vnd.sap.as+xml; charset=UTF-8; dataname=com.sap.adt.transport.service.checkData',
         'x-csrf-token': await clientA.getCsrfToken(),
+        ...lockSessionHeader(),
       }
     );
     const transportRc = transportResult.body.match(/<RESULT>([^<]*)<\/RESULT>/)?.[1];
@@ -320,6 +322,7 @@ export async function bwCreateRkf(client: BwClient, args: CreateRkfArgs): Promis
     Accept: RKF_ACCEPT_LIST,
     'bwmt-level': '50',
     'x-csrf-token': await clientB.getCsrfToken(),
+    ...lockSessionHeader(),
   });
   const lockHandleB = lockB.body.match(/<LOCK_HANDLE>([^<]+)<\/LOCK_HANDLE>/)?.[1];
   if (!lockHandleB) {

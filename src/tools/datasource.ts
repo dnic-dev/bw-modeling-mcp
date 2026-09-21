@@ -5,7 +5,10 @@ import {
   bwSeg,
   bwSegUpper,
   bwEscapeName,
+  lockSessionHeader,
+  decodeXmlEntities,
 } from '../bw-client.js';
+import { cachedPlatform } from '../platform.js';
 
 const BASE = '/sap/bw/modeling/repo/datasourcestructure';
 const BASE_PREFIX = `${BASE}/`;
@@ -593,33 +596,10 @@ interface RemoteEntity {
 }
 
 /**
- * bw_list_remote_entities — read-only discovery of the remote entities (HANA views /
- * virtual tables) exposed by a source system, as offered on the DataSource proposal page.
- *
- * The returned technical_name is exactly what binds into the adapter externalObject when
- * creating a DataSource via bw_create_datasource.
+ * BW/4HANA value help: one `<row>` per entity, the name in `<technicalName>` and the rest
+ * as `<attribute name="…" value="…"/>`.
  */
-export async function bwListRemoteEntities(
-  client: BwClient,
-  sourceSystem: string,
-  searchPattern: string = '*',
-  resultSize: number = 200,
-): Promise<string> {
-  const ssUpper = sourceSystem.toUpperCase();
-  const url =
-    `/sap/bw/modeling/rsdsint/values/hanaentity` +
-    `?searchPattern=${encodeURIComponent(searchPattern)}` +
-    `&sourcesystem=${encodeURIComponent(ssUpper)}` +
-    `&resultSize=${resultSize}`;
-
-  const { body } = await client.rawGet(url, { Accept: valuehelpAccept() });
-
-  // Root <vh:valueHelp size="..." resultComplete="..."> — surface truncation info.
-  const rootAttrs = body.match(/<vh:valueHelp\b([^>]*)>/)?.[1] ?? '';
-  const sizeRaw = rootAttrs.match(/\bsize="([^"]*)"/)?.[1];
-  const size = sizeRaw !== undefined ? parseInt(sizeRaw, 10) : null;
-  const resultComplete = rootAttrs.match(/\bresultComplete="([^"]*)"/)?.[1] === 'true';
-
+function parseValueHelp(body: string): RemoteEntity[] {
   const entities: RemoteEntity[] = [];
   const rowRe = /<row\b[^>]*>([\s\S]*?)<\/row>/g;
   let rm: RegExpExecArray | null;
@@ -641,6 +621,75 @@ export async function bwListRemoteEntities(
 
     entities.push({ technical_name: technicalName, entity_type: entityType, path_suffix: pathSuffix });
   }
+  return entities;
+}
+
+/**
+ * Classic value help: positional. A `<valueHelpCatalog>` names the columns, and each
+ * `<row>` carries one bare `<value>` per column in that order — so the column list decides
+ * which value is the entity name and which the type, and a release that adds a column in
+ * front does not shift the result.
+ */
+function parseClassicValueHelp(body: string): RemoteEntity[] {
+  const catalog = body.match(/<valueHelpCatalog>([\s\S]*?)<\/valueHelpCatalog>/)?.[1] ?? '';
+  const columns = [...catalog.matchAll(/<columnname>([^<]*)<\/columnname>/g)].map((m) => m[1].trim());
+  const idxEntity = columns.indexOf('ENTITY');
+  const idxType = columns.indexOf('ENTITY_TYPE');
+  const idxPath = columns.indexOf('PATH_SUFFIX');
+
+  const entities: RemoteEntity[] = [];
+  const values = body.match(/<valueHelpValues>([\s\S]*?)<\/valueHelpValues>/)?.[1] ?? '';
+  for (const rm of values.matchAll(/<row>([\s\S]*?)<\/row>/g)) {
+    const cells = [...rm[1].matchAll(/<value\s*\/>|<value>([\s\S]*?)<\/value>/g)]
+      .map((m) => decodeXmlEntities(m[1] ?? ''));
+    const at = (i: number) => (i >= 0 && cells[i] ? cells[i] : null);
+    const technicalName = at(idxEntity) ?? cells[0] ?? '';
+    if (!technicalName) continue;
+    entities.push({ technical_name: technicalName, entity_type: at(idxType), path_suffix: at(idxPath) });
+  }
+  return entities;
+}
+
+/**
+ * bw_list_remote_entities — read-only discovery of the remote entities (HANA views /
+ * virtual tables) exposed by a source system, as offered on the DataSource proposal page.
+ *
+ * The returned technical_name is exactly what binds into the adapter externalObject when
+ * creating a DataSource via bw_create_datasource.
+ */
+export async function bwListRemoteEntities(
+  client: BwClient,
+  sourceSystem: string,
+  searchPattern: string = '*',
+  resultSize: number = 200,
+): Promise<string> {
+  const ssUpper = sourceSystem.toUpperCase();
+  const classic = cachedPlatform()?.platform === 'classic';
+
+  // The value help sits at a different address on a classic release, with different
+  // parameter names — `rsdsint` is not published there and answers HTTP 404, which made
+  // this look like a resource a 7.5 system simply does not have. It does; it is `is`.
+  const url = classic
+    ? `/sap/bw/modeling/is/values/hanaentity` +
+      `?sourcesystem=${encodeURIComponent(ssUpper)}` +
+      `&pattern=${encodeURIComponent(searchPattern)}` +
+      `&maxrows=${resultSize}`
+    : `/sap/bw/modeling/rsdsint/values/hanaentity` +
+      `?searchPattern=${encodeURIComponent(searchPattern)}` +
+      `&sourcesystem=${encodeURIComponent(ssUpper)}` +
+      `&resultSize=${resultSize}`;
+
+  const { body } = await client.rawGet(url, { Accept: valuehelpAccept() });
+
+  // Root <vh:valueHelp size="..." resultComplete="..."> — surface truncation info.
+  const rootAttrs = body.match(/<vh:valueHelp\b([^>]*)>/)?.[1] ?? '';
+  const sizeRaw = rootAttrs.match(/\bsize="([^"]*)"/)?.[1];
+  const resultComplete = rootAttrs.match(/\bresultComplete="([^"]*)"/)?.[1] === 'true';
+
+  const entities: RemoteEntity[] = classic ? parseClassicValueHelp(body) : parseValueHelp(body);
+  const size = sizeRaw !== undefined
+    ? parseInt(sizeRaw, 10)
+    : parseInt(body.match(/\bvalueHelpLines="\s*(\d+)/)?.[1] ?? '', 10) || null;
 
   return JSON.stringify({
     source_system: ssUpper,
@@ -722,7 +771,9 @@ export async function bwCreateDatasource(
            name="HANA" externalObject="${externalObject}" pathSuffix=""/>
   <tlogoProperties adtcore:language="${language}" adtcore:name="${dsUpper}"
                    adtcore:type="RSDS" adtcore:masterLanguage="${language}"
-                   adtcore:masterSystem="${masterSystem}" adtcore:responsible="${responsible}"/>
+                   adtcore:masterSystem="${masterSystem}" adtcore:responsible="${responsible}">
+    <adtcore:packageRef adtcore:name="$TMP"/>
+  </tlogoProperties>
 </dataSource:dataSource>`;
 
   try {
@@ -895,7 +946,10 @@ export async function bwChangeDatasourceDelta(
   const deltaRe = /<delta>([^<]*)<\/delta>/g;
   let dm: RegExpExecArray | null;
   while ((dm = deltaRe.exec(admBlock)) !== null) allowed.push(dm[1]);
-  if (allowed.length > 0 && !allowed.includes(args.deltaProcess)) {
+  // The empty string means "remove the delta process", which the tool documents and which
+  // is not one of the admissible values — checking it against that list made the documented
+  // way back from a delta impossible, so a delta could be set and never taken off again.
+  if (args.deltaProcess !== '' && allowed.length > 0 && !allowed.includes(args.deltaProcess)) {
     return JSON.stringify({
       success: false,
       current_delta: currentDelta,
@@ -912,7 +966,7 @@ export async function bwChangeDatasourceDelta(
   const lockUrl = `/sap/bw/modeling/rsds/${bwSeg(dsLower)}/${ssUpper}?action=lock`;
   const unlockUrl = `/sap/bw/modeling/rsds/${bwSeg(dsLower)}/${ssUpper}?action=unlock`;
   const csrf = await client.getCsrfToken();
-  const lockRes = await client.rawPost(lockUrl, '', { Accept: RSDS_ACCEPT, 'x-csrf-token': csrf });
+  const lockRes = await client.rawPost(lockUrl, '', { Accept: RSDS_ACCEPT, 'x-csrf-token': csrf, ...lockSessionHeader() });
   const lockHandle = lockRes.body.match(/<LOCK_HANDLE>([^<]+)<\/LOCK_HANDLE>/)?.[1] ?? '';
   if (!lockHandle) {
     return JSON.stringify({
@@ -932,8 +986,8 @@ export async function bwChangeDatasourceDelta(
     // 4. PUT the full modified body.
     const putUrl = `${mUrl}?lockHandle=${encodeURIComponent(lockHandle)}`;
     const putRes = await client.rawPut(putUrl, modified, {
-      'Content-Type': 'application/xml, application/vnd.sap.bw.modeling.rsds-v1_1_0+xml',
-      Accept: 'application/vnd.sap.bw.modeling.rsds-v1_1_0+xml',
+      'Content-Type': `application/xml, ${MEDIA_TYPES['rsds']}`,
+      Accept: MEDIA_TYPES['rsds'],
       'x-csrf-token': csrf,
       ...(timestamp ? { timestamp } : {}),
     });
@@ -1061,7 +1115,7 @@ export async function bwSetDatasourceFields(
   const lockUrl = `/sap/bw/modeling/rsds/${bwSeg(dsLower)}/${ssUpper}?action=lock`;
   const unlockUrl = `/sap/bw/modeling/rsds/${bwSeg(dsLower)}/${ssUpper}?action=unlock`;
   const csrf = await client.getCsrfToken();
-  const lockRes = await client.rawPost(lockUrl, '', { Accept: RSDS_ACCEPT, 'x-csrf-token': csrf });
+  const lockRes = await client.rawPost(lockUrl, '', { Accept: RSDS_ACCEPT, 'x-csrf-token': csrf, ...lockSessionHeader() });
   const lockHandle = lockRes.body.match(/<LOCK_HANDLE>([^<]+)<\/LOCK_HANDLE>/)?.[1] ?? '';
   if (!lockHandle) {
     return JSON.stringify({
@@ -1077,8 +1131,8 @@ export async function bwSetDatasourceFields(
       ? `?corrNr=${encodeURIComponent(args.transport)}&lockHandle=${encodeURIComponent(lockHandle)}`
       : `?lockHandle=${encodeURIComponent(lockHandle)}`;
     const headers: Record<string, string> = {
-      'Content-Type': 'application/xml, application/vnd.sap.bw.modeling.rsds-v1_1_0+xml',
-      Accept: 'application/vnd.sap.bw.modeling.rsds-v1_1_0+xml',
+      'Content-Type': `application/xml, ${MEDIA_TYPES['rsds']}`,
+      Accept: MEDIA_TYPES['rsds'],
     };
     if (timestamp) headers['timestamp'] = timestamp;
     if (args.transport) headers['Transport-Lock-Holder'] = args.transport;

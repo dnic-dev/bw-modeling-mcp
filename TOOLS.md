@@ -269,6 +269,12 @@ Set the per-characteristic display and access properties of the rows, columns, a
 ### `bw_create_variable`
 Create a characteristic variable. Processing type: `UserEntry`, `CustomerExit`, `Authorization` or `ReplacementPath`. Represents a characteristic value, a hierarchy or hierarchy nodes; selection as `Interval`, `SingleValue`, `SeveralSingleValues` or `SelectionOption`. Entry requirement, ready-for-input and reusability are parameters, so a variable filled only by the exit can be kept off the selection screen. Replacement path is limited to the current-member variant — replacement from a query result is not supported.
 
+### `bw_get_variable` _(Read only)_
+Read a characteristic variable — reference characteristic, description, variable type, processing type, selection type, entry requirement, ready-for-input, reusability, UID, package and InfoArea. The tool to reach for after `bw_create_variable`: the modelling API accepts an enum literal it does not know, stores its default and still reports the object as consistent, so the create alone says nothing about what is in the system. Reading the variable through its query does not answer this either — a query resolves the technical name of a variable reference, never its definition. `format: "raw"` returns the unmodified XML.
+
+### `bw_update_variable`
+Change a characteristic variable in place — description, ready-for-input, entry requirement, selection type and processing type. The UID stays the same, so references from queries, CKFs and structures survive; the alternative before was delete and recreate, which BW refuses once the variable is referenced, and deleting a query leaves its reusable components behind. The reference characteristic and the variable type are rejected rather than sent: BW accepts such a write, reports it as consistent and keeps the old value. Switching the processing type to `ReplacementPath` writes the current-member block with it, and switching away clears it.
+
 ### `bw_get_ckf` _(Read only)_
 Read a global Calculated Key Figure — formula recursively resolved to a human-readable string, metadata (package, InfoArea, author), and full dependency graph of all referenced sub-components.
 
