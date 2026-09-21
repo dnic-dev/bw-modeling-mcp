@@ -273,9 +273,9 @@ const COLLECTION_NEEDS: Record<string, string[]> = {
   bw_get_planning_properties: ['plcr'],
   bw_get_planning_sequence: ['plsq'],
 
-  // Query *data* over BICS. Classic publishes the `query` collection — query definitions
-  // read fine — but not `reporting`, and its `comp/reporting` handler answers every call
-  // with "Reporting resource not implemented". bw_get_filter_values is not here: it reads
+  // Query *data*. Classic publishes the `query` collection — query definitions read fine —
+  // but not `reporting`, and its `comp/reporting` handler answers every call with "Reporting
+  // resource not implemented". That is the REST resource, not BICS, which classic does have. bw_get_filter_values is not here: it reads
   // the value help under `is/values`, which works on classic.
   bw_query_data: ['reporting'],
 

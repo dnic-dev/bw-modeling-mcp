@@ -2943,7 +2943,10 @@ const TOOL_DEFINITIONS = [
         'Distinguishes SAP BW/4HANA from classic SAP BW (7.5) via the system\'s own b4hanamode flag, ' +
         'lists which REST endpoint groups the system publishes, and verifies three preconditions: ' +
         'Accept-header handling (a broken one makes almost every call fail with HTTP 406 on BW 7.5), ' +
-        'access to the ADT DataPreview service, and whether the BICS reporting resource is implemented. ' +
+        'access to the ADT DataPreview service, and whether the reporting resource of the modeling ' +
+        'API is implemented — the REST route to query data, which a classic release publishes ' +
+        'without implementing; BICS itself is present there, and InA clients reach it by their ' +
+        'own route. ' +
         'Call it before planning work on a system whose release you do not already know: the answer says which tool ' +
         'groups are available and which route to take where they are not — on classic BW, for instance, ' +
         'transformations, DTPs and the classic providers have no REST resource and are read with ' +

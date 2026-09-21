@@ -85,7 +85,12 @@ async function probeDataPreview(client: BwClient): Promise<Check> {
 }
 
 /**
- * Is the BICS reporting resource implemented, not merely published?
+ * Is the modeling API's reporting resource implemented, not merely published?
+ *
+ * This asks about the REST resource and nothing else. BICS itself is present on a classic
+ * release — its packages are there and the InA node is registered, which is how Analysis
+ * for Office and the other InA clients reach a query. What is missing there is the route
+ * to it through `/sap/bw/modeling`, the one Eclipse BWMT uses for its data preview.
  *
  * Only asked of a system that publishes `reporting` at all — the caller settles the rest
  * from discovery. It is worth asking there because published is not implemented: a system
@@ -179,8 +184,8 @@ export async function bwSystemProfile(client: BwClient, toolNames: readonly stri
   const dataPreview = await probeDataPreview(client);
   out.push(`ADT DataPreview:  ${dataPreview.ok ? 'OK' : 'UNAVAILABLE'} — ${dataPreview.detail}`);
   // Discovery decides first, and it is the same signal the tool filter uses, so the two
-  // cannot disagree: `reporting` is the BICS resource, while `query` — the query definition
-  // resource — is published on classic BW as well and says nothing about query data.
+  // cannot disagree: `reporting` is the resource that returns query data, while `query` — the
+  // query definition resource — is published on classic BW as well and says nothing about it.
   const reporting = collections.has('reporting')
     ? await probeReporting(client)
     : { ok: false, detail: 'the reporting resource is not published by this system' };
@@ -230,8 +235,11 @@ export async function bwSystemProfile(client: BwClient, toolNames: readonly stri
   out.push('── What this means ──');
   if (!reporting.ok && !reporting.unclear) {
     out.push('Query definitions can be read, but bw_query_data cannot return anything on this');
-    out.push('system — the BICS reporting resource is not implemented here. Characteristic values');
-    out.push('(bw_get_filter_values) come from the value help and are unaffected.');
+    out.push('system: the modeling API publishes its reporting resource here without implementing');
+    out.push('it. That is a statement about the REST resource, not about BICS — a classic release');
+    out.push('has the framework, and InA clients such as Analysis for Office reach it by their own');
+    out.push('route. Characteristic values (bw_get_filter_values) come from the value help and are');
+    out.push('unaffected.');
   }
   if (isBw4) {
     out.push('Full tool coverage: reading, creating and modifying BW objects, plus runtime and monitoring.');
