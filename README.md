@@ -99,8 +99,9 @@ An overview by area. Every tool in detail — parameters, behaviour, and the seq
 
 <p align="center">
   <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="docs/landkarte-dark.svg">
-    <img src="docs/landkarte-light.svg" alt="What the server can read, create and run in SAP BW, by object area, and how much of it works on classic SAP BW 7.5 on HANA" width="100%">
+    <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/dnic-dev/bw-modeling-mcp/main/docs/landkarte-dark.svg">
+    <source media="(prefers-color-scheme: light)" srcset="https://raw.githubusercontent.com/dnic-dev/bw-modeling-mcp/main/docs/landkarte-light.svg">
+    <img src="https://raw.githubusercontent.com/dnic-dev/bw-modeling-mcp/main/docs/landkarte-light.svg" alt="What the server can read, create and run in SAP BW, by object area, and how much of it works on classic SAP BW 7.5 on HANA" width="100%">
   </picture>
 </p>
 
