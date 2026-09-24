@@ -1,6 +1,12 @@
 import { XMLParser } from 'fast-xml-parser';
 import { BwClient, bwSeg, stripInfoAreaSentinel } from '../bw-client.js';
-import { ckfAccept, rkfAccept, structureAccept, variableAccept } from './query.js';
+import {
+  ckfAccept,
+  rkfAccept,
+  structureAccept,
+  variableAccept,
+  parseExceptionAggregation,
+} from './query.js';
 
 // ── XML Parser ───────────────────────────────────────────────────────────────
 
@@ -217,6 +223,23 @@ function buildDependencies(
   }));
 }
 
+/**
+ * Exception aggregation of a component's member in the snake_case shape of these
+ * tools, or null when none is set (so the field is always present and an unset
+ * aggregation reads as a statement rather than as a gap in the output).
+ */
+function exceptionAggregationOf(
+  member: Record<string, unknown> | undefined
+): Record<string, unknown> | null {
+  const ea = parseExceptionAggregation(member);
+  if (!ea) return null;
+  const out: Record<string, unknown> = { type: ea.type };
+  if (ea.label) out['label'] = ea.label;
+  out['reference_characteristics'] = ea.referenceCharacteristics;
+  if (ea.exclude) out['exclude'] = true;
+  return out;
+}
+
 // ── bw_get_ckf ───────────────────────────────────────────────────────────────
 
 export async function bwGetCkf(client: BwClient, componentName: string): Promise<string> {
@@ -254,6 +277,7 @@ export async function bwGetCkf(client: BwClient, componentName: string): Promise
       ...extractMetadata(mainComp),
       formula,
       formula_tree: formulaTree,
+      exception_aggregation: exceptionAggregationOf(member),
       dependency_count: dependencies.length,
       dependencies,
     },
@@ -339,6 +363,7 @@ export async function bwGetRkf(client: BwClient, componentName: string): Promise
       component_type: 'RKF',
       ...extractMetadata(mainComp),
       base_measure: baseMeasure,
+      exception_aggregation: exceptionAggregationOf(member),
       filters,
       dependency_count: dependencies.length,
       dependencies,
@@ -382,6 +407,8 @@ function parseMember(
   const memberType = mType === 'Qry:MemberFormula' ? 'Formula' : 'Selection';
 
   const result: Record<string, unknown> = { id, description: desc, member_type: memberType, position };
+  const exceptionAggregation = exceptionAggregationOf(member);
+  if (exceptionAggregation) result['exception_aggregation'] = exceptionAggregation;
 
   if (mType === 'Qry:MemberFormula') {
     const formulaDef = member['Qry:formulaDefinition'] as Record<string, unknown> | undefined;

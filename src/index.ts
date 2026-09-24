@@ -1889,9 +1889,9 @@ const TOOL_DEFINITIONS = [
       name: 'bw_get_query',
       description:
         'Read a BW Query definition — variables, filter, layout (rows/columns/free characteristics), ' +
-        'calculated and restricted measures, exceptions, and cell definitions. ' +
+        'calculated and restricted measures (each with its exception aggregation), exceptions, and cell definitions. ' +
         'Structure members are reported with their properties: input readiness and disaggregation ' +
-        '(the planning settings), decimals, scaling, sign inversion, constant selection, position, ' +
+        '(the planning settings), exception aggregation, decimals, scaling, sign inversion, constant selection, position, ' +
         'nested child members and the inverse formulas that make an input-ready formula writable. ' +
         'Tries the active version first; falls back to the inactive version if not found. ' +
         'format="text" (default): compact human-readable output. format="raw": full parsed JSON.',
@@ -3225,7 +3225,8 @@ const TOOL_DEFINITIONS = [
       description:
         'Read a global Calculated Key Figure (CKF) defined at CompositeProvider level. ' +
         'Returns technical name, description, the formula both as a rendered string and as a ' +
-        'structured tree (formula_tree) that bw_create_ckf and bw_update_ckf take back unchanged, metadata, ' +
+        'structured tree (formula_tree) that bw_create_ckf and bw_update_ckf take back unchanged, the exception ' +
+        'aggregation (type and reference characteristics, null when none is set), metadata, ' +
         'and the full dependency graph of referenced CKF/RKF sub-components.',
       inputSchema: {
         type: 'object',
@@ -3242,7 +3243,8 @@ const TOOL_DEFINITIONS = [
       name: 'bw_get_rkf',
       description:
         'Read a global Restricted Key Figure (RKF) defined at CompositeProvider level. ' +
-        'Returns technical name, description, base measure, characteristic filters, metadata, ' +
+        'Returns technical name, description, base measure, characteristic filters, the exception ' +
+        'aggregation (type and reference characteristics, null when none is set), metadata, ' +
         'and the full dependency graph of referenced CKF/RKF sub-components.',
       inputSchema: {
         type: 'object',
@@ -3260,7 +3262,7 @@ const TOOL_DEFINITIONS = [
       description:
         'Read a global Structure defined at CompositeProvider level. ' +
         'Returns the ordered member list with type (Selection/Formula), referenced component ' +
-        'or IOBJ name, characteristic filters, and the full dependency graph.',
+        'or IOBJ name, characteristic filters, exception aggregation where set, and the full dependency graph.',
       inputSchema: {
         type: 'object',
         properties: {

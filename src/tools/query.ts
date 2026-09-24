@@ -309,6 +309,76 @@ export function parseMemberPlanning(
   return planning;
 }
 
+/**
+ * Labels of the exception aggregation types, taken from the fixed values of the
+ * domain RSAGGREXC (the codes the server writes into the type attribute). A code
+ * outside this list is still reported, just without a label.
+ */
+const EXCEPTION_AGGREGATION_LABELS: Record<string, string> = {
+  AV0: 'Average (values not equal to zero)',
+  AV1: 'Average (weighted with the number of days)',
+  AV2: 'Average (weighted with the number of working days; factory calendar)',
+  AVG: 'Average (all values)',
+  CN0: 'Counter (values not equal to zero)',
+  CNT: 'Counter (all values)',
+  FIR: 'First value',
+  LAS: 'Last value',
+  MAX: 'Maximum',
+  MIN: 'Minimum',
+  NO1: 'No aggregation (X if more than one record occurs)',
+  NO2: 'No aggregation (X if more than one value occurs)',
+  NOP: 'No aggregation (X if more than one value not equal to zero occurs)',
+  STD: 'Standard deviation',
+  SUM: 'Summation',
+  VAR: 'Variance',
+};
+
+export interface ParsedExceptionAggregation {
+  type: string;
+  label?: string;
+  referenceCharacteristics: string[];
+  exclude?: true;
+}
+
+/**
+ * Exception aggregation of a member (a CKF, an RKF or a structure member), or
+ * undefined when none is set. The server writes it as
+ *   <Qry:exceptionAggregation exclude="false" type="CN0">
+ *     <Qry:referenceCharacteristic>0DOC_NUMBER</Qry:referenceCharacteristic>
+ *   </Qry:exceptionAggregation>
+ * and as an empty <Qry:exceptionAggregation/> when unset. A formula can aggregate
+ * over several reference characteristics at once, so every one is reported.
+ */
+export function parseExceptionAggregation(
+  member: Record<string, unknown> | undefined
+): ParsedExceptionAggregation | undefined {
+  const node = member?.['Qry:exceptionAggregation'];
+  if (!node || typeof node !== 'object') return undefined;
+  const ea = node as Record<string, unknown>;
+  const type = ea['@_type'] as string | undefined;
+  if (!type) return undefined;
+  const referenceCharacteristics = ensureArray(ea['Qry:referenceCharacteristic'])
+    .map((rc) => {
+      if (rc !== null && typeof rc === 'object') {
+        const o = rc as Record<string, unknown>;
+        return String(o['#text'] ?? o['@_name'] ?? o['@_infoObject'] ?? '');
+      }
+      return String(rc ?? '');
+    })
+    .filter(Boolean);
+  const result: ParsedExceptionAggregation = { type, referenceCharacteristics };
+  const label = EXCEPTION_AGGREGATION_LABELS[type];
+  if (label) result.label = label;
+  if (ea['@_exclude'] === 'true' || ea['@_exclude'] === true) result.exclude = true;
+  return result;
+}
+
+/** One-line rendering, e.g. "CN0 (Counter (values not equal to zero)) by 0DOC_NUMBER". */
+export function formatExceptionAggregation(ea: ParsedExceptionAggregation): string {
+  const refs = ea.referenceCharacteristics.length > 0 ? ea.referenceCharacteristics.join(', ') : '?';
+  return `${ea.type}${ea.label ? ` (${ea.label})` : ''} by ${refs}${ea.exclude ? ' [exclude=true]' : ''}`;
+}
+
 function parseMemberRecursive(
   member: Record<string, unknown>,
   variableMap: Map<string, { technicalName: string }>,
@@ -354,6 +424,8 @@ function parseMemberRecursive(
   if (scaling) result['scaling'] = scaling;
   const planning = parseMemberPlanning(member, localMemberMap);
   if (planning) result['planning'] = planning;
+  const exceptionAggregation = parseExceptionAggregation(member);
+  if (exceptionAggregation) result['exceptionAggregation'] = exceptionAggregation;
 
   if (isFormula) {
     const formulaDef = member['Qry:formulaDefinition'] as Record<string, unknown> | undefined;
@@ -457,6 +529,8 @@ function renderMemberLines(members: unknown[], indent: string, lines: string[]):
     if (m['signInversion'] === true) flags.push('signInversion=true');
     if (m['constantSelection'] === true) flags.push('constantSelection=true');
     if (m['inverseFor']) flags.push(`inverseFor=${m['inverseFor']}`);
+    const memberEa = m['exceptionAggregation'] as ParsedExceptionAggregation | undefined;
+    if (memberEa) flags.push(`exceptionAggregation=${memberEa.type}(${memberEa.referenceCharacteristics.join(',')})`);
     const label = m['description'] ? String(m['description']) : String(m['id'] ?? '');
     lines.push(`${indent}${label}  [${m['type']}]${flags.length > 0 ? '  ' + flags.join('  ') : ''}`);
     if (m['formula']) lines.push(`${indent}  Formula: ${m['formula']}`);
@@ -563,6 +637,8 @@ function renderQueryText(q: Record<string, unknown>): string {
     for (const c of ckfs as Record<string, unknown>[]) {
       lines.push(`  ${s(c['technicalName'])}  ${s(c['description'])}`);
       if (c['formula']) lines.push(`    Formula: ${s(c['formula'])}`);
+      const ea = c['exceptionAggregation'] as ParsedExceptionAggregation | undefined;
+      if (ea) lines.push(`    Exception aggregation: ${formatExceptionAggregation(ea)}`);
     }
   }
 
@@ -574,6 +650,8 @@ function renderQueryText(q: Record<string, unknown>): string {
       lines.push(`  ${s(r['technicalName'])}  ${s(r['description'])}`);
       const member = r['member'] as Record<string, unknown> | undefined;
       if (member?.['keyFigure']) lines.push(`    KeyFigure: ${s(member['keyFigure'])}`);
+      const ea = r['exceptionAggregation'] as ParsedExceptionAggregation | undefined;
+      if (ea) lines.push(`    Exception aggregation: ${formatExceptionAggregation(ea)}`);
     }
   }
 
@@ -658,7 +736,7 @@ export async function bwGetQuery(queryName: string, format: 'text' | 'raw' = 'te
 
   // Step 1: Build subComponent maps
   const variableMap = new Map<string, { technicalName: string; description: string; infoObject: string; type: string; procType: string; inputType: string; represents: string; defaultSelection: unknown }>();
-  const ckfMap = new Map<string, { technicalName: string; description: string; formulaDefinition: unknown }>();
+  const ckfMap = new Map<string, { technicalName: string; description: string; formulaDefinition: unknown; exceptionAggregation?: ParsedExceptionAggregation }>();
   const rkfMap = new Map<string, { technicalName: string; description: string; member: Record<string, unknown> | undefined }>();
 
   const subComponents = ensureArray(root['Qry:subComponents']) as Record<string, unknown>[];
@@ -682,6 +760,7 @@ export async function bwGetQuery(queryName: string, format: 'text' | 'raw' = 'te
         technicalName: (sc['@_technicalName'] as string) ?? '',
         description: ((sc['Qry:description'] as Record<string, unknown> | undefined)?.['@_value'] as string) ?? '',
         formulaDefinition: member?.['Qry:formulaDefinition'],
+        exceptionAggregation: parseExceptionAggregation(member),
       });
     } else if (scType === 'Qry:RestrictedMeasure') {
       rkfMap.set(id, {
@@ -803,21 +882,26 @@ export async function bwGetQuery(queryName: string, format: 'text' | 'raw' = 'te
   for (const [, ckf] of ckfMap) {
     const formulaDef = ckf.formulaDefinition as Record<string, unknown> | undefined;
     const formulaToken = formulaDef?.['Qry:formulaToken'] as Record<string, unknown> | undefined;
-    calculatedMeasures.push({
+    const measure: Record<string, unknown> = {
       technicalName: ckf.technicalName,
       description: ckf.description,
       formula: formulaToken ? renderFormula(formulaToken, variableMap, ckfMap, rkfMap, new Map()) : '',
-    });
+    };
+    if (ckf.exceptionAggregation) measure['exceptionAggregation'] = ckf.exceptionAggregation;
+    calculatedMeasures.push(measure);
   }
 
   // Step 8: Restricted Measures
   const restrictedMeasures: Record<string, unknown>[] = [];
   for (const [, rkf] of rkfMap) {
-    restrictedMeasures.push({
+    const measure: Record<string, unknown> = {
       technicalName: rkf.technicalName,
       description: rkf.description,
       selections: parseSelectionGroups(ensureArray(rkf.member?.['Qry:groups']), ckfMap, rkfMap),
-    });
+    };
+    const rkfEa = parseExceptionAggregation(rkf.member);
+    if (rkfEa) measure['exceptionAggregation'] = rkfEa;
+    restrictedMeasures.push(measure);
   }
 
   // Step 9: Exceptions

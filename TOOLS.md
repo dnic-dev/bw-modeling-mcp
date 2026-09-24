@@ -276,13 +276,13 @@ Read a characteristic variable — reference characteristic, description, variab
 Change a characteristic variable in place — description, ready-for-input, entry requirement, selection type and processing type. The UID stays the same, so references from queries, CKFs and structures survive; the alternative before was delete and recreate, which BW refuses once the variable is referenced, and deleting a query leaves its reusable components behind. The reference characteristic and the variable type are rejected rather than sent: BW accepts such a write, reports it as consistent and keeps the old value. Switching the processing type to `ReplacementPath` writes the current-member block with it, and switching away clears it.
 
 ### `bw_get_ckf` _(Read only)_
-Read a global Calculated Key Figure — formula recursively resolved to a human-readable string, metadata (package, InfoArea, author), and full dependency graph of all referenced sub-components.
+Read a global Calculated Key Figure — formula recursively resolved to a human-readable string, exception aggregation (type and all reference characteristics; `null` when none is set), metadata (package, InfoArea, author), and full dependency graph of all referenced sub-components. A counter such as formula `1` only means something together with its exception aggregation, so the two are reported side by side.
 
 ### `bw_get_rkf` _(Read only)_
-Read a global Restricted Key Figure — base measure, all characteristic restriction groups (field and value), and metadata.
+Read a global Restricted Key Figure — base measure, all characteristic restriction groups (field and value), exception aggregation (`null` when none is set), and metadata.
 
 ### `bw_get_structure` _(Read only)_
-Read a global Structure — all members with type (Formula/Selection), referenced components, characteristic filters, optional child members, and metadata.
+Read a global Structure — all members with type (Formula/Selection), referenced components, characteristic filters, exception aggregation where set, optional child members, and metadata.
 
 ### `bw_create_rkf`
 Create one reusable Restricted Key Figure (TLOGO ELEM) on an InfoProvider from a base key figure plus one or more characteristic restrictions. Built for mass creation (one RKF per call); each restriction value is validated against the InfoProvider and mapped to its internal key before the write, and the RKF is written consistent (no separate activation step). Supports `Equal` / `Between` / `LessThan` / `GreaterThan` / `LessEqual` / `GreaterEqual` / `Contains` operators and exclusions, an optional InfoArea, and a transport request for transportable packages.
