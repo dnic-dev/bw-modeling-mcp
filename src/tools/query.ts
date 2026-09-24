@@ -314,7 +314,7 @@ export function parseMemberPlanning(
  * domain RSAGGREXC (the codes the server writes into the type attribute). A code
  * outside this list is still reported, just without a label.
  */
-const EXCEPTION_AGGREGATION_LABELS: Record<string, string> = {
+export const EXCEPTION_AGGREGATION_LABELS: Record<string, string> = {
   AV0: 'Average (values not equal to zero)',
   AV1: 'Average (weighted with the number of days)',
   AV2: 'Average (weighted with the number of working days; factory calendar)',

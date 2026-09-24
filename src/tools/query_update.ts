@@ -1,5 +1,5 @@
 import { BwClient, createClientFromEnv, bwSeg, lockSessionHeader } from '../bw-client.js';
-import { QUERY_ACCEPT_LIST, queryAccept, queryWriteMediaType, variableAccept, ckfAccept, rkfAccept, structureAccept } from './query.js';
+import { QUERY_ACCEPT_LIST, queryAccept, queryWriteMediaType, variableAccept, ckfAccept, rkfAccept, structureAccept, EXCEPTION_AGGREGATION_LABELS } from './query.js';
 
 /**
  * Query update tools (bw_update_query_layout, bw_update_query_filter).
@@ -1071,9 +1071,18 @@ export interface KeyFigureRestriction {
   values: FilterValue[];
 }
 
+/**
+ * Exception aggregation as the write tools take it. `reference_characteristics` is
+ * the shape the read tools return (bw_get_ckf `exception_aggregation`), so a read
+ * result can be passed back unchanged; `reference_characteristic` is the original
+ * single-characteristic form and stays accepted. Extra fields of a read result
+ * (`label`) are ignored.
+ */
 export interface ExceptionAggregation {
   type: string;
-  reference_characteristic: string;
+  reference_characteristic?: string;
+  reference_characteristics?: string[];
+  exclude?: boolean;
 }
 
 export interface MemberProperties {
@@ -1209,14 +1218,56 @@ function buildComponentMember(vid: string, componentId: string, descEsc: string,
 ${restrictionGroups}</Qry:members>`;
 }
 
-/** Build an exceptionAggregation element (empty when ea is false/undefined). */
-function excAggEl(ea: ExceptionAggregation | false | undefined): string {
+/**
+ * The metadata table behind the element (RSZCALC) has five reference characteristic
+ * slots (AGGRCHA … AGGRCHA5), so more than five cannot be stored.
+ */
+const MAX_REFERENCE_CHARACTERISTICS = 5;
+
+/**
+ * Build an exceptionAggregation element (empty when ea is false/undefined).
+ *
+ * Rejected rather than written: a type outside the domain RSAGGREXC, a type without
+ * any reference characteristic, and exclude=true. The latter two occur in existing
+ * documents, but what the server makes of them on a write has not been observed, and
+ * a write that is accepted and then means something else is worse than an error.
+ */
+export function excAggEl(ea: ExceptionAggregation | false | undefined): string {
   if (!ea) return '<Qry:exceptionAggregation/>';
-  if (!ea.type || !ea.reference_characteristic) {
-    throw new Error('exception_aggregation requires type and reference_characteristic.');
+  const type = (ea.type ?? '').toUpperCase();
+  if (!type) throw new Error('exception_aggregation requires a type.');
+  if (!EXCEPTION_AGGREGATION_LABELS[type]) {
+    throw new Error(
+      `exception_aggregation type '${ea.type}' is unknown. Valid types: ${Object.keys(EXCEPTION_AGGREGATION_LABELS).join(', ')}.`
+    );
   }
-  return `<Qry:exceptionAggregation exclude="false" type="${escapeXml(ea.type)}">
-    <Qry:referenceCharacteristic>${escapeXml(ea.reference_characteristic.toUpperCase())}</Qry:referenceCharacteristic>
+  if (ea.reference_characteristic && ea.reference_characteristics) {
+    throw new Error('exception_aggregation: pass reference_characteristic or reference_characteristics, not both.');
+  }
+  const refs = (ea.reference_characteristics ?? (ea.reference_characteristic ? [ea.reference_characteristic] : []))
+    .map((r) => String(r).trim().toUpperCase())
+    .filter(Boolean);
+  if (refs.length === 0) {
+    throw new Error(
+      'exception_aggregation requires at least one reference characteristic. An aggregation type without one ' +
+        'does occur in existing definitions, but writing it is not supported — omit exception_aggregation instead.'
+    );
+  }
+  if (new Set(refs).size !== refs.length) {
+    throw new Error('exception_aggregation: a reference characteristic is listed twice.');
+  }
+  if (refs.length > MAX_REFERENCE_CHARACTERISTICS) {
+    throw new Error(
+      `exception_aggregation takes at most ${MAX_REFERENCE_CHARACTERISTICS} reference characteristics (got ${refs.length}).`
+    );
+  }
+  if (ea.exclude === true) {
+    throw new Error('exception_aggregation with exclude=true is not supported for writing.');
+  }
+  const refEls = refs
+    .map((r) => `\n    <Qry:referenceCharacteristic>${escapeXml(r)}</Qry:referenceCharacteristic>`)
+    .join('');
+  return `<Qry:exceptionAggregation exclude="false" type="${escapeXml(type)}">${refEls}
   </Qry:exceptionAggregation>`;
 }
 
