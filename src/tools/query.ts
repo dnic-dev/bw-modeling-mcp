@@ -348,6 +348,9 @@ export interface ParsedExceptionAggregation {
  *   </Qry:exceptionAggregation>
  * and as an empty <Qry:exceptionAggregation/> when unset. A formula can aggregate
  * over several reference characteristics at once, so every one is reported.
+ * A type without any reference characteristic also occurs (structure formulas
+ * with type="SUM", including in SAP-delivered content); it is reported as such,
+ * with an empty list, rather than being dropped or completed.
  */
 export function parseExceptionAggregation(
   member: Record<string, unknown> | undefined
@@ -375,8 +378,11 @@ export function parseExceptionAggregation(
 
 /** One-line rendering, e.g. "CN0 (Counter (values not equal to zero)) by 0DOC_NUMBER". */
 export function formatExceptionAggregation(ea: ParsedExceptionAggregation): string {
-  const refs = ea.referenceCharacteristics.length > 0 ? ea.referenceCharacteristics.join(', ') : '?';
-  return `${ea.type}${ea.label ? ` (${ea.label})` : ''} by ${refs}${ea.exclude ? ' [exclude=true]' : ''}`;
+  const refs =
+    ea.referenceCharacteristics.length > 0
+      ? `by ${ea.referenceCharacteristics.join(', ')}`
+      : 'without reference characteristic';
+  return `${ea.type}${ea.label ? ` (${ea.label})` : ''} ${refs}${ea.exclude ? ' [exclude=true]' : ''}`;
 }
 
 function parseMemberRecursive(
@@ -530,7 +536,10 @@ function renderMemberLines(members: unknown[], indent: string, lines: string[]):
     if (m['constantSelection'] === true) flags.push('constantSelection=true');
     if (m['inverseFor']) flags.push(`inverseFor=${m['inverseFor']}`);
     const memberEa = m['exceptionAggregation'] as ParsedExceptionAggregation | undefined;
-    if (memberEa) flags.push(`exceptionAggregation=${memberEa.type}(${memberEa.referenceCharacteristics.join(',')})`);
+    if (memberEa) {
+      const refs = memberEa.referenceCharacteristics;
+      flags.push(`exceptionAggregation=${memberEa.type}${refs.length > 0 ? `(${refs.join(',')})` : '(no reference characteristic)'}`);
+    }
     const label = m['description'] ? String(m['description']) : String(m['id'] ?? '');
     lines.push(`${indent}${label}  [${m['type']}]${flags.length > 0 ? '  ' + flags.join('  ') : ''}`);
     if (m['formula']) lines.push(`${indent}  Formula: ${m['formula']}`);

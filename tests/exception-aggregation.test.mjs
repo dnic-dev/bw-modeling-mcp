@@ -59,3 +59,11 @@ test('the exclude flag is surfaced and rendered', () => {
   assert.equal(ea?.exclude, true);
   assert.equal(formatExceptionAggregation(ea), 'SUM (Summation) by 0CALDAY [exclude=true]');
 });
+
+test('a type without reference characteristic is kept and rendered as such', () => {
+  // Occurs on structure formulas (type="SUM", no referenceCharacteristic), including
+  // SAP-delivered content; it must neither be dropped nor rendered as "by ?".
+  const ea = parseExceptionAggregation(memberOf('<Qry:exceptionAggregation exclude="false" type="SUM"/>'));
+  assert.deepEqual(ea, { type: 'SUM', label: 'Summation', referenceCharacteristics: [] });
+  assert.equal(formatExceptionAggregation(ea), 'SUM (Summation) without reference characteristic');
+});
