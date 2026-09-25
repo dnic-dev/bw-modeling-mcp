@@ -198,6 +198,27 @@ const DTP_FILTER_SCHEMA_PROPS = {
 
 // ── Tool definitions ─────────────────────────────────────────────────────────
 
+/** Exception aggregation of a reusable CKF, in the shape bw_get_ckf returns it. */
+const EXCEPTION_AGGREGATION_WRITE_SCHEMA = {
+  type: 'object',
+  description:
+    'Exception aggregation: { "type": "CN0", "reference_characteristics": ["0DOC_NUMBER"] }. The ' +
+    '"exception_aggregation" of a bw_get_ckf result can be passed unchanged (its "label" is ignored). ' +
+    'Type is a code of domain RSAGGREXC (SUM, MAX, MIN, AVG, AV0, AV1, AV2, CNT, CN0, FIR, LAS, NO1, NO2, NOP, ' +
+    'STD, VAR); one to five reference characteristics. A type without reference characteristic and ' +
+    'exclude=true are rejected rather than written.',
+  properties: {
+    type: { type: 'string', description: 'Aggregation type code, e.g. "CN0", "MAX", "AVG".' },
+    reference_characteristics: {
+      type: 'array',
+      items: { type: 'string' },
+      description: 'Reference characteristics (InfoObject or CompositeProvider field names), 1 to 5.',
+    },
+    reference_characteristic: { type: 'string', description: 'Single reference characteristic (alternative form).' },
+  },
+  required: ['type'],
+};
+
 const TOOL_DEFINITIONS = [
     {
       name: 'bw_search',
@@ -1889,9 +1910,9 @@ const TOOL_DEFINITIONS = [
       name: 'bw_get_query',
       description:
         'Read a BW Query definition — variables, filter, layout (rows/columns/free characteristics), ' +
-        'calculated and restricted measures, exceptions, and cell definitions. ' +
+        'calculated and restricted measures (each with its exception aggregation), exceptions, and cell definitions. ' +
         'Structure members are reported with their properties: input readiness and disaggregation ' +
-        '(the planning settings), decimals, scaling, sign inversion, constant selection, position, ' +
+        '(the planning settings), exception aggregation, decimals, scaling, sign inversion, constant selection, position, ' +
         'nested child members and the inverse formulas that make an input-ready formula writable. ' +
         'Tries the active version first; falls back to the inactive version if not found. ' +
         'format="text" (default): compact human-readable output. format="raw": full parsed JSON.',
@@ -3225,7 +3246,8 @@ const TOOL_DEFINITIONS = [
       description:
         'Read a global Calculated Key Figure (CKF) defined at CompositeProvider level. ' +
         'Returns technical name, description, the formula both as a rendered string and as a ' +
-        'structured tree (formula_tree) that bw_create_ckf and bw_update_ckf take back unchanged, metadata, ' +
+        'structured tree (formula_tree) that bw_create_ckf and bw_update_ckf take back unchanged, the exception ' +
+        'aggregation (type and reference characteristics, null when none is set), metadata, ' +
         'and the full dependency graph of referenced CKF/RKF sub-components.',
       inputSchema: {
         type: 'object',
@@ -3242,7 +3264,8 @@ const TOOL_DEFINITIONS = [
       name: 'bw_get_rkf',
       description:
         'Read a global Restricted Key Figure (RKF) defined at CompositeProvider level. ' +
-        'Returns technical name, description, base measure, characteristic filters, metadata, ' +
+        'Returns technical name, description, base measure, characteristic filters, the exception ' +
+        'aggregation (type and reference characteristics, null when none is set), metadata, ' +
         'and the full dependency graph of referenced CKF/RKF sub-components.',
       inputSchema: {
         type: 'object',
@@ -3260,7 +3283,7 @@ const TOOL_DEFINITIONS = [
       description:
         'Read a global Structure defined at CompositeProvider level. ' +
         'Returns the ordered member list with type (Selection/Formula), referenced component ' +
-        'or IOBJ name, characteristic filters, and the full dependency graph.',
+        'or IOBJ name, characteristic filters, exception aggregation where set, and the full dependency graph.',
       inputSchema: {
         type: 'object',
         properties: {
@@ -3363,7 +3386,7 @@ const TOOL_DEFINITIONS = [
         'Create a reusable Calculated Key Figure (CKF) on an InfoProvider. The formula is passed ' +
         'as an operator/operand tree in the same node syntax `bw_update_query_key_figures` uses for ' +
         '"add_formula", so a tree read back from `bw_get_ckf` (field formula_tree) can be written ' +
-        'again unchanged. Records to a transport when package and transport_request are given, and ' +
+        'again unchanged, and so can its exception_aggregation. Records to a transport when package and transport_request are given, and ' +
         'reports in "recorded_in" where the entry actually landed.',
       inputSchema: {
         type: 'object',
@@ -3376,6 +3399,7 @@ const TOOL_DEFINITIONS = [
           description: { type: 'string', description: 'Description of the CKF.' },
           formula: { type: 'object', description: "Formula tree. A node is one of: {\"type\":\"operator\",\"code\":\"+\",\"operands\":[...]} (codes as in the BW formula editor: + - * / , NDIV0, IF, MAX, %A, …); {\"type\":\"component\",\"component_name\":\"...\"} for a reusable CKF/RKF; {\"type\":\"key_figure\",\"name\":\"...\"} for a basic key figure InfoObject; {\"type\":\"constant\",\"value\":100}. Operand counts are checked against the operator catalog before anything is written." },
           decimals: { type: 'integer', description: 'Number of decimal places (0-9). Server default when omitted.' },
+          exception_aggregation: EXCEPTION_AGGREGATION_WRITE_SCHEMA,
           info_area: { type: 'string', description: 'InfoArea the CKF is filed under.' },
           package: { type: 'string', description: 'Development package (default "$TMP").' },
           transport_request: { type: 'string', description: 'Transport request to record the CKF in.' },
@@ -3390,7 +3414,8 @@ const TOOL_DEFINITIONS = [
         'expression, or "operations" for targeted edits that leave the rest of the formula untouched — ' +
         'the usual case being "add another summand to a sum" without having to know or rebuild the ' +
         'existing formula. All operations are applied to one document and written in a single save, so ' +
-        'a rejected operation leaves the stored formula unchanged rather than half edited.',
+        'a rejected operation leaves the stored formula unchanged rather than half edited. ' +
+        '"exception_aggregation" sets or resets the exception aggregation, alone or together with a formula change.',
       inputSchema: {
         type: 'object',
         properties: {
@@ -3401,6 +3426,11 @@ const TOOL_DEFINITIONS = [
             description: 'Replacement formula tree (mutually exclusive with "operations"). ' + "Formula tree. A node is one of: {\"type\":\"operator\",\"code\":\"+\",\"operands\":[...]} (codes as in the BW formula editor: + - * / , NDIV0, IF, MAX, %A, …); {\"type\":\"component\",\"component_name\":\"...\"} for a reusable CKF/RKF; {\"type\":\"key_figure\",\"name\":\"...\"} for a basic key figure InfoObject; {\"type\":\"constant\",\"value\":100}. Operand counts are checked against the operator catalog before anything is written.",
           },
           decimals: { type: 'integer', description: 'Number of decimal places (0-9).' },
+          exception_aggregation: {
+            ...EXCEPTION_AGGREGATION_WRITE_SCHEMA,
+            type: ['object', 'boolean', 'null'],
+            description: EXCEPTION_AGGREGATION_WRITE_SCHEMA.description + ' Pass false to reset it.',
+          },
           operations: {
             type: 'array',
             description: 'Targeted edits on the existing formula, applied in order.',

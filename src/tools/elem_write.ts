@@ -19,6 +19,9 @@ import {
   type FormulaNode,
   type MemberProperties,
   type KeyFigureRestriction,
+  excAggEl,
+  setMemberChildElement,
+  type ExceptionAggregation,
 } from './query_update.js';
 import type { RkfRestriction, RkfRestrictionValue, RkfOperator } from './rkf_create.js';
 
@@ -352,6 +355,8 @@ export interface CreateCkfArgs {
   description: string;
   formula: FormulaNode;
   decimals?: number;
+  /** Exception aggregation; the `exception_aggregation` of a bw_get_ckf result is accepted as is. */
+  exception_aggregation?: ExceptionAggregation | null;
   info_area?: string;
   package?: string;
   transport_request?: string;
@@ -370,6 +375,10 @@ export async function bwCreateCkf(client: BwClient, args: CreateCkfArgs): Promis
   if (args.decimals !== undefined && (args.decimals < 0 || args.decimals > 9)) {
     throw new Error('decimals must be between 0 and 9.');
   }
+  // Built before anything is locked or created, so an invalid aggregation fails
+  // without leaving an empty skeleton behind. null (as bw_get_ckf reports "none")
+  // writes the empty element, same as omitting it.
+  const excAggXml = excAggEl(args.exception_aggregation ?? undefined);
 
   const provider = args.provider_name.toUpperCase();
   const nameUpper = args.technical_name.toUpperCase();
@@ -520,7 +529,7 @@ export async function bwCreateCkf(client: BwClient, args: CreateCkfArgs): Promis
       ${decimalsEl}
       <Qry:mapName>${nameUpper}</Qry:mapName>
       <Qry:formulaDefinition>${formulaXml}</Qry:formulaDefinition>
-      <Qry:exceptionAggregation/>
+      ${excAggXml}
     `;
       let next = doc.slice(0, memberStart) + newMember + doc.slice(memberEnd);
       if (infoAreaEl && !next.includes('<infoArea>')) {
@@ -581,7 +590,29 @@ export interface UpdateCkfArgs {
   /** Targeted edits on the existing top-level operator. Mutually exclusive with `formula`. */
   operations?: CkfOperandOperation[];
   decimals?: number;
+  /**
+   * Set the exception aggregation, or reset it with false (null is taken the same
+   * way, since bw_get_ckf reports an unset aggregation as null).
+   */
+  exception_aggregation?: ExceptionAggregation | false | null;
   transport_request?: string;
+}
+
+/**
+ * Replace the exceptionAggregation element of the CKF's own member — the member of
+ * the main component, never one of an embedded sub-component, which belongs to
+ * another object.
+ */
+export function setCkfExceptionAggregation(doc: string, excAggXml: string): string {
+  const mainStart = doc.indexOf('<Qry:mainComponent');
+  if (mainStart === -1) throw new Error('CKF document has no <Qry:mainComponent>.');
+  const memberStart = doc.indexOf('<Qry:member', mainStart);
+  if (memberStart === -1) throw new Error('CKF document has no <Qry:member> in its main component.');
+  const closeTag = '</Qry:member>';
+  const memberEnd = doc.indexOf(closeTag, memberStart);
+  if (memberEnd === -1) throw new Error('CKF document has no </Qry:member> closing tag.');
+  const end = memberEnd + closeTag.length;
+  return doc.slice(0, memberStart) + setMemberChildElement(doc.slice(memberStart, end), 'exceptionAggregation', excAggXml) + doc.slice(end);
 }
 
 /**
@@ -704,12 +735,21 @@ export async function bwUpdateCkf(client: BwClient, args: UpdateCkfArgs): Promis
   if (args.formula && args.operations && args.operations.length > 0) {
     throw new Error('Pass either `formula` (replace) or `operations` (targeted edits), not both.');
   }
-  if (!args.formula && !args.operations?.length && args.description === undefined && args.decimals === undefined) {
-    throw new Error('Nothing to do: pass formula, operations, description, and/or decimals.');
+  if (
+    !args.formula &&
+    !args.operations?.length &&
+    args.description === undefined &&
+    args.decimals === undefined &&
+    args.exception_aggregation === undefined
+  ) {
+    throw new Error('Nothing to do: pass formula, operations, description, decimals, and/or exception_aggregation.');
   }
   if (args.decimals !== undefined && (args.decimals < 0 || args.decimals > 9)) {
     throw new Error('decimals must be between 0 and 9.');
   }
+  // Validated before the lock, like the component references below.
+  const excAggXml =
+    args.exception_aggregation === undefined ? undefined : excAggEl(args.exception_aggregation || undefined);
 
   const nameUpper = args.component_name.toUpperCase();
   const uidCache = new Map<string, string>();
@@ -766,6 +806,20 @@ export async function bwUpdateCkf(client: BwClient, args: UpdateCkfArgs): Promis
           .replace(/<Qry:decimals\b[^>]*?\/>/, `<Qry:decimals default="false" number="${args.decimals}"/>`);
         next = head + tail;
         applied.push(`decimals set to ${args.decimals}`);
+      }
+
+      if (excAggXml !== undefined) {
+        next = setCkfExceptionAggregation(next, excAggXml);
+        const ea = args.exception_aggregation;
+        applied.push(
+          ea
+            ? `exception aggregation set to ${ea.type.toUpperCase()} by ${(
+                ea.reference_characteristics ?? [ea.reference_characteristic ?? '']
+              )
+                .map((r) => String(r).toUpperCase())
+                .join(', ')}`
+            : 'exception aggregation reset'
+        );
       }
 
       if (replacement !== undefined) {
