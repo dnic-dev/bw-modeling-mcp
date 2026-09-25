@@ -200,6 +200,17 @@ async function targetFieldNames(client: BwClient, type: string, name: string): P
   return [];
 }
 
+/**
+ * Whether ABAP source holds more than the editor's template: comment lines and the
+ * "insert your code here" placeholder alone are what an untouched global part contains.
+ */
+function hasStatements(code: string): boolean {
+  return code
+    .split('\n')
+    .map((l) => l.trim())
+    .some((l) => l && !l.startsWith('*') && !l.startsWith('"') && !/insert your code here/i.test(l));
+}
+
 async function readTransformation(client: BwClient, tranId: string): Promise<string> {
   const id = sqlLiteral(tranId.toUpperCase());
   const scope = `tranid = '${id}' AND objvers = 'A'`;
@@ -229,7 +240,14 @@ async function readTransformation(client: BwClient, tranId: string): Promise<str
   // rather than on RSTRANSTEPROUT.KIND matters: the KIND values differ between releases.
   const codeIds = [
     ...new Set(
-      [header.STARTROUTINE, header.ENDROUTINE, header.EXPERT, ...routines.map((r) => r.CODEID)].filter(
+      [
+        header.GLBCODE,
+        header.GLBCODE2,
+        header.STARTROUTINE,
+        header.ENDROUTINE,
+        header.EXPERT,
+        ...routines.map((r) => r.CODEID),
+      ].filter(
         Boolean,
       ),
     ),
@@ -272,6 +290,21 @@ async function readTransformation(client: BwClient, tranId: string): Promise<str
   // ── Routines ──
   out.push('');
   out.push('── Routines ──');
+  // The global declarations come first: a routine that buffers a lookup across data packages
+  // keeps the buffer here, and its table kind and key decide how the lookup behaves.
+  const globals: [string, string][] = [
+    ['globalPart', header.GLBCODE],
+    ['globalPart2', header.GLBCODE2],
+  ];
+  for (const [label, codeId] of globals) {
+    const code = codeId ? codeOf.get(codeId) ?? '' : '';
+    if (!hasStatements(code)) {
+      out.push(`  ${label}: (none)`);
+      continue;
+    }
+    out.push(`  ${label}: (code id ${codeId})`);
+    out.push(indent(code));
+  }
   const named: [string, string][] = [
     ['startRoutine', header.STARTROUTINE],
     ['endRoutine', header.ENDROUTINE],
@@ -562,6 +595,120 @@ async function readAdso(client: BwClient, adsoName: string): Promise<string> {
   return [...out, ...section].join('\n');
 }
 
+// ── InfoObject details ──────────────────────────────────────────────────────
+
+interface IobjDetail {
+  /** RSDIOBJ-IOBJTP: CHA, KYF, TIM, UNI or DPA. */
+  kind: string;
+  /** "CHAR 5", "NUMC 6", "CURR", "QUAN" — a key figure's length lives in its domain, not here. */
+  dataType: string;
+  text: string;
+}
+
+const IOBJ_KINDS: Record<string, string> = {
+  CHA: 'characteristic',
+  KYF: 'key figure',
+  TIM: 'time characteristic',
+  UNI: 'unit',
+  DPA: 'technical (package)',
+};
+
+/** RSDIOBJT keys texts by the one-letter SAP language; the client is configured in ISO. */
+const SAP_LANGUAGE: Record<string, string> = { DE: 'D', EN: 'E', FR: 'F', ES: 'S', IT: 'I', NL: 'N', PT: 'P' };
+
+/**
+ * Kind, data type and text of each InfoObject a provider uses, in a handful of statements
+ * for the whole list rather than one call per InfoObject. Texts come in the logon language,
+ * English, or whatever exists — in that order.
+ *
+ * A characteristic's data type sits on its basic characteristic (RSDCHABAS), which is the
+ * characteristic itself unless it references another. Best effort throughout: a detail that
+ * cannot be read stays empty and the field list is still complete.
+ */
+export async function infoObjectDetails(client: BwClient, names: string[]): Promise<Map<string, IobjDetail>> {
+  const details = new Map<string, IobjDetail>();
+  const unique = [...new Set(names.map((n) => n.trim().toUpperCase()).filter(Boolean))];
+  if (unique.length === 0) return details;
+  for (const n of unique) details.set(n, { kind: '', dataType: '', text: '' });
+
+  const run = async (build: (batch: string) => string, each: (r: Row) => void) => {
+    for (const batch of inListBatches(unique, 150)) {
+      try {
+        for (const r of await queryTable(client, build(batch), 1000)) each(r);
+      } catch {
+        // An enrichment; the InfoObject names are listed regardless.
+      }
+    }
+  };
+
+  await run(
+    (b) => `SELECT iobjnm, iobjtp FROM rsdiobj WHERE objvers = 'A' AND iobjnm IN (${b})`,
+    (r) => { const d = details.get(r.IOBJNM); if (d) d.kind = r.IOBJTP; },
+  );
+
+  const basicOf = new Map<string, string>();
+  await run(
+    (b) => `SELECT chanm, chabasnm FROM rsdcha WHERE objvers = 'A' AND chanm IN (${b})`,
+    (r) => basicOf.set(r.CHANM, r.CHABASNM || r.CHANM),
+  );
+  // Time characteristics and the data package characteristics have no RSDCHA entry; their
+  // basic characteristic is themselves.
+  for (const n of unique) {
+    const kind = details.get(n)!.kind;
+    if (!basicOf.has(n) && kind !== 'KYF') basicOf.set(n, n);
+  }
+  const basics = [...new Set(basicOf.values())];
+  const basicType = new Map<string, string>();
+  for (const batch of inListBatches(basics, 150)) {
+    try {
+      const rows = await queryTable(
+        client,
+        `SELECT chabasnm, datatp, intlen FROM rsdchabas WHERE objvers = 'A' AND chabasnm IN (${batch})`,
+        1000,
+      );
+      for (const r of rows) basicType.set(r.CHABASNM, `${r.DATATP} ${Number(r.INTLEN)}`);
+    } catch {
+      // As above.
+    }
+  }
+  for (const [cha, basic] of basicOf) {
+    const d = details.get(cha);
+    const t = basicType.get(basic);
+    if (d && t) d.dataType = t;
+  }
+
+  await run(
+    (b) => `SELECT kyfnm, datatp FROM rsdkyf WHERE objvers = 'A' AND kyfnm IN (${b})`,
+    (r) => { const d = details.get(r.KYFNM); if (d) d.dataType = r.DATATP; },
+  );
+
+  const logon = SAP_LANGUAGE[(client.language ?? '').toUpperCase()];
+  const rank = (langu: string) => (langu === logon ? 0 : langu === 'E' ? 1 : 2);
+  const bestRank = new Map<string, number>();
+  await run(
+    (b) => `SELECT iobjnm, langu, txtsh, txtlg FROM rsdiobjt WHERE objvers = 'A' AND iobjnm IN (${b})`,
+    (r) => {
+      const text = (r.TXTLG || r.TXTSH || '').trim();
+      const d = details.get(r.IOBJNM);
+      if (!d || !text) return;
+      const k = rank(r.LANGU);
+      if (k < (bestRank.get(r.IOBJNM) ?? 9)) {
+        bestRank.set(r.IOBJNM, k);
+        d.text = text;
+      }
+    },
+  );
+  return details;
+}
+
+/** One InfoObject as a table row: name, kind, data type, text, plus optional trailing columns. */
+function iobjRow(name: string, d: IobjDetail | undefined, extra = ''): string {
+  return (
+    `  ${toDisplayName(name).padEnd(12)} ${(IOBJ_KINDS[d?.kind ?? ''] ?? d?.kind ?? '').padEnd(20)} ` +
+    `${(d?.dataType ?? '').padEnd(9)} ${d?.text ?? ''}${extra}`
+  );
+}
+
 // ── Provider type lookup ────────────────────────────────────────────────────
 
 /**
@@ -680,11 +827,13 @@ async function readOdso(client: BwClient, odsoName: string): Promise<string> {
   out.push(`── Key Fields (${keys.length}) ──`);
   out.push(keys.length ? `  ${keys.map((f) => toDisplayName(f.IOBJNM)).join(', ')}` : '  (none)');
   out.push('');
+  const odsoDetails = await infoObjectDetails(client, fields.map((f) => f.IOBJNM));
   out.push(`── Fields (${fields.length}) ──`);
-  out.push('  POS   KEY  INFOOBJECT');
+  out.push(`  POS   KEY  ${'INFOOBJECT'.padEnd(12)} ${'KIND'.padEnd(20)} ${'TYPE'.padEnd(9)} TEXT`);
   for (const f of fields) {
     out.push(
-      `  ${String(Number(f.POSIT)).padStart(3)}   ${f.KEYFLAG === 'X' ? ' X ' : '   '}  ${toDisplayName(f.IOBJNM)}`,
+      `  ${String(Number(f.POSIT)).padStart(3)}   ${f.KEYFLAG === 'X' ? ' X ' : '   '}` +
+        iobjRow(f.IOBJNM, odsoDetails.get(f.IOBJNM)),
     );
   }
 
@@ -782,9 +931,42 @@ async function readCube(client: BwClient, cubeName: string): Promise<string> {
     }
   }
 
+  // Characteristics and key figures apart: in a cube the key figures are otherwise only
+  // recognisable by standing in no dimension.
+  const cubeDetails = await infoObjectDetails(client, fields.map((f) => f.IOBJNM));
+  const isKeyFigure = (n: string) => cubeDetails.get(n)?.kind === 'KYF';
+
+  // A MultiProvider identifies each of its InfoObjects in some of its parts, not necessarily
+  // all — that is what separates, say, an actuals part from a plan part.
+  const sourcesOf = new Map<string, string[]>();
+  if (isMulti) {
+    for (const r of await queryTable(
+      client,
+      `SELECT iobjnm, partcube, partiobj FROM rsdicmultiiobj WHERE ${scope}`,
+      5000,
+    )) {
+      const via = r.PARTIOBJ && r.PARTIOBJ !== r.IOBJNM ? `${r.PARTCUBE}.${toDisplayName(r.PARTIOBJ)}` : r.PARTCUBE;
+      sourcesOf.set(r.IOBJNM, [...(sourcesOf.get(r.IOBJNM) ?? []), via]);
+    }
+  }
+  const fromColumn = (n: string) => {
+    if (!isMulti) return '';
+    const from = sourcesOf.get(n);
+    return from?.length ? `   ← ${from.sort().join(', ')}` : '   ← (identified in no part)';
+  };
+
+  const header = `  ${'INFOOBJECT'.padEnd(12)} ${'KIND'.padEnd(20)} ${'TYPE'.padEnd(9)} TEXT` +
+    (isMulti ? '   ← IDENTIFIED IN' : '');
+  const chars = fields.filter((f) => !isKeyFigure(f.IOBJNM));
+  const kyfs = fields.filter((f) => isKeyFigure(f.IOBJNM));
   out.push('');
-  out.push(`── InfoObjects (${fields.length}) ──`);
-  out.push(`  ${fields.map((f) => toDisplayName(f.IOBJNM)).join(', ') || '(none)'}`);
+  out.push(`── Characteristics (${chars.length}) ──`);
+  out.push(header);
+  for (const f of chars) out.push(iobjRow(f.IOBJNM, cubeDetails.get(f.IOBJNM), fromColumn(f.IOBJNM)));
+  out.push('');
+  out.push(`── Key Figures (${kyfs.length}) ──`);
+  out.push(header);
+  for (const f of kyfs) out.push(iobjRow(f.IOBJNM, cubeDetails.get(f.IOBJNM), fromColumn(f.IOBJNM)));
 
   // A MultiProvider holds no data of its own — its parts do, and each is readable here.
   if (head.CUBETYPE !== 'M') out.push(...(await loadHistorySection(client, cubeName)));

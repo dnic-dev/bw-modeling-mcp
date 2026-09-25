@@ -501,6 +501,45 @@ function parseDimElement(
  * properties are appended, so a line stays short unless the member actually
  * deviates from the server defaults.
  */
+/**
+ * What a selection member shows, in one line: the key figure or reusable component first,
+ * then the characteristic restrictions. The key figure is a restriction on the 1KYFNM
+ * pseudo-characteristic, which is how the query model stores it; a reader looking at a
+ * member described as "Quantity" otherwise has no way to see which key figure it is.
+ */
+export function formatMemberSelection(selections: Record<string, unknown>[]): string {
+  const measures: string[] = [];
+  const restrictions: string[] = [];
+  for (const g of selections) {
+    const iobj = String(g['infoObject'] ?? '');
+    for (const t of (g['tokens'] as Record<string, unknown>[] | undefined) ?? []) {
+      if (t['tokenType'] === 'SelectionTokenForComponent') {
+        measures.push(`${t['componentType']} ${t['componentTechnicalName']}`);
+        continue;
+      }
+      const value = String(t['value'] ?? '');
+      if (iobj === '1KYFNM' || t['selectionType'] === 'keyFigure') {
+        measures.push(value);
+        continue;
+      }
+      const op = t['operator'] === 'Equal' ? '=' : ` ${String(t['operator'] ?? '')} `;
+      restrictions.push(`${t['exclude'] ? 'NOT ' : ''}${iobj}${op}${value}`);
+    }
+  }
+  return [...measures, ...restrictions].join(', ');
+}
+
+/** Readable names for the provider types a query can sit on. */
+const PROVIDER_LABELS: Record<string, string> = {
+  HCPR: 'CompositeProvider',
+  ALVL: 'AggregationLevel',
+  ADSO: 'aDSO',
+  MPRO: 'MultiProvider',
+  CUBE: 'InfoCube',
+  ODSO: 'DataStore object (classic)',
+  IOBJ: 'InfoObject',
+};
+
 function renderMemberLines(members: unknown[], indent: string, lines: string[]): void {
   for (const m of members as Record<string, unknown>[]) {
     const flags: string[] = [];
@@ -534,6 +573,8 @@ function renderMemberLines(members: unknown[], indent: string, lines: string[]):
     const label = m['description'] ? String(m['description']) : String(m['id'] ?? '');
     lines.push(`${indent}${label}  [${m['type']}]${flags.length > 0 ? '  ' + flags.join('  ') : ''}`);
     if (m['formula']) lines.push(`${indent}  Formula: ${m['formula']}`);
+    const selection = formatMemberSelection((m['selections'] as Record<string, unknown>[] | undefined) ?? []);
+    if (selection) lines.push(`${indent}  Selection: ${selection}`);
     const children = [
       ...((m['childMembers'] as unknown[]) ?? []),
       ...((m['childFormulas'] as unknown[]) ?? []),
@@ -548,8 +589,9 @@ function renderQueryText(q: Record<string, unknown>): string {
   const bool = (v: unknown) => (v === true || v === 'true') ? 'yes' : 'no';
 
   lines.push(`Query: ${s(q['name'])} — ${s(q['description'])}`);
-  lines.push(`InfoProvider: ${s(q['infoProvider'])} (${s(q['providerType'])})`);
+  lines.push(`InfoProvider: ${s(q['infoProvider'])} (${s(q['providerType'])}${q['providerTlogo'] ? `, ${q['providerTlogo']}` : ''})`);
   lines.push(`InfoArea: ${s(q['infoArea'])}  Package: ${s(q['package'])}`);
+  if (q['compuid']) lines.push(`Component UID: ${q['compuid']}`);
   lines.push(`Status: ${s(q['status'])}  Changed: ${s(q['changedAt'])}  By: ${s(q['responsible'])}`);
   if (q['versionNote']) lines.push(`Note: ${q['versionNote']}`);
 
@@ -790,11 +832,10 @@ export async function bwGetQuery(queryName: string, format: 'text' | 'raw' = 'te
   const relatedLink = links.find((l) => l['@_rel'] === 'related');
   const href = (relatedLink?.['@_href'] as string) ?? '';
 
-  let providerType: string;
-  if (href.includes('/hcpr/')) providerType = 'CompositeProvider';
-  else if (href.includes('/alvl/')) providerType = 'AggregationLevel';
-  else if (href.includes('/adso/')) providerType = 'aDSO';
-  else providerType = 'Unknown';
+  // The link path carries the provider's TLOGO; a classic release links MultiProviders,
+  // InfoCubes and classic DSOs as well.
+  const providerTlogo = (href.match(/\/sap\/bw\/modeling\/([a-z]{4})\//)?.[1] ?? '').toUpperCase();
+  const providerType = PROVIDER_LABELS[providerTlogo] ?? (providerTlogo || 'Unknown');
 
   const packageRef = entityProps['adtCore:packageRef'] as Record<string, unknown> | undefined;
 
@@ -1042,8 +1083,10 @@ export async function bwGetQuery(queryName: string, format: 'text' | 'raw' = 'te
   const output: Record<string, unknown> = {
     name: (mainComp['@_technicalName'] as string) ?? queryName.toUpperCase(),
     description: ((mainComp['Qry:description'] as Record<string, unknown> | undefined)?.['@_value'] as string) ?? '',
+    compuid: (mainComp['@_id'] as string) ?? '',
     infoProvider: (mainComp['@_providerName'] as string) ?? '',
     providerType,
+    ...(providerTlogo ? { providerTlogo } : {}),
     package: (packageRef?.['@_adtCore:name'] as string) ?? '',
     infoArea: stripInfoAreaSentinel((entityProps['infoArea'] as string) ?? ''),
     // A query has no activation step: the A version is written on every save. The server's

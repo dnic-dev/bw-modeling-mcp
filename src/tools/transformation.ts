@@ -300,6 +300,10 @@ function summarizeTransformation(
     lines.push(`        and call GetSource(object_type="CLAS", name=ClassName, method=MethodName).`);
     lines.push(`        Never read the ABAP Program listed in the header — it contains the full`);
     lines.push(`        generated class (~5000 lines) and will exceed context limits.`);
+    // Buffers and types a routine shares across data packages are declared outside the
+    // method; without them a lookup's table kind and key are unknown.
+    lines.push(`        The routines' global declarations are not in the method: they sit in the`);
+    lines.push(`        class definition between "begin of global area" and "end of global area".`);
   }
 
   if (ruleMatches.length > 0) {

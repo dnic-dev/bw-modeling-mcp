@@ -243,7 +243,9 @@ function summarizeDatasource(d: DatasourceData): string {
 
   lines.push(`DataSource: ${d.name ?? ''}`);
   lines.push(`Source System: ${d.source_system ?? ''}`);
-  lines.push(`Status: ${d.status ?? ''} | Type: ${d.type ?? ''} | Delta: ${d.delta ?? ''} | Direct Access: ${d.direct_access ?? ''}`);
+  // An empty delta process is a DataSource without one: it loads in full only.
+  const delta = d.delta ? d.delta : 'none (full loads only)';
+  lines.push(`Status: ${d.status ?? ''} | Type: ${d.type ?? ''} | Delta: ${delta} | Direct Access: ${d.direct_access ?? ''}`);
   lines.push(`Description: ${d.description ?? ''}`);
   lines.push(`Application Component: ${d.application_component ?? ''}`);
   lines.push(`Changed: ${d.changed_at ?? ''} by ${d.changed_by ?? ''}`);
@@ -306,6 +308,15 @@ function summarizeDatasource(d: DatasourceData): string {
   // ── Adapter ────────────────────────────────────────────────────────────────
   lines.push('');
   lines.push('── Adapter ──');
+  if (Object.keys(d.adapter).length === 0) {
+    // Seen on classic file DataSources: the definition holds only an unused converter entry,
+    // and the file settings are part of the InfoPackage.
+    lines.push('(no active adapter in the DataSource definition)');
+    lines.push(
+      'On a classic release the file settings of a file DataSource are kept in its InfoPackages: ' +
+        'bw_read_metadata_tables with object_type="ISIP" and this DataSource name lists them.',
+    );
+  }
   for (const [key, value] of Object.entries(d.adapter)) {
     lines.push(`${key}: ${value ?? ''}`);
   }

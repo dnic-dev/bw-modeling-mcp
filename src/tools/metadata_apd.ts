@@ -272,6 +272,62 @@ async function resolveQueryUids(client: BwClient, uids: string[]): Promise<Map<s
   return names;
 }
 
+/**
+ * The fields an analysis process reads from a query, with what each one is.
+ *
+ * A query source hands its key figures on under generic names (KYF_0001, …). The node that
+ * consumes them lists each as a FIELD_REF whose NAME is the UID of the query's structure
+ * element; the element's text is in RSZELTTXT, and the key figure behind it is its 1KYFNM
+ * selection in RSZRANGE — a key figure name, or the UID of a calculated or restricted key
+ * figure. Characteristics arrive under their field name and need no lookup. Resolving by UID
+ * rather than by position keeps the mapping right when the structure is reordered.
+ */
+export async function describeQueryFields(client: BwClient, nodes: ApdNode[]): Promise<string[]> {
+  const refs = new Map<string, string>();
+  for (const n of nodes) {
+    for (const m of n.body.matchAll(/<FIELD_REF\b([^>]*?)\/?>/g)) {
+      const a = parseAttributes(m[1]);
+      if (a.NAME && a.FIELDNAME && !refs.has(a.FIELDNAME)) refs.set(a.FIELDNAME, a.NAME);
+    }
+  }
+  const isUid = (v: string) => /^[A-Z0-9]{25}$/.test(v);
+  const uids = [...new Set([...refs.values()].filter(isUid))];
+
+  const texts = new Map<string, string>();
+  const measures = new Map<string, string>();
+  for (const batch of inListBatches(uids, 150)) {
+    try {
+      for (const r of await queryTable(
+        client,
+        `SELECT eltuid, langu, txtlg FROM rszelttxt WHERE objvers = 'A' AND eltuid IN (${batch})`,
+        500,
+      )) {
+        if (r.TXTLG && (r.LANGU === 'E' || !texts.has(r.ELTUID))) texts.set(r.ELTUID, r.TXTLG.trim());
+      }
+      for (const r of await queryTable(
+        client,
+        `SELECT eltuid, low FROM rszrange WHERE objvers = 'A' AND iobjnm = '1KYFNM' AND eltuid IN (${batch})`,
+        500,
+      )) {
+        measures.set(r.ELTUID, r.LOW);
+      }
+    } catch {
+      // An enrichment; the field names are listed regardless.
+    }
+  }
+  const componentNames = await resolveQueryUids(client, [...measures.values()].filter(isUid));
+
+  return [...refs.entries()]
+    .sort(([a], [b]) => a.localeCompare(b))
+    .map(([field, name]) => {
+      if (!isUid(name)) return `${field} = ${name}`;
+      const measure = measures.get(name);
+      const behind = measure ? componentNames.get(measure) ?? measure : '';
+      const text = texts.get(name);
+      return `${field} = ${text ?? `element ${name}`}${behind ? ` (${behind})` : ''}`;
+    });
+}
+
 // ── Entry point ─────────────────────────────────────────────────────────────
 
 /** Which version to read, and what to say about it. A is the active one; D is shipped content. */
@@ -389,6 +445,7 @@ export async function readAnalysisProcess(client: BwClient, processName: string)
   }
 
   const { nodes, edges } = parseApdXml(xml);
+  const queryFields = nodes.some((n) => n.type === 'DS_QUERY') ? await describeQueryFields(client, nodes) : [];
   const { ordered, cyclic } = orderApdNodes(nodes, edges);
 
   const predecessors = new Map<string, string[]>();
@@ -407,6 +464,11 @@ export async function readAnalysisProcess(client: BwClient, processName: string)
 
     const objectValue = known?.objectAttr ? node.attributes[known.objectAttr] : '';
     if (objectValue) out.push(`       ${known!.objectAttr!.toLowerCase()}: ${objectValue}`);
+
+    if (node.type === 'DS_QUERY' && queryFields.length > 0) {
+      out.push(`       output fields (${queryFields.length}):`);
+      for (const f of queryFields) out.push(`         ${f}`);
+    }
 
     // Details that are the point of the node rather than decoration.
     if (node.type === 'DT_FILE') {

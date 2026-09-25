@@ -132,7 +132,10 @@ along the way:
   (feeds it) or `downstream` (fed from it) with its source and target. The analysis processes
   that write to or read from the provider appear in the same list, with direction.
 - A MultiProvider's parts come from `bw_read_metadata_tables` with `object_type="MPRO"`, each
-  with its type, ready for the next `bw_xref`.
+  with its type, ready for the next `bw_xref` — and per InfoObject the parts it is identified
+  in. The provider reads list every InfoObject with its kind, data type and text.
+- A transformation read with `object_type="TRFN"` includes the global declarations of its
+  routines, where lookup buffers are declared.
 - An analysis process itself — its source query or provider, the routine, and the field rules
   into its target, constants included — is read with `object_type="ANPR"`.
 - An upstream hit that starts at a DataSource ends the trace; `bw_xref` on the DataSource

@@ -601,6 +601,11 @@ export class BwClient {
     await this.csrfFetch;
   }
 
+  /** The logon language as configured (ISO, e.g. "DE"), if one was set. */
+  public get language(): string | undefined {
+    return this.opts.language;
+  }
+
   public clearCsrfToken(): void {
     this.csrfToken = null;
   }
