@@ -627,12 +627,28 @@ export class BwClient {
     });
     this.updateCookies(response);
     if (response.status >= 400) {
+      if (response.status === 500) this.discardSessionContext();
       throw bwHttpError(`GET ${path}`, response.status, response.data);
     }
     return {
       body: response.data as string,
       headers: response.headers as Record<string, string>,
     };
+  }
+
+  /**
+   * Forget the server-side session context after a request that ended in a short dump.
+   *
+   * The dump ends the stateful context on the server, but the server does not say so: the
+   * next request carrying the same `sap-contextid` hangs and fails as well (verified on a
+   * classic 7.5 system), or is answered "400 Session Timed Out" (BW/4HANA) — so one rejected
+   * search filter made the following, valid search fail too. Without the cookie the next
+   * request opens a fresh context under the same logon. Nothing held in the old context
+   * survives the dump anyway, a lock included, so dropping the cookie loses nothing.
+   */
+  private discardSessionContext(): void {
+    if (this.frozenCookies.has('sap-contextid')) return;
+    this.cookies.delete('sap-contextid');
   }
 
   /**

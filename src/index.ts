@@ -24,7 +24,7 @@ import {
 } from './platform.js';
 import { bwGetAdso, bwCreateAdso, FieldDef, bwUpdateAdso, bwUpdateAdsoAddPureField, bwUpdateAdsoSettings, AdsoSettings, bwUpdateAdsoManageKeys, bwUpdateAdsoFieldProperties, FieldProperties } from './tools/adso.js';
 import { bwGetInfoObject, bwCreateInfoObject, bwUpdateInfoObject, AttributeDef } from './tools/infoobject.js';
-import { bwGetTransformation, bwUpdateTransformation, bwCreateTransformation, bwSetTransformationRuntime, bwSetTransformationRoutine, bwDeleteTransformationRoutine, bwSetTransformationRoutineFields, bwSetTransformationExpertRoutine } from './tools/transformation.js';
+import { bwGetTransformation, bwUpdateTransformation, bwCreateTransformation, bwSetTransformationRuntime, bwSetTransformationRoutine, bwDeleteTransformationRoutine, bwSetTransformationRoutineFields, bwSetTransformationExpertRoutine, type RuleConversion } from './tools/transformation.js';
 import { bwActivate } from './tools/activation.js';
 import { bwSystemProfile } from './tools/system_profile.js';
 import { bwReadMetadataTables } from './tools/metadata_tables.js';
@@ -37,8 +37,9 @@ import { bwCreateInfosource, bwUpdateInfosource, bwGetInfosource, InfosourceFiel
 import { bwPushData, bwGetPushSchema } from './tools/push.js';
 import { bwGetQuery, bwCreateQuery } from './tools/query.js';
 import { bwCreateVariable, CreateVariableArgs } from './tools/variable.js';
-import { bwUpdateQueryLayout, bwUpdateQueryFilter, bwUpdateQueryKeyFigures, bwUpdateQuerySettings, LayoutOperation, FilterOperation, KeyFigureOperation, UpdateQuerySettingsArgs } from './tools/query_update.js';
+import { bwUpdateQueryLayout, bwUpdateQueryFilter, bwUpdateQueryKeyFigures, bwUpdateQuerySettings, EXCEPTION_AGGREGATION_TYPES, LayoutOperation, FilterOperation, KeyFigureOperation, UpdateQuerySettingsArgs } from './tools/query_update.js';
 import { bwUpdateQueryCharacteristic, UpdateQueryCharacteristicArgs } from './tools/query_characteristic.js';
+import { bwUpdateQueryCells, UpdateQueryCellsArgs } from './tools/query_cells.js';
 import {
   bwGetCompositeProvider,
   bwCreateCompositeProvider,
@@ -72,7 +73,13 @@ import { bwQueryData, bwGetFilterValues, InfoObjectState, VariableInput, DrillOp
 import { bwGetRoles, bwGetQueryRoles, bwSetQueryRoles, bwGetRoleQueries } from './tools/roles.js';
 import { bwGetProcessChain } from './tools/processchain.js';
 import { bwGetProcessVariant } from './tools/processvariant.js';
-import { bwListRequests, bwGetRequest, bwActivateRequest, bwDeleteRequest } from './tools/request_monitor.js';
+import {
+  bwListRequests,
+  bwGetRequest,
+  bwActivateRequest,
+  bwDeleteRequest,
+  defaultRequestStorages,
+} from './tools/request_monitor.js';
 import {
   bwListRemodelingRequests,
   bwGetRemodelingRequest,
@@ -196,6 +203,34 @@ const DTP_FILTER_SCHEMA_PROPS = {
   },
 } as const;
 
+/** Properties of an exception aggregation, shared by the CKF and the query member tools. */
+const EXCEPTION_AGGREGATION_PROPS = {
+  type: {
+    type: 'string',
+    enum: [...EXCEPTION_AGGREGATION_TYPES],
+    description:
+      'Aggregation type: SUM, MAX, MIN, AVG (all values), AV0 (average of non-zero values), AV1 / AV2 ' +
+      '(average weighted by calendar / working days), CNT (count all), CN0 (count non-zero), FIR / LAS ' +
+      '(first / last value), NO1 / NO2 / NOP (no aggregation if more than one record / value / non-zero ' +
+      'value), STD, VAR. Any other literal is refused, because the backend would silently store standard ' +
+      'aggregation instead.',
+  },
+  reference_characteristic: {
+    type: 'string',
+    description: 'Reference characteristic the exception aggregation runs over (e.g. "IOBJ_NAME").',
+  },
+  reference_characteristics: {
+    type: 'array',
+    items: { type: 'string' },
+    maxItems: 5,
+    description: 'Several reference characteristics (up to five). Takes precedence over reference_characteristic.',
+  },
+  exclude: {
+    type: 'boolean',
+    description: 'Aggregate over all characteristics except the reference characteristics. Default false.',
+  },
+};
+
 // ── Tool definitions ─────────────────────────────────────────────────────────
 
 const TOOL_DEFINITIONS = [
@@ -205,6 +240,7 @@ const TOOL_DEFINITIONS = [
         'Universal search for BW objects by name or description. Use this whenever the user wants to find, list, or look up any BW object — aDSOs, queries (ELEM), transformations (TRFN), DTPs (DTPA), InfoObjects (IOBJ), InfoSources (TRCS), CompositeProviders (HCPR), DataSources (RSDS), InfoAreas (AREA), process chains (RSPC), and any other TLOGO type. ' +
         'Supports wildcards (e.g. "Z*" to find all objects starting with Z). ' +
         'Pass object_type to restrict results to a single type; omit it to search across all types. ' +
+        'Analysis processes (ANPR) are not in the search index — list them with bw_read_metadata_tables instead. ' +
         'Prefer this tool over type-specific get/list tools whenever the object name is unknown or a pattern is given.',
       inputSchema: {
         type: 'object',
@@ -227,6 +263,9 @@ const TOOL_DEFINITIONS = [
       description:
         'Find where-used / dependencies for a BW object. Returns all objects that reference the given object. ' +
         'Use this to find the Transformation and DTPs that reference an aDSO, or to find which DTPs depend on a Transformation. ' +
+        'Every transformation and DTP hit carries its source and target (type and name) and its direction relative to the object: ' +
+        'upstream (feeds it) or downstream (fed from it) — follow upstream hits hop by hop to trace a data flow back to its DataSource. ' +
+        'On classic SAP BW the analysis processes that write to or read from a provider (ADSO, ODSO, CUBE, MPRO, IOBJ) are listed too, with direction. ' +
         'Use object_type=DTPA to find the process chain(s) a DTP belongs to — this is preferred over bw_get_dtp when only the process chain is needed.',
       inputSchema: {
         type: 'object',
@@ -817,6 +856,7 @@ const TOOL_DEFINITIONS = [
         'rule_type="direct" with unit_source_field set: creates a COMBINED key-figure + unit/currency ' +
         'direct rule (multi-source/target) — maps a quantity together with its unit (or an amount with ' +
         'its currency) in one rule, as the Eclipse rule editor shows it. ' +
+        'A rule on a key figure with a currency or unit takes the value over unconverted unless conversion is set. ' +
         'Returns a lock_handle for bw_activate.',
       inputSchema: {
         type: 'object',
@@ -894,6 +934,26 @@ const TOOL_DEFINITIONS = [
               '(the target key figure must reference a unit/currency field). The standalone unit/currency rule is folded ' +
               'into the combined rule and the transformation\'s currency/unit handling is switched on. ' +
               'Example: target_infoobject="QUANTITY", unit_source_field="QUANTITYUNIT".',
+          },
+          conversion: {
+            type: 'object',
+            description:
+              'Currency or unit conversion for a direct rule on a key figure with a currency or unit (rule_type="direct"). ' +
+              'Omitted or type "none": no conversion — the value is taken over as it is, which is also what direct, formula ' +
+              'and constant rules on such a key figure get by default. Type "currency": convert with a currency translation ' +
+              'type; type "unit": convert with a unit conversion type. The name is checked against the types defined on the ' +
+              'system, and an unknown name is refused with the list of available ones. The source currency/unit comes from ' +
+              'source_unit_field, else from the source key figure\'s own unit reference; a conversion type with a fixed ' +
+              'source needs neither. The transformation\'s currency/unit handling is switched on.',
+            properties: {
+              type: { type: 'string', enum: ['none', 'currency', 'unit'] },
+              name: { type: 'string', description: 'Currency translation type or unit conversion type (e.g. "CONV_TYPE").' },
+              source_unit_field: {
+                type: 'string',
+                description: 'Source field holding the source currency or unit (e.g. "CURRENCY_FIELD").',
+              },
+            },
+            required: ['type'],
           },
           transport: {
             type: 'string',
@@ -1419,7 +1479,9 @@ const TOOL_DEFINITIONS = [
           },
           storage: {
             type: 'string',
-            description: 'Comma-separated storage area codes (default "AQ,AX,AT").',
+            description:
+              'Comma-separated storage area codes (default "AQ,AX,AT"; for target_type "IOBJ" ' +
+              '"ATAT,ATTE,ATHI" — attributes, texts, hierarchies).',
           },
           status: {
             type: 'string',
@@ -1529,7 +1591,8 @@ const TOOL_DEFINITIONS = [
             description:
               'Storage area code the request lives in (default "AQ"). Take it from the ' +
               '"Storage" line of bw_list_requests. AT/AX mark an activation request, which ' +
-              'is rolled back rather than deleted.',
+              'is rolled back rather than deleted; so does every InfoObject storage ' +
+              '(ATAT, ATTE, ATHI), since InfoObject loads write straight into active data.',
           },
           target: {
             type: 'string',
@@ -1891,8 +1954,10 @@ const TOOL_DEFINITIONS = [
         'Read a BW Query definition — variables, filter, layout (rows/columns/free characteristics), ' +
         'calculated and restricted measures, exceptions, and cell definitions. ' +
         'Structure members are reported with their properties: input readiness and disaggregation ' +
-        '(the planning settings), decimals, scaling, sign inversion, constant selection, position, ' +
-        'nested child members and the inverse formulas that make an input-ready formula writable. ' +
+        '(the planning settings), decimals, scaling, sign inversion, constant selection, the local ' +
+        'calculation (results / single values as), exception aggregation, position, nested child members and the inverse formulas that make an input-ready ' +
+        'formula writable. A member that shows a reusable CKF reports the CKF\'s own exception aggregation ' +
+        'separately from the member\'s. ' +
         'Tries the active version first; falls back to the inactive version if not found. ' +
         'format="text" (default): compact human-readable output. format="raw": full parsed JSON.',
       inputSchema: {
@@ -2240,9 +2305,9 @@ const TOOL_DEFINITIONS = [
       description:
         'Manage the key figure structure of an existing BW Query: add basic key figures, add references ' +
         'to reusable CKFs/RKFs (with optional local restrictions), add local formula members (recursive ' +
-        'operator/operand tree), set member display and planning properties (decimals, hidden, sign ' +
-        'inversion, input readiness, disaggregation, constant selection) and exception aggregation, and ' +
-        'remove members. All operations are applied in a single save. ' +
+        'operator/operand tree), set member display and planning properties (decimals, scaling, hidden, ' +
+        'sign inversion, input readiness, disaggregation, constant selection, local calculation) and ' +
+        'exception aggregation, nest members and place them at a position, and remove members. All operations are applied in a single save. ' +
         'Member operations also apply to a reusable key figure structure referenced via ' +
         'bw_update_query_layout add_structure. ' +
         'All names must be technical names (e.g. "IOBJ_NAME", "CKF_NAME", "QUERY_NAME").',
@@ -2330,13 +2395,14 @@ const TOOL_DEFINITIONS = [
                 exception_aggregation: {
                   type: 'object',
                   description:
-                    'Exception aggregation for the member (add_key_figure / add_ckf / add_rkf / add_formula). ' +
-                    'Shape: { "type": "AVG", "reference_characteristic": "IOBJ_NAME" }.',
-                  properties: {
-                    type: { type: 'string', description: 'Aggregation type (e.g. "AVG", "MAX", "LAS").' },
-                    reference_characteristic: { type: 'string', description: 'Reference characteristic technical name (e.g. "IOBJ_NAME").' },
-                  },
-                  required: ['type', 'reference_characteristic'],
+                    'Exception aggregation of a local formula member ("add_formula" only). ' +
+                    'Shape: { "type": "AVG", "reference_characteristic": "IOBJ_NAME" } — the same shape ' +
+                    'bw_get_query reports per member. Refused on add_key_figure / add_ckf / add_rkf: a ' +
+                    'selection member has no calculation step, and the backend drops the setting without ' +
+                    'an error. For a CKF set it on the CKF itself with bw_create_ckf / bw_update_ckf — ' +
+                    'that is also the only place another CKF referencing it picks the setting up from.',
+                  properties: EXCEPTION_AGGREGATION_PROPS,
+                  required: ['type'],
                 },
                 properties: {
                   type: 'object',
@@ -2351,7 +2417,9 @@ const TOOL_DEFINITIONS = [
                     sign_inversion: { type: 'boolean', description: 'Invert the +/- sign.' },
                     exception_aggregation: {
                       description:
-                        'Exception aggregation { "type": "AVG", "reference_characteristic": "IOBJ_NAME" }, or false to reset it.',
+                        'Exception aggregation { "type": "AVG", "reference_characteristic": "IOBJ_NAME" }, or false to reset it. ' +
+                        'Same fields as the operation-level exception_aggregation; formula members only.',
+                      properties: EXCEPTION_AGGREGATION_PROPS,
                     },
                     description: { type: 'string', description: 'New member description text.' },
                     input_mode: {
@@ -2374,6 +2442,27 @@ const TOOL_DEFINITIONS = [
                     constant_selection: {
                       type: 'boolean',
                       description: 'Constant selection on the member itself.',
+                    },
+                    scaling: {
+                      description: 'Scaling as a power of ten, 0-9 (3 = thousands), or false to restore the default.',
+                    },
+                    calculation: {
+                      description:
+                        'Local calculation of the member, or false to restore the default. Fields not given keep ' +
+                        'their current value. result_as ("calculate results as"): blank, summation, maximum, ' +
+                        'mininum (the model\'s spelling of minimum), detValuesCounter, detValuesCounterNonEmpty, ' +
+                        'average, averageNonEmpty, standardDeviation, variance, hide, firstValue, lastValue, ' +
+                        'summationRoundedValues. single_values_as ("calculate single values as"): blank, minimum, ' +
+                        'maximum, detValuesCounter, detValuesCounterNonEmpty, movingAverage, movingAverageNonEmpty ' +
+                        '(read back as movingAverage), normalizeNGLR, normalizeOverall, normalizeUnrestOverall, ' +
+                        'rankNumber, olympicRankNumber, hide. apply_to_result: use the calculated single values ' +
+                        'for the result (false is what the modeling tools write). cumulation: show values cumulated.',
+                      properties: {
+                        result_as: { type: 'string' },
+                        single_values_as: { type: 'string' },
+                        apply_to_result: { type: 'boolean' },
+                        cumulation: { type: 'boolean' },
+                      },
                     },
                   },
                 },
@@ -2541,6 +2630,116 @@ const TOOL_DEFINITIONS = [
           },
         },
         required: ['query_name'],
+      },
+    },
+    {
+      name: 'bw_update_query_cells',
+      description:
+        'Manage the cell definitions of an existing BW Query that has two structures (one on each axis): ' +
+        'add reference cells (make the value at an intersection of a member of each structure addressable), ' +
+        'add formula cells at an intersection, add help cells (formula or selection cells outside the grid, ' +
+        'used as reusable operands such as a unit-free denominator), change a cell\'s formula, description, ' +
+        'decimals or scaling, and remove cells. Members and cells are addressed by description or id; ' +
+        'bw_get_query lists the existing cells with the member descriptions they sit on. ' +
+        'All operations are applied in a single save.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          query_name: {
+            type: 'string',
+            description: 'Technical name of the query to modify (e.g. "QUERY_NAME").',
+          },
+          transport: {
+            type: 'string',
+            description: 'Transport request number (e.g. DEVK900123). Only needed when the query lives on a transportable package; omit for $TMP queries.',
+          },
+          operations: {
+            type: 'array',
+            description: 'Cell changes, applied in order in one save cycle. A later operation can reference a cell an earlier one added, by its description.',
+            items: {
+              type: 'object',
+              properties: {
+                action: {
+                  type: 'string',
+                  enum: ['add_reference_cell', 'add_formula_cell', 'add_help_cell', 'update_cell', 'remove_cell'],
+                  description:
+                    'add_reference_cell: a ReferenceCell at row_member × column_member. ' +
+                    'add_formula_cell: a FormulaCell at row_member × column_member (formula required). ' +
+                    'add_help_cell: a help cell outside the grid, either a formula cell (formula) or a selection ' +
+                    'cell (key_figure, optional restrictions); description required. ' +
+                    'update_cell: change formula / description / decimals / scaling of the cell given by cell, or ' +
+                    'by row_member × column_member. remove_cell: remove that cell; refused while another cell\'s ' +
+                    'formula references it.',
+                },
+                row_member: {
+                  type: 'string',
+                  description:
+                    'Member of one of the two structures, by description or id (members at any depth). ' +
+                    'Together with column_member it names an intersection; which one lies on rows or columns ' +
+                    'does not matter, they must belong to different structures.',
+                },
+                column_member: {
+                  type: 'string',
+                  description: 'Member of the other structure, by description or id.',
+                },
+                cell: {
+                  type: 'string',
+                  description: 'Existing cell for update_cell / remove_cell, by description or id.',
+                },
+                description: {
+                  type: 'string',
+                  description: 'Cell description. Optional for grid cells (the server then numbers them), required for help cells.',
+                },
+                formula: {
+                  type: 'object',
+                  description:
+                    'Cell formula tree (recursive). A cell formula references cells only. Node forms: ' +
+                    '{ "type": "operator", "code": "+|-|*|/|NOERR|NODIM|NDIV0|...", "operands": [node, ...] } ' +
+                    '(same operator catalog and operand counts as bw_update_query_key_figures add_formula); ' +
+                    '{ "type": "cell", "cell": "..." } for an existing cell (help cell or grid cell) by description or id; ' +
+                    '{ "type": "cell", "row_member": "...", "column_member": "..." } for the value at an intersection — ' +
+                    'its reference cell is created when the intersection has no cell yet; ' +
+                    '{ "type": "constant", "value": "100" }.',
+                },
+                key_figure: {
+                  type: 'string',
+                  description: 'Selection help cell: technical name of the key figure it reads (e.g. "IOBJ_NAME").',
+                },
+                restrictions: {
+                  type: 'array',
+                  description: 'Selection help cell: characteristic restrictions, same shape as in bw_update_query_key_figures.',
+                  items: {
+                    type: 'object',
+                    properties: {
+                      infoobject: { type: 'string', description: 'Characteristic technical name.' },
+                      values: {
+                        type: 'array',
+                        items: {
+                          type: 'object',
+                          properties: {
+                            value: { type: 'string' },
+                            high: { type: 'string', description: 'Upper bound of an interval.' },
+                            exclude: { type: 'boolean' },
+                          },
+                          required: ['value'],
+                        },
+                      },
+                    },
+                    required: ['infoobject', 'values'],
+                  },
+                },
+                decimals: {
+                  description: 'Decimal places 0-9 for the cell, or false to return to the default.',
+                },
+                scaling: {
+                  description: 'Scaling factor as a power of ten 0-9 for the cell, or false to return to the default.',
+                },
+              },
+              required: ['action'],
+            },
+          },
+        },
+        required: ['query_name', 'operations'],
       },
     },
     {
@@ -2884,53 +3083,57 @@ const TOOL_DEFINITIONS = [
     {
       name: 'bw_read_metadata_tables',
       description:
-        'Read a BW object definition directly from its metadata tables (via the ADT DataPreview service). ' +
-        'Read-only fallback for object types the connected system does not publish as a REST resource — ' +
-        'on classic SAP BW (7.5) that is typically transformations and DTPs, and the classic providers, ' +
-        'for which no release ships a REST resource. ' +
-        'Use bw_system_profile to see which endpoints a system publishes. ' +
-        'Supported object_type: TRFN (transformation incl. start/end/expert and field routine source code), ' +
-        'DTPA (data transfer process), ADSO (load history only — structure and settings come from bw_get_adso), ' +
-        'ODSO (classic DataStore Object), CUBE (InfoCube), MPRO (MultiProvider) ' +
-        'and RSPC (process chain: steps with their variant parameters, in execution order — every step follows its ' +
-        'predecessors, but branches that run in parallel have no order among themselves, so read the "After" line ' +
-        'of each step for the actual dependency). ' +
-        'Planning objects: PLSE (planning function: type, aggregation level, characteristic usage, conditions and ' +
-        'the full parameter tree with its selections; FOX formula lines come back as source code, and a customer ' +
-        'function type names its exit class), PLSQ (planning sequence: steps in execution order with aggregation ' +
-        'level, function and filter), PLCR (planning properties of an InfoProvider: key date, save strategy and the ' +
-        'characteristic relationships) and PLDS (data slices of an InfoProvider — no release publishes a REST ' +
-        'resource for those, so this is the only route to them on any platform). ' +
-        'PLCR and PLDS are keyed by the InfoProvider, not by the aggregation level. ' +
-        'ANPR reads an analysis process (APD): its nodes in execution order with the object each source reads and each target writes, the edges between them, filters, formulas and the ABAP of a routine node. No release publishes a REST resource for it and BW/4HANA dropped the object type, so this is the only route on any platform. A node type this reader does not know is still listed with its category and attributes rather than dropped. ' +
-        'RSPCLOG reads process chain *runs* (the definition is RSPC) and answers three questions ' +
-        'from one type, told apart by what object_name is: a chain name returns the run history ' +
-        'newest first plus the steps of the newest run; a 25-character log id returns the steps of ' +
-        'that run with status, start, duration and the process variant behind each; a pattern with ' +
-        '* returns the last status of every matching chain. Status codes come back as the raw code ' +
-        'plus its colour and meaning. The message log of a failed step is an application log and is ' +
-        'not readable through table access. ' +
-        'ADSO, ODSO, CUBE and MPRO end with the load history of the provider — request, status, update mode, ' +
-        'start, user, duration, records and source — which on a classic release is the only route to load ' +
-        'status, since the BW/4HANA request monitor API does not exist there. ' +
-        'Requires ADT authorization for the calling user. Prefer bw_get_transformation where the REST endpoint exists.',
+        'Read a BW object definition from its metadata tables (ADT DataPreview, read-only; needs ADT ' +
+        'authorization). The route for objects without a REST resource on this system. object_type → result: ' +
+        'TRFN transformation with rules and routine code; ' +
+        'DTPA DTP; ' +
+        'ODSO classic DSO, CUBE InfoCube, MPRO MultiProvider (parts with their type) — each with load history; ' +
+        'ADSO load history only; ' +
+        'ANPR analysis process (nodes, field rules, routine code; "Z*" lists them); ' +
+        'ISIP InfoPackage (a DataSource name lists its InfoPackages); ' +
+        'RSPC process chain definition; RSPCLOG chain runs; ' +
+        'PLSE planning function; PLSQ planning sequence; PLCR planning properties; PLDS data slices. ' +
+        'Details per type are in the object_type parameter. Prefer the REST tool (bw_get_transformation, ' +
+        'bw_get_dtp, …) where the system publishes one.',
       inputSchema: {
         type: 'object',
         properties: {
           object_type: {
             type: 'string',
             description:
-              'Object type to read. Supported: TRFN, DTPA, ADSO (load history only), ODSO, CUBE, MPRO, RSPC, ' +
-              'PLSE (planning function), PLSQ (planning sequence), PLCR (planning properties and characteristic ' +
-              'relationships of an InfoProvider), PLDS (data slices of an InfoProvider), RSPCLOG ' +
-              '(process chain runs) and ANPR (analysis process / APD).',
+              'Object type to read. ' +
+              'TRFN: rules incl. start/end/expert and field routine source code. ' +
+              'DTPA: settings; the filter definition (selections, filter routine, semantic group, package ' +
+              'sizes) is a serialised ABAP object, reported only where the optional helper endpoint of ' +
+              'bw75/README.md is installed and named as unreadable where it is not. ' +
+              'ADSO: load history only — structure and settings come from bw_get_adso. ' +
+              'ODSO, CUBE, MPRO: structure, and for MPRO the part providers with their type, so each can ' +
+              'be passed on directly; a name read under the wrong provider type names the right one. ' +
+              'ADSO, ODSO, CUBE and MPRO end with the load history (request, status, update mode, start, ' +
+              'user, duration, records, source) — on a classic release the only route to load status. ' +
+              'RSPC: steps with variant parameters in execution order; parallel branches have no order ' +
+              'among themselves, so read the "After" line of each step. ' +
+              'RSPCLOG: process chain runs — a chain name gives the run history plus the steps of the ' +
+              'newest run, a 25-character log id the steps of that run, a pattern with * the last status ' +
+              'of every matching chain; the message log of a failed step is not readable here. ' +
+              'PLSE: planning function type, aggregation level, characteristic usage, conditions, ' +
+              'parameters, FOX formula as source code. PLSQ: planning sequence steps in execution order. ' +
+              'PLCR: planning properties and characteristic relationships. PLDS: data slices (no REST ' +
+              'resource on any release). PLCR and PLDS are keyed by the InfoProvider, not the aggregation level. ' +
+              'ANPR: analysis process (APD, classic only) — nodes in execution order with the object each ' +
+              'source reads and each target writes, the edges with their field rules (copies and ' +
+              'constants), filters, formulas and routine code; a pattern with * lists the analysis ' +
+              'processes, which bw_search cannot find. ' +
+              'ISIP: InfoPackage (classic only) — DataSource, file settings, selections with routines, ' +
+              'deletion settings, the process chains using it, load history.',
           },
           object_name: {
             type: 'string',
             description:
               'Technical name of the object (for TRFN the UUID-like transformation ID; for PLCR and PLDS the ' +
               'InfoProvider, not the aggregation level; for RSPCLOG a chain name, a run log id, or a ' +
-              'pattern such as "Z*" for the last status per chain).',
+              'pattern such as "Z*" for the last status per chain; for ANPR a process name or a pattern ' +
+              'such as "Z*"; for ISIP the InfoPackage id, or a DataSource name to list its InfoPackages).',
           },
         },
         required: ['object_type', 'object_name'],
@@ -3225,8 +3428,9 @@ const TOOL_DEFINITIONS = [
       description:
         'Read a global Calculated Key Figure (CKF) defined at CompositeProvider level. ' +
         'Returns technical name, description, the formula both as a rendered string and as a ' +
-        'structured tree (formula_tree) that bw_create_ckf and bw_update_ckf take back unchanged, metadata, ' +
-        'and the full dependency graph of referenced CKF/RKF sub-components.',
+        'structured tree (formula_tree) that bw_create_ckf and bw_update_ckf take back unchanged, the ' +
+        'exception aggregation of the CKF (null for standard aggregation; same shape the write tools take), ' +
+        'metadata, and the full dependency graph of referenced CKF/RKF sub-components.',
       inputSchema: {
         type: 'object',
         properties: {
@@ -3376,6 +3580,17 @@ const TOOL_DEFINITIONS = [
           description: { type: 'string', description: 'Description of the CKF.' },
           formula: { type: 'object', description: "Formula tree. A node is one of: {\"type\":\"operator\",\"code\":\"+\",\"operands\":[...]} (codes as in the BW formula editor: + - * / , NDIV0, IF, MAX, %A, …); {\"type\":\"component\",\"component_name\":\"...\"} for a reusable CKF/RKF; {\"type\":\"key_figure\",\"name\":\"...\"} for a basic key figure InfoObject; {\"type\":\"constant\",\"value\":100}. Operand counts are checked against the operator catalog before anything is written." },
           decimals: { type: 'integer', description: 'Number of decimal places (0-9). Server default when omitted.' },
+          exception_aggregation: {
+            type: 'object',
+            description:
+              'Exception aggregation of the CKF itself, e.g. { "type": "SUM", "reference_characteristic": ' +
+              '"IOBJ_NAME" }. Needed for a weighted average: a helper CKF "unit value * quantity" with SUM over ' +
+              'the finest characteristic, divided by the quantity in a second CKF. Without it the product is ' +
+              'formed from values already summed up — numerically plausible and wrong. Standard aggregation ' +
+              'when omitted.',
+            properties: EXCEPTION_AGGREGATION_PROPS,
+            required: ['type'],
+          },
           info_area: { type: 'string', description: 'InfoArea the CKF is filed under.' },
           package: { type: 'string', description: 'Development package (default "$TMP").' },
           transport_request: { type: 'string', description: 'Transport request to record the CKF in.' },
@@ -3401,6 +3616,14 @@ const TOOL_DEFINITIONS = [
             description: 'Replacement formula tree (mutually exclusive with "operations"). ' + "Formula tree. A node is one of: {\"type\":\"operator\",\"code\":\"+\",\"operands\":[...]} (codes as in the BW formula editor: + - * / , NDIV0, IF, MAX, %A, …); {\"type\":\"component\",\"component_name\":\"...\"} for a reusable CKF/RKF; {\"type\":\"key_figure\",\"name\":\"...\"} for a basic key figure InfoObject; {\"type\":\"constant\",\"value\":100}. Operand counts are checked against the operator catalog before anything is written.",
           },
           decimals: { type: 'integer', description: 'Number of decimal places (0-9).' },
+          exception_aggregation: {
+            description:
+              'Exception aggregation of the CKF itself, e.g. { "type": "SUM", "reference_characteristic": ' +
+              '"IOBJ_NAME" }, or false (null is accepted too) to return to standard aggregation. Independent ' +
+              'of "formula" / "operations": the formula stays as it is. Takes back unchanged what bw_get_ckf ' +
+              'reports in exception_aggregation.',
+            properties: EXCEPTION_AGGREGATION_PROPS,
+          },
           operations: {
             type: 'array',
             description: 'Targeted edits on the existing formula, applied in order.',
@@ -3545,7 +3768,8 @@ const TOOL_DEFINITIONS = [
                   description:
                     'add_member: insert a member showing component_name or key_figure. remove_member / ' +
                     'set_member_properties: act on an existing member, matched by member_id, description ' +
-                    'or component_name.',
+                    'or component_name. set_member_properties changes properties, moves the member ' +
+                    '(position / parent), or both — at least one of the three is required.',
                 },
                 component_name: { type: 'string', description: 'Reusable CKF/RKF the member shows, or matches on.' },
                 key_figure: { type: 'string', description: 'Basic key figure the member shows (add_member).' },
@@ -3553,10 +3777,24 @@ const TOOL_DEFINITIONS = [
                 description: { type: 'string', description: 'Member text (set on add, matches on the others).' },
                 properties: {
                   type: 'object',
-                  description: 'Display and planning properties. Only the fields given are changed.',
+                  description:
+                    'Display and planning properties. Only the fields given are changed. Optional on ' +
+                    'set_member_properties when position or parent is given.',
                 },
-                parent: { type: 'string', description: 'Nest the new member under this one, by id or description.' },
-                position: { type: 'integer', description: 'Position among the siblings (0-based). Appends when omitted.' },
+                parent: {
+                  type: 'string',
+                  description:
+                    'Parent member, by id or description. add_member: nest the new member under it. ' +
+                    'set_member_properties: move the member under it; an empty string moves it to the top ' +
+                    'level; omitted, the member keeps its current parent.',
+                },
+                position: {
+                  type: 'integer',
+                  description:
+                    'Position among the siblings (0-based). add_member: appends when omitted. ' +
+                    'set_member_properties: moves the member to this position among its (new) siblings; ' +
+                    'with only parent given, it goes last.',
+                },
               },
               required: ['action'],
             },
@@ -5040,6 +5278,7 @@ async function handleToolCall(
           args?.object_type as string,
           args?.object_name as string,
           args?.source_system as string | undefined,
+          (await ensurePlatform(client)).platform,
         );
         break;
 
@@ -5255,6 +5494,7 @@ async function handleToolCall(
           args?.transport as string | undefined,
           args?.additional_source_fields as string[] | undefined,
           args?.unit_source_field as string | undefined,
+          args?.conversion as RuleConversion | undefined,
         );
         break;
 
@@ -5418,7 +5658,8 @@ async function handleToolCall(
           client,
           args?.target as string,
           args?.target_type as string | undefined ?? 'ADSO',
-          args?.storage as string | undefined ?? 'AQ,AX,AT',
+          args?.storage as string | undefined ??
+            defaultRequestStorages(args?.target_type as string | undefined ?? 'ADSO'),
           args?.status as string | undefined ?? 'N,GG,GR,YG,RR,YR,RG,U,Y,X',
           args?.top as number | undefined ?? 3,
           args?.created_from as string | undefined,
@@ -5617,6 +5858,10 @@ async function handleToolCall(
 
       case 'bw_update_query_settings':
         text = await bwUpdateQuerySettings(client, args as unknown as UpdateQuerySettingsArgs);
+        break;
+
+      case 'bw_update_query_cells':
+        text = await bwUpdateQueryCells(client, args as unknown as UpdateQueryCellsArgs);
         break;
 
       case 'bw_update_query_characteristic':

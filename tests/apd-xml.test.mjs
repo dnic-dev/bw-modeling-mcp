@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { parseApdXml, orderApdNodes } from '../dist/tools/metadata_apd.js';
+import { parseApdXml, orderApdNodes, renderRules } from '../dist/tools/metadata_apd.js';
 
 // The whole definition of an analysis process is one XML document in RSANT_PROCESS.XML. The
 // nodes are its tags, the edges sit in a separate <MAPPINGS> block, and the order the nodes
@@ -97,4 +97,49 @@ test('a document without mappings still yields its nodes', () => {
   assert.equal(nodes.length, 4);
   assert.deepEqual(edges, []);
   assert.equal(orderApdNodes(nodes, edges).cyclic.length, 0);
+});
+
+// A mapping with a body carries the field rules of its edge. Constants matter most: a target
+// key field that no copy reaches is filled by one, and without them the reader cannot tell
+// which version an analysis process writes.
+const WITH_RULES = `<ANALYSIS_PROCESS NAME="NEW_ANALYSIS">
+ <MAPPINGS>
+  <MAPPING NAME="MAPPING1" TEXT="Feldzuordnung 1" SOURCE="DS_QUERY1" TARGET="DST_ROUTINE1"/>
+  <MAPPING NAME="MAPPING2" TEXT="Feldzuordnung 2" SOURCE="DST_ROUTINE1" TARGET="DT_ODS1">
+   <RULES>
+    <MR_COPY NAME="MR_COPY1" TEXT="Regel kopieren 1" SOURCE="/BIC/FIELD_A" TARGET="FIELD_A"/>
+    <MR_CONST NAME="MR_CONST1" TEXT="Konstante setzen 1" TARGET="VERSION_FIELD" VALUE="001"/>
+    <MR_COPY NAME="MR_COPY2" TEXT="Regel kopieren 2" SOURCE="KYF_0001" TARGET="AMOUNT"/>
+   </RULES>
+  </MAPPING>
+ </MAPPINGS>
+ <NODES>
+  <DS_QUERY NAME="DS_QUERY1" REPORT_ID="IPROV/QUERY1"/>
+  <DST_ROUTINE NAME="DST_ROUTINE1" CODE=""/>
+  <DT_ODS NAME="DT_ODS1" ODS="ZTARGET"/>
+ </NODES>
+</ANALYSIS_PROCESS>`;
+
+test('the field rules of an edge are read from the body of its mapping', () => {
+  const { edges } = parseApdXml(WITH_RULES);
+  assert.equal(edges.length, 2, 'a mapping with a body is still one edge');
+  const [plain, withRules] = edges;
+  assert.deepEqual(plain.rules, []);
+  assert.deepEqual(withRules.rules, [
+    { type: 'MR_COPY', source: '/BIC/FIELD_A', target: 'FIELD_A', value: undefined },
+    { type: 'MR_CONST', source: '', target: 'VERSION_FIELD', value: '001' },
+    { type: 'MR_COPY', source: 'KYF_0001', target: 'AMOUNT', value: undefined },
+  ]);
+});
+
+test('constants are rendered first, and an unknown rule type keeps its tag', () => {
+  const lines = renderRules(
+    [
+      { type: 'MR_COPY', source: 'A', target: 'B' },
+      { type: 'MR_CONST', source: '', target: 'VERSION_FIELD', value: '001' },
+      { type: 'MR_OTHER', source: 'C', target: 'D' },
+    ],
+    '',
+  );
+  assert.deepEqual(lines, ["VERSION_FIELD = '001'   (constant)", 'A → B', 'C → D   (MR_OTHER)']);
 });

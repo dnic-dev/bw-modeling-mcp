@@ -1,6 +1,6 @@
 import { XMLParser } from 'fast-xml-parser';
 import { BwClient, bwSeg, stripInfoAreaSentinel } from '../bw-client.js';
-import { ckfAccept, rkfAccept, structureAccept, variableAccept } from './query.js';
+import { ckfAccept, rkfAccept, structureAccept, variableAccept, parseExceptionAggregation } from './query.js';
 
 // ── XML Parser ───────────────────────────────────────────────────────────────
 
@@ -11,6 +11,7 @@ const ALWAYS_ARRAY = new Set([
   'Qry:members',
   'Qry:childMembers',
   'Qry:childToken',
+  'Qry:referenceCharacteristic',
   'atom:link',
 ]);
 
@@ -241,6 +242,7 @@ export async function bwGetCkf(client: BwClient, componentName: string): Promise
   const formulaToken = formulaDef?.['Qry:formulaToken'] as Record<string, unknown> | undefined;
   const formula = formulaToken ? renderFormula(formulaToken, ckfMap, rkfMap, new Map()) : '';
   const formulaTree = formulaToken ? formulaToTree(formulaToken, ckfMap, rkfMap) : null;
+  const exceptionAggregation = parseExceptionAggregation(member);
 
   const dependencies = buildDependencies(subComponents);
 
@@ -254,6 +256,8 @@ export async function bwGetCkf(client: BwClient, componentName: string): Promise
       ...extractMetadata(mainComp),
       formula,
       formula_tree: formulaTree,
+      // null rather than absent, so "standard aggregation" is a stated fact and not a gap.
+      exception_aggregation: exceptionAggregation ?? null,
       dependency_count: dependencies.length,
       dependencies,
     },

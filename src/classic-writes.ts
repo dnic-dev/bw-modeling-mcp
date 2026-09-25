@@ -46,6 +46,7 @@ export const CLASSIC_WRITE_STATUS: Record<string, ClassicWriteStatus> = {
   bw_update_query_key_figures: { verdict: 'verified' },
   bw_update_query_characteristic: { verdict: 'verified' },
   bw_update_query_settings: { verdict: 'verified' },
+  bw_update_query_cells: { verdict: 'verified', note: 'reference, formula and help cells; decimals and scaling with their priorities' },
   bw_create_variable: { verdict: 'verified' },
   bw_update_variable: { verdict: 'verified' },
   bw_create_rkf: { verdict: 'verified' },

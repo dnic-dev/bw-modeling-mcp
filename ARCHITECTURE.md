@@ -31,9 +31,11 @@ The token is fetched once at startup and reused for all subsequent write operati
 
 **Cookie mode (BW Bridge / SAML- or OAuth-fronted systems):** When `BW_COOKIE_FILE` is set, the client authenticates with cookies exported from an authenticated browser session instead of Basic Auth (`BW_USER` / `BW_PASSWORD` become optional). The cookie file is read in Netscape format (7 tab-separated fields) or as simple `name=value` lines. In this mode the stateful headers (`sap-client`, `X-sap-adt-sessiontype: stateful`) are not sent as defaults — BW Bridge rejects stateful requests with HTTP 401 when no backend session exists on the targeted app instance. Cookies loaded from the file are "frozen" and never overwritten by `Set-Cookie` responses. When the session expires, refresh the cookies in `BW_COOKIE_FILE` and restart the server.
 
+**A short dump ends the session context.** A request answered with HTTP 500 has usually dumped, and the dump ends the stateful context on the server without saying so: the next request carrying the same `sap-contextid` hangs and fails as well on a classic release, or is answered "400 Session Timed Out" on BW/4HANA. `BwClient.get` therefore drops `sap-contextid` after an HTTP 500, and the next request opens a fresh context under the same logon. Nothing held in the old context survives the dump, a lock included, so nothing is lost. The search service is where this shows: it answers a type filter it does not support with a dump, and `bw_search` falls back to an unfiltered search in the fresh context.
+
 **Important:** Lock and write operations on the same object must use separate `BwClient` instances (separate `sap-contextid` session cookies). SAP's internal buffer caches object state per session — reusing the same session for both Lock and PUT causes null pointer crashes in the ABAP backend (`CL_RSTRAN_TRFN=>GET_PROGID`). This is not documented in the API — discovered via ABAP debugging.
 
-**Central hosting (SAP BTP Cloud Foundry):** The HTTP transport (`src/http.ts`) puts XSUAA OAuth in front and a BTP destination behind. XSUAA authenticates each caller and carries the `read` / `analyst` / `write` scopes (`src/scopes.ts`, which also filters `tools/list` per role). `analyst` is a strict subset of `read`: it exists to hand a business user a fourteen-tool client rather than a hundred-tool one, not to narrow anyone's permissions, so adding it took nothing away from a reader. A tool therefore carries the *set* of scopes that admit it rather than one required scope, and `write` admits everything. A second, independent filter decides what the *system* can answer rather than what the caller may invoke (`src/platform.ts`): the platform is detected once per process from `bw.b4hanamode` and the discovery document, and a tool is offered only where the resource behind it exists. `BW_PLATFORM` overrides the verdict; see `docs/BW75-SUPPORT.md`. The destination (`src/destination.ts`) decides the BW identity: with `BasicAuthentication` all callers share one technical user; with `PrincipalPropagation` each caller reaches BW as themselves via a short-lived X.509 certificate issued by the Cloud Connector and mapped to an ABAP user by CERTRULE. The server is stateless — a fresh `BwClient` per request, held in an `AsyncLocalStorage` (`src/request-context.ts`) so concurrent users never share a session. stdio (`src/stdio.ts`) is unaffected: one process, one user, no auth. Setup: `docs/CENTRAL-HOSTING-SETUP.md` and `docs/CLOUD-FOUNDRY.md`.
+**Central hosting (SAP BTP Cloud Foundry):** The HTTP transport (`src/http.ts`) puts XSUAA OAuth in front and a BTP destination behind. XSUAA authenticates each caller and carries the `read` / `analyst` / `write` scopes (`src/scopes.ts`, which also filters `tools/list` per role). `analyst` is a strict subset of `read`: it exists to hand a business user a fourteen-tool client rather than a hundred-tool one, not to narrow anyone's permissions, so adding it took nothing away from a reader. A tool therefore carries the *set* of scopes that admit it rather than one required scope, and `write` admits everything. A second, independent filter decides what the *system* can answer rather than what the caller may invoke (`src/platform.ts`): the platform is detected once per process from `bw.b4hanamode` and the discovery document, and a tool is offered only where the resource behind it exists. `BW_PLATFORM` overrides the verdict; see [Platform Detection & Tool Surface](#platform-detection--tool-surface). The destination (`src/destination.ts`) decides the BW identity: with `BasicAuthentication` all callers share one technical user; with `PrincipalPropagation` each caller reaches BW as themselves via a short-lived X.509 certificate issued by the Cloud Connector and mapped to an ABAP user by CERTRULE. The server is stateless — a fresh `BwClient` per request, held in an `AsyncLocalStorage` (`src/request-context.ts`) so concurrent users never share a session. stdio (`src/stdio.ts`) is unaffected: one process, one user, no auth. Setup: `docs/CENTRAL-HOSTING-SETUP.md` and `docs/CLOUD-FOUNDRY.md`.
 
 Everything that talks to BW goes through `BwClient`, including the `raw*` helpers and the Push API. The proxy transport and the `Proxy-Authorization` header (plus an optional `SAP-Connectivity-SCC-Location_ID`) are attached by the client's interceptor, so any call path that builds its own `axios` instance silently loses them and tries to resolve the virtual destination host itself.
 
@@ -88,6 +90,36 @@ GET /sap/bw/modeling/discovery
 ```
 
 This returns a self-describing service document with all available workspaces, object types, and their required media types. The server filters out `+json` variants where XML is required (e.g. for Lock endpoints).
+
+The discovered versions override the hardcoded media type defaults in both directions: a backend that serves an older resource version than the default rejects the higher one with HTTP 415, so downgrades are applied as well. The reconciliation keys on the collection name in the discovery document, and that name is not stable across releases — a classic system publishes InfoObjects as `infoobject` where BW/4HANA publishes them as `iobj`. The client maps the two spellings onto each other; without the mapping the discovered version would be filed under a key nothing looks up, and every InfoObject write would fail at the lock with HTTP 415 while the reads went through, because the read path sends a list of versions rather than one.
+
+---
+
+## Platform Detection & Tool Surface
+
+Two independent filters decide what `tools/list` offers: the scope filter (what the caller may invoke, `src/scopes.ts`) and the platform filter (what the system can answer, `src/platform.ts`). This section is the second one. What it means for a user of a classic release is in `bw75/BW75-SUPPORT.md`; this is how it works.
+
+**Detection.** `bw.b4hanamode` from `repo/is/systeminfo` states the platform (`STRICT` is BW/4HANA, `STANDARD` a classic release), and the discovery document lists the collections the system publishes. Both are read once per process, before the first tool call, and cached at module level because the HTTP transport builds a fresh `Server` per request. Detection never fails closed: a system that cannot be identified gets the full tool surface and a logged warning, because an empty server would be the worse failure.
+
+**Filter.** A tool that addresses a `/sap/bw/modeling` collection is offered exactly where that collection is published, so the system itself decides rather than a hardcoded release list. The `/sap/bw4/…` APIs and the monitoring OData services are not in the discovery document; those follow the platform verdict. A hidden tool that is called anyway — a client with a cached tool list, or one connected to several instances — is answered with the reason instead of a request to BW.
+
+**Substitute routes.** Hiding a tool leaves the model with the question but without the route: `bw_get_transformation` is gone, and nothing says the same content is in the metadata tables. `CLASSIC_SUBSTITUTE` in `platform.ts` maps every hidden read to the call that answers the same question (`bw_read_metadata_tables` with an object type, or `bw_xref`). The route is named in the message a stale client gets and in the server instructions at handshake time, narrowed to the tools this particular system hides. Extending it is one line per tool: teach `bw_read_metadata_tables` the object type, add the substitute entry, remove the tool from the catalog if it should become visible again.
+
+**One route per backend.** Hidden tools are not rerouted behind their own description. The REST API and the metadata tables are different backends — the second is direct table access through ADT DataPreview — and keeping them in separate tools keeps that boundary where it can be governed: an installation that does not grant ADT simply does not offer `bw_read_metadata_tables`.
+
+One exception, an addition rather than a switch: on a classic release `bw_xref` on a provider adds the analysis processes that write to or read from it, from `RSANT_PROCESSI` (`ASC_TYPE` 004 "sends data to", 005 "receives data from"). The backend's where-used index leaves them out, and no release has a REST route to them, so without the addition a DSO filled by an analysis process has no visible origin. The REST answer stays complete on its own, both tools sit under the same `read` scope, BW/4HANA (which has no analysis processes) is never queried, and a failed table read — no ADT authorization, service inactive — is reported as one line instead of failing the call. Direction for transformations and DTPs comes from their titles in the same where-used feed, which have the same format on both platforms.
+
+**Write status.** `src/classic-writes.ts` records the verdict of every write tool on a classic release (verified, blocked, untested) and `bw_system_profile` prints it, so the tool surface and the statement about it cannot drift apart.
+
+**ICF error page.** A 404 whose body is the HTML "Logon Error Message" page is replaced by the sentence it means, naming the path and the route that works instead. ADT exception documents pass through unchanged, because callers parse them.
+
+**`BW_PLATFORM`** overrides the verdict (`auto` by default):
+
+| Value | Effect |
+|---|---|
+| `auto` | detect; if detection fails, offer the full surface and log a warning |
+| `classic` | force the classic verdict, even when detection failed — for a 7.5 system the server cannot reach for detection |
+| `bw4` | switch the platform filter off entirely — the escape hatch if a tool is hidden that does work on your system |
 
 ---
 
@@ -144,6 +176,10 @@ src/
     ├── metadata_apd.ts   # the ANPR reader behind bw_read_metadata_tables: the analysis
     │                     # process XML in RSANT_PROCESS, parsed into nodes and edges and
     │                     # sorted into execution order; node-type catalogue by XML tag
+    ├── metadata_infopackage.ts # the ISIP reader behind bw_read_metadata_tables: header
+    │                     # (RSLDPIO), settings and selections (RSLDPSEL, named columns only —
+    │                     # the table holds a password), routines (RSLDPRULE), chain usage
+    │                     # (RSPCCHAIN) and load history (RSREQDONE + RSSELDONE)
     ├── metadata_chainlog.ts # the RSPCLOG reader behind bw_read_metadata_tables: run
     │                     # history (RSPCLOGCHAIN), the steps of one run (RSPCPROCESSLOG)
     │                     # and the last status per chain for a name pattern
@@ -182,6 +218,8 @@ src/
     │                     # bw_update_query_key_figures, bw_update_query_settings
     ├── query_characteristic.ts # bw_update_query_characteristic — per-characteristic display and
     │                     # access properties of the rows/columns/free areas
+    ├── query_cells.ts    # bw_update_query_cells — reference, formula and help cells of a query
+    │                     # with two structures (Qry:gridCells / Qry:helpCells)
     ├── reporting.ts      # bw_query_data, bw_get_filter_values — BICS reporting endpoint (/sap/bw/modeling/comp/reporting)
     ├── remodeling.ts     # bw_list_remodeling_requests, bw_get_remodeling_request,
     │                     # bw_run_remodeling — remodeling monitor via the bw4 manage API
@@ -225,6 +263,7 @@ system serves a lower resource version than the fallback.
 | InfoSource | `/sap/bw/modeling/trcs/{trcsnm}` | `trcs-v1_0_0+xml` |
 | Transformation | `/sap/bw/modeling/trfn/{trfnnm}` | `trfn-v1_0_0+xml` |
 | Transformation Formula Tokens | `/sap/bw/modeling/trfn/formula/tokens` | `trfn.formulatokens-v1_0_0+xml` |
+| Currency/Unit Conversion Types | `/sap/bw/modeling/comp/conv?template=TRFN` | `application/xml` |
 | DataSource | `/sap/bw/modeling/rsds/{datasource}/{logsys}` | `rsds-v1_1_0+xml` |
 | Aggregation Level | `/sap/bw/modeling/alvl/{alvlnm}` | `alvl-v1_0_0+xml` |
 | Semantic Group | `/sap/bw/modeling/segr/{segrnm}` | `segr-v1_0_0+xml` |

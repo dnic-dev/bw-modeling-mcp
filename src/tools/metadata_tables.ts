@@ -1,4 +1,5 @@
 import { BwClient, MEDIA_TYPES, bwSeg } from '../bw-client.js';
+import { fetchDtpFilter, HELPER_PATH, type DtpFilter } from '../helper.js';
 import {
   queryTable,
   sqlLiteral,
@@ -21,6 +22,7 @@ import {
 } from './metadata_planning.js';
 import { readChainLog } from './metadata_chainlog.js';
 import { readAnalysisProcess } from './metadata_apd.js';
+import { readInfoPackage } from './metadata_infopackage.js';
 
 /**
  * Read BW object definitions straight from their metadata tables, through the ADT
@@ -456,14 +458,71 @@ async function readDtp(client: BwClient, dtpName: string): Promise<string> {
   out.push(`Last changed: ${header.TIMESTMP} by ${header.TSTPNM}`);
 
   out.push('');
-  out.push('NOTE: filter selections, filter routines and the semantic group are NOT readable this');
-  out.push('way. They are stored as a serialised ABAP object in RSBKCMD-TPL_INSTANCE, not in');
-  out.push('relational columns — every RSBK selection table (RSBKSELECT, RSBKDATAPAKSEL, RSSELDTP)');
-  out.push('is request scope, i.e. runtime. Reading them needs ABAP deserialisation; use the SAP GUI');
-  out.push('or the REST endpoint on a system that publishes one. Package size likewise comes from');
-  out.push('the runtime default rather than the definition.');
+  const filter = await fetchDtpFilter(client, dtpName);
+  if (filter.kind === 'ok') {
+    out.push(...renderDtpFilter(filter.filter));
+  } else {
+    if (filter.kind === 'failed') {
+      // Installed and did not answer is a different situation from not installed, and the
+      // note below would otherwise describe it wrongly.
+      out.push(`The helper endpoint ${HELPER_PATH} is installed but did not answer for this`);
+      out.push(`object: ${filter.reason}`);
+      out.push('');
+    }
+    out.push('NOTE: filter selections, filter routines, the semantic group and the package sizes of');
+    out.push('the definition are NOT readable this way. They are stored as a serialised ABAP object');
+    out.push('in RSBKCMD-TPL_INSTANCE, not in relational columns — every RSBK selection table');
+    out.push('(RSBKSELECT, RSBKDATAPAKSEL, RSSELDTP) is request scope, i.e. runtime, and shows what a');
+    out.push('past load ran with rather than the definition. Reading them needs ABAP deserialisation:');
+    out.push('use the SAP GUI, the REST endpoint on a system that publishes one, or install the');
+    out.push('optional helper endpoint described in bw75/README.md.');
+  }
 
   return out.join('\n');
+}
+
+/**
+ * The filter as the helper endpoint reports it.
+ *
+ * Two things are worth keeping apart here and are easy to confuse: a selection with a fixed
+ * value, and a field whose value a routine computes at run time. Only the second explains why
+ * a load selected what it selected, which is the whole reason this section exists — a
+ * request's selection values show the result, never the rule that produced them.
+ */
+function renderDtpFilter(f: DtpFilter): string[] {
+  const out: string[] = ['── Filter ──'];
+
+  if (!f.selections.length && !f.dynamic.length) {
+    out.push('  no filter set');
+  }
+  for (const s of f.selections) {
+    const range = s.high ? `${s.low} .. ${s.high}` : s.low;
+    out.push(`  ${s.field.padEnd(22)} ${s.sign} ${s.option} ${range}`);
+  }
+  for (const d of f.dynamic) {
+    const by = d.sel_routine
+      ? `routine "${d.sel_routine}"`
+      : d.bex_variable
+        ? `BEx variable ${d.bex_variable}`
+        : `selection type ${d.sel_type}`;
+    out.push(`  ${d.field.padEnd(22)} filled at run time by ${by}`);
+  }
+
+  for (const r of f.routines) {
+    out.push('');
+    // The entry without a field carries the declaration part shared by the routine.
+    const scope = r.field ? `field ${r.field}` : 'declaration part';
+    out.push(`  Routine "${r.sel_routine}" — ${scope}, code id ${r.codeid}, ${r.line_count} lines:`);
+    for (const line of r.source.split('\n')) out.push(`    ${line}`);
+  }
+
+  out.push('');
+  out.push(`  Package size:   min ${f.min_size}, max ${f.max_size}`);
+  out.push(`  Semantic group: ${f.semantic_groups.length ? JSON.stringify(f.semantic_groups) : 'none'}`);
+  out.push('');
+  out.push(`Filter source: helper endpoint ${HELPER_PATH} (the metadata tables cannot answer this)`);
+
+  return out;
 }
 
 // ── Classic DSO (ODSO) ──────────────────────────────────────────────────────
@@ -503,6 +562,60 @@ async function readAdso(client: BwClient, adsoName: string): Promise<string> {
   return [...out, ...section].join('\n');
 }
 
+// ── Provider type lookup ────────────────────────────────────────────────────
+
+/**
+ * Where each provider type keeps its active definitions. A table missing on a release (the
+ * aDSO and CompositeProvider tables before 7.4) fails its lookup, which then finds nothing.
+ */
+const PROVIDER_TABLES: { table: string; key: string; typeOf: (row: Row) => string; extra?: string }[] = [
+  { table: 'rsdcube', key: 'infocube', extra: ', cubetype', typeOf: (r) => (r.CUBETYPE === 'M' ? 'MPRO' : 'CUBE') },
+  { table: 'rsdodso', key: 'odsobject', typeOf: () => 'ODSO' },
+  { table: 'rsoadso', key: 'adsonm', typeOf: () => 'ADSO' },
+  { table: 'rsohcpr', key: 'hcprnm', typeOf: () => 'HCPR' },
+  { table: 'rsdiobj', key: 'iobjnm', typeOf: () => 'IOBJ' },
+];
+
+/**
+ * The TLOGO of each provider name, from whichever definition table holds it actively.
+ *
+ * A MultiProvider records its parts by name alone, and the name says nothing about the type:
+ * reading a DSO part as an InfoCube answers "not found". Unresolved names are absent.
+ */
+export async function providerTypes(client: BwClient, names: string[]): Promise<Map<string, string>> {
+  const types = new Map<string, string>();
+  const unique = [...new Set(names.map((n) => n.trim().toUpperCase()).filter(Boolean))];
+  for (const { table, key, extra, typeOf } of PROVIDER_TABLES) {
+    const open = unique.filter((n) => !types.has(n));
+    if (open.length === 0) break;
+    for (const batch of inListBatches(open, 150)) {
+      try {
+        const rows = await queryTable(
+          client,
+          `SELECT ${key}${extra ?? ''} FROM ${table} WHERE objvers = 'A' AND ${key} IN (${batch})`,
+          500,
+        );
+        for (const r of rows) types.set(r[key.toUpperCase()], typeOf(r));
+      } catch {
+        // The table does not exist on this release; the names stay open for the next one.
+      }
+    }
+  }
+  return types;
+}
+
+/** What to say when a provider is not where it was looked for, but exists as another type. */
+async function otherTypeHint(client: BwClient, name: string, askedAs: string[]): Promise<string> {
+  const found = (await providerTypes(client, [name])).get(name.trim().toUpperCase());
+  if (!found || askedAs.includes(found)) return '';
+  const how =
+    found === 'ADSO' ? 'bw_get_adso (structure) or object_type="ADSO" (load history)' :
+    found === 'HCPR' ? 'bw_get_composite_provider' :
+    found === 'IOBJ' ? 'bw_get_infoobject' :
+    `object_type="${found}"`;
+  return ` ${name.trim().toUpperCase()} exists as ${found} — read it with ${how}.`;
+}
+
 async function readOdso(client: BwClient, odsoName: string): Promise<string> {
   const name = sqlLiteral(odsoName.trim().toUpperCase());
   const scope = `odsobject = '${name}' AND objvers = 'A'`;
@@ -530,7 +643,12 @@ async function readOdso(client: BwClient, odsoName: string): Promise<string> {
     ),
   ]);
 
-  if (!head) return `Classic DSO ${odsoName} not found (no active version in RSDODSO).`;
+  if (!head) {
+    return (
+      `Classic DSO ${odsoName} not found (no active version in RSDODSO).` +
+      (await otherTypeHint(client, odsoName, ['ODSO']))
+    );
+  }
 
   const out: string[] = [];
   out.push(`Classic DSO: ${head.ODSOBJECT}`);
@@ -611,7 +729,12 @@ async function readCube(client: BwClient, cubeName: string): Promise<string> {
     queryTable(client, `SELECT dimension, posit, iobjnm FROM rsddimeiobj WHERE ${scope}`, 2000),
   ]);
 
-  if (!head) return `InfoProvider ${cubeName} not found (no active version in RSDCUBE).`;
+  if (!head) {
+    return (
+      `InfoProvider ${cubeName} not found (no active version in RSDCUBE).` +
+      (await otherTypeHint(client, cubeName, ['CUBE', 'MPRO']))
+    );
+  }
 
   const isMulti = head.CUBETYPE === 'M';
   const out: string[] = [];
@@ -632,9 +755,14 @@ async function readCube(client: BwClient, cubeName: string): Promise<string> {
       `SELECT posit, partcube FROM rsdcubemulti WHERE ${scope} ORDER BY posit ASCENDING`,
       200,
     );
+    const partTypes = await providerTypes(client, parts.map((p) => p.PARTCUBE));
     out.push('');
     out.push(`── Part Providers (${parts.length}) ──`);
-    for (const p of parts) out.push(`  ${String(Number(p.POSIT)).padStart(3)}  ${p.PARTCUBE}`);
+    for (const p of parts) {
+      const type = partTypes.get(p.PARTCUBE);
+      out.push(`  ${String(Number(p.POSIT)).padStart(3)}  ${type ?? '????'}  ${p.PARTCUBE}${type ? '' : '   (type not resolved)'}`);
+    }
+    out.push('  Pass the type with the name to bw_xref or bw_read_metadata_tables to follow a part.');
   } else {
     // Dimensions only exist on cubes that physically store data.
     const byDimension = new Map<string, string[]>();
@@ -894,7 +1022,7 @@ async function readProcessChain(client: BwClient, chainName: string): Promise<st
 
 // ── Dispatcher ──────────────────────────────────────────────────────────────
 
-const SUPPORTED = ['TRFN', 'DTPA', 'ADSO', 'ODSO', 'CUBE', 'MPRO', 'RSPC', 'PLSE', 'PLSQ', 'PLCR', 'PLDS', 'RSPCLOG', 'ANPR'];
+const SUPPORTED = ['TRFN', 'DTPA', 'ADSO', 'ODSO', 'CUBE', 'MPRO', 'RSPC', 'PLSE', 'PLSQ', 'PLCR', 'PLDS', 'RSPCLOG', 'ANPR', 'ISIP'];
 
 /**
  * Width of the key column each type is looked up by. A name wider than its column does not
@@ -920,6 +1048,8 @@ const NAME_WIDTHS: Record<string, number> = {
   // RSPC_CHAIN and RSPC_LOGID are both CHAR(25); a pattern is checked before the width is.
   RSPCLOG: 25,
   ANPR: 30,
+  // RSLDPIO-LOGDPID and -OLTPSOURCE, since a DataSource name is accepted too.
+  ISIP: 30,
 };
 
 /**
@@ -973,6 +1103,8 @@ export async function bwReadMetadataTables(
       return readChainLog(client, objectName.trim());
     case 'ANPR':
       return readAnalysisProcess(client, objectName.trim());
+    case 'ISIP':
+      return readInfoPackage(client, objectName.trim());
     default:
       return (
         `Object type "${objectType}" is not supported yet. Supported: ${SUPPORTED.join(', ')}.`

@@ -76,6 +76,13 @@ export function parseDataPreview(xml: string): Row[] {
  * resulting ECONNRESET reaches the caller as a stack trace rather than as an answer
  * (verified: reproducible on a run of consecutive reads, and gone on the next attempt with
  * the same object). One retry, because a genuinely unreachable host must still fail fast.
+ *
+ * Retried once on HTTP 500 as well, which is what a classic release answers when two of
+ * these POSTs are the first calls of a session: with no session cookie yet, both requests
+ * open their own session and one of them loses (verified on a 7.5 system — reproducible on
+ * a cold client, never on one that has run a single statement before). A malformed
+ * statement does not come back this way; the service reports that as HTTP 400 with a
+ * message, so the retry cannot swallow a real SQL error.
  */
 export async function queryTable(client: BwClient, sql: string, maxRows = 500): Promise<Row[]> {
   const run = async (): Promise<string> => {
@@ -101,6 +108,9 @@ export async function queryTable(client: BwClient, sql: string, maxRows = 500): 
       return parseDataPreview(await run());
     }
     if (/ECONNRESET|ECONNABORTED|EPIPE|socket hang up/i.test(message)) {
+      return parseDataPreview(await run());
+    }
+    if (/HTTP 500/.test(message)) {
       return parseDataPreview(await run());
     }
     throw err;

@@ -15,7 +15,10 @@ import {
   allocateVirtualId,
   buildRestrictionGroups,
   descriptionEl,
+  excAggEl,
+  normalizeExceptionAggregation,
   walkMembers,
+  type ExceptionAggregation,
   type FormulaNode,
   type MemberProperties,
   type KeyFigureRestriction,
@@ -124,7 +127,7 @@ async function withElementDocument(
   componentName: string,
   mutate: (xml: string) => string,
   corrNr?: string
-): Promise<{ messages: string[]; document: string }> {
+): Promise<{ messages: string[]; document: string; unchanged?: boolean }> {
   const nameLower = componentName.toLowerCase();
   const path = `/sap/bw/modeling/${resource}/${bwSeg(nameLower)}/a`;
   const accept = acceptFor(resource);
@@ -134,6 +137,11 @@ async function withElementDocument(
   if (!timestamp) {
     throw new Error(`No timestamp header on GET ${path} — cannot do optimistic locking.`);
   }
+
+  // A save of an unchanged document is not free: it records the whole component,
+  // with every element it contains, in the transport request.
+  const mutated = mutate(getResult.body);
+  if (mutated === getResult.body) return { messages: [], document: mutated, unchanged: true };
 
   const lockResponse = await client.rawPost(`${path}?action=lock`, '', {
     Accept: accept,
@@ -147,7 +155,6 @@ async function withElementDocument(
   }
 
   try {
-    const mutated = mutate(getResult.body);
     const client2 = createClientFromEnv();
     const corrNrPrefix = corrNr ? `corrNr=${corrNr}&` : '';
     const putResponse = await client2.rawPut(`${path}?${corrNrPrefix}lockHandle=${lockHandle}`, mutated, {
@@ -334,6 +341,27 @@ export function renderFormulaTree(node: FormulaNode, tag: string): string {
   );
 }
 
+/**
+ * Replace the exception aggregation of the main component's member. The setting must sit
+ * on the CKF itself: a formula that references the CKF computes with the CKF's own
+ * definition, so the same setting on a query member that shows the CKF does not reach it.
+ *
+ * The GET omits the element entirely while the CKF aggregates by its standard behaviour,
+ * so it is inserted where the server writes it — last in the member, after the formula.
+ */
+export function setCkfExceptionAggregation(doc: string, elementXml: string): string {
+  const mainStart = doc.indexOf('<Qry:mainComponent');
+  if (mainStart === -1) throw new Error('Document has no <Qry:mainComponent>.');
+  const memberStart = doc.indexOf('<Qry:member', mainStart);
+  if (memberStart === -1) throw new Error('Document has no <Qry:member> in the main component.');
+  const memberEnd = doc.indexOf('</Qry:member>', memberStart);
+  if (memberEnd === -1) throw new Error('Unterminated <Qry:member> in the main component.');
+  const member = doc.slice(memberStart, memberEnd);
+  const existing = /<Qry:exceptionAggregation\b[^>]*?\/>|<Qry:exceptionAggregation\b[^>]*>[\s\S]*?<\/Qry:exceptionAggregation>/;
+  const next = existing.test(member) ? member.replace(existing, elementXml) : member + elementXml;
+  return doc.slice(0, memberStart) + next + doc.slice(memberEnd);
+}
+
 /** Resolve and render in one step, for callers that only need the XML. */
 async function renderComponentFormula(
   client: BwClient,
@@ -352,6 +380,7 @@ export interface CreateCkfArgs {
   description: string;
   formula: FormulaNode;
   decimals?: number;
+  exception_aggregation?: ExceptionAggregation | false | null;
   info_area?: string;
   package?: string;
   transport_request?: string;
@@ -392,6 +421,8 @@ export async function bwCreateCkf(client: BwClient, args: CreateCkfArgs): Promis
   // Render the formula up front: a failure here must happen before anything is locked.
   const uidCache = new Map<string, string>();
   const formulaXml = await renderComponentFormula(client, args.formula, 'Qry:formulaToken', uidCache);
+  const exceptionAggregation = normalizeExceptionAggregation(args.exception_aggregation);
+  const excAggXml = excAggEl(exceptionAggregation);
 
   // Step 1: compexist — name check + server-generated ELEMUID.
   const existResult = await client.rawGet(
@@ -520,7 +551,7 @@ export async function bwCreateCkf(client: BwClient, args: CreateCkfArgs): Promis
       ${decimalsEl}
       <Qry:mapName>${nameUpper}</Qry:mapName>
       <Qry:formulaDefinition>${formulaXml}</Qry:formulaDefinition>
-      <Qry:exceptionAggregation/>
+      ${excAggXml}
     `;
       let next = doc.slice(0, memberStart) + newMember + doc.slice(memberEnd);
       if (infoAreaEl && !next.includes('<infoArea>')) {
@@ -545,6 +576,7 @@ export async function bwCreateCkf(client: BwClient, args: CreateCkfArgs): Promis
       obj_uri: objUri,
       package: pkg,
       ...(infoArea ? { info_area: infoArea } : {}),
+      ...(exceptionAggregation ? { exception_aggregation: exceptionAggregation } : {}),
       ...(transport ? { transport_request: transport } : {}),
       ...(recorded ? { recorded_in: recorded } : {}),
       consistency_messages: messages,
@@ -581,6 +613,8 @@ export interface UpdateCkfArgs {
   /** Targeted edits on the existing top-level operator. Mutually exclusive with `formula`. */
   operations?: CkfOperandOperation[];
   decimals?: number;
+  /** Set the exception aggregation, or false / null to return to standard aggregation. */
+  exception_aggregation?: ExceptionAggregation | false | null;
   transport_request?: string;
 }
 
@@ -704,12 +738,21 @@ export async function bwUpdateCkf(client: BwClient, args: UpdateCkfArgs): Promis
   if (args.formula && args.operations && args.operations.length > 0) {
     throw new Error('Pass either `formula` (replace) or `operations` (targeted edits), not both.');
   }
-  if (!args.formula && !args.operations?.length && args.description === undefined && args.decimals === undefined) {
-    throw new Error('Nothing to do: pass formula, operations, description, and/or decimals.');
+  if (
+    !args.formula &&
+    !args.operations?.length &&
+    args.description === undefined &&
+    args.decimals === undefined &&
+    args.exception_aggregation === undefined
+  ) {
+    throw new Error('Nothing to do: pass formula, operations, description, decimals, and/or exception_aggregation.');
   }
   if (args.decimals !== undefined && (args.decimals < 0 || args.decimals > 9)) {
     throw new Error('decimals must be between 0 and 9.');
   }
+  const exceptionAggregation =
+    args.exception_aggregation !== undefined ? normalizeExceptionAggregation(args.exception_aggregation) : undefined;
+  const excAggXml = exceptionAggregation !== undefined ? excAggEl(exceptionAggregation) : undefined;
 
   const nameUpper = args.component_name.toUpperCase();
   const uidCache = new Map<string, string>();
@@ -766,6 +809,19 @@ export async function bwUpdateCkf(client: BwClient, args: UpdateCkfArgs): Promis
           .replace(/<Qry:decimals\b[^>]*?\/>/, `<Qry:decimals default="false" number="${args.decimals}"/>`);
         next = head + tail;
         applied.push(`decimals set to ${args.decimals}`);
+      }
+
+      if (excAggXml !== undefined) {
+        next = setCkfExceptionAggregation(next, excAggXml);
+        const ea = exceptionAggregation;
+        applied.push(
+          ea
+            ? `exception aggregation set to ${String(ea.type).toUpperCase()} over ` +
+                (ea.reference_characteristics?.length ? ea.reference_characteristics : [ea.reference_characteristic])
+                  .map((r) => String(r).toUpperCase())
+                  .join(', ')
+            : 'exception aggregation reset to standard aggregation'
+        );
       }
 
       if (replacement !== undefined) {
@@ -1197,7 +1253,8 @@ function insertStructureMember(
   doc: string,
   memberXml: string,
   parent: string | undefined,
-  position: number | undefined
+  position: number | undefined,
+  context = 'add_member'
 ): string {
   const region = structureMembersRegion(doc);
   // walkMembers reports offsets inside the region; everything below is absolute.
@@ -1208,13 +1265,13 @@ function insertStructureMember(
   }));
 
   if (parent) {
-    const target = resolveStructureMember(doc, parent, 'add_member parent');
+    const target = resolveStructureMember(doc, parent, `${context} parent`);
     if (target.full.endsWith('/>')) {
       throw new Error(
-        `add_member: member '${parent}' is empty and cannot take a child member as it stands.`
+        `${context}: member '${parent}' is empty and cannot take a child member as it stands.`
       );
     }
-    const children = all.filter((m) => m.parentId === target.id);
+    const children = all.filter((m) => m.parentId === target.id && m.tag !== 'childFormulas');
     const insertAt =
       position === undefined || position >= children.length
         ? target.end - `</Qry:${target.tag}>`.length
@@ -1227,20 +1284,96 @@ function insertStructureMember(
   return doc.slice(0, insertAt) + memberXml + doc.slice(insertAt);
 }
 
+/** Where a member sits: the member it is nested under, and its index among those siblings. */
+export function structureMemberPlacement(
+  doc: string,
+  memberId: string
+): { parentId?: string; index: number } | undefined {
+  const all = walkMembers(structureMembersRegion(doc).xml);
+  const member = all.find((m) => m.id === memberId);
+  if (!member) return undefined;
+  const siblings = all.filter((m) => m.parentId === member.parentId && m.tag !== 'childFormulas');
+  return { parentId: member.parentId, index: siblings.findIndex((m) => m.id === memberId) };
+}
+
 /**
- * Count the members a saved structure actually holds, read from a fresh session.
+ * Move an existing member to another place in the structure. The display order of a
+ * structure is nothing but the document order of its member elements — every member
+ * carries `flatPosition="0"`, and the modeling tools reorder by writing the elements
+ * in the new order — so a move is cutting the element out and inserting it again.
+ *
+ * `parent` undefined keeps the current parent, an empty string moves the member to
+ * the top level. `position` is the index among the new siblings once the member is
+ * in place; omitted, the member goes last.
+ *
+ * The element name follows the level: a top-level member is `Qry:members`, a nested
+ * one `Qry:childMembers`. A member written under the wrong name is dropped by the
+ * backend on save, so only the outer element is renamed; its own children stay
+ * `childMembers`.
+ */
+export function moveStructureMember(
+  doc: string,
+  memberId: string,
+  parent: string | undefined,
+  position: number | undefined
+): string {
+  const region = structureMembersRegion(doc);
+  const all = walkMembers(region.xml);
+  const member = all.find((m) => m.id === memberId);
+  if (!member) throw new Error(`set_member_properties: no member with id '${memberId}'.`);
+  if (member.tag === 'childFormulas') {
+    throw new Error(
+      `set_member_properties: member '${memberId}' is the inverse formula of its parent and cannot be moved on its own.`
+    );
+  }
+
+  let parentId = member.parentId;
+  if (parent !== undefined) {
+    if (parent === '') {
+      parentId = undefined;
+    } else {
+      const target = resolveStructureMember(doc, parent, 'set_member_properties parent');
+      const inside = target.start >= region.start + member.start && target.end <= region.start + member.end;
+      if (inside) {
+        throw new Error(
+          `set_member_properties: member '${memberId}' cannot be moved under itself or one of its own children.`
+        );
+      }
+      parentId = target.id;
+    }
+  }
+
+  const tag = parentId === undefined ? 'members' : 'childMembers';
+  let xml = member.full;
+  if (member.tag !== tag) {
+    xml = `<Qry:${tag}` + xml.slice(`<Qry:${member.tag}`.length);
+    if (!xml.endsWith('/>')) {
+      xml = xml.slice(0, xml.length - `</Qry:${member.tag}>`.length) + `</Qry:${tag}>`;
+    }
+  }
+
+  const start = region.start + member.start;
+  const without = doc.slice(0, start) + doc.slice(region.start + member.end);
+  return insertStructureMember(without, xml, parentId, position, 'set_member_properties');
+}
+
+/**
+ * Read the members a saved structure actually holds, from a fresh session.
  *
  * The backend drops a member it will not accept and still reports the save as
- * consistent, so "success" alone proves nothing about what was stored — exactly the
- * outcome this issue set out to remove. Counting the result turns a silent loss into
- * an error the caller can act on.
+ * consistent, so "success" alone proves nothing about what was stored. Reading the
+ * result back turns a silent loss into an error the caller can act on.
  */
-async function countStoredMembers(componentName: string): Promise<number> {
+async function readStoredStructure(componentName: string): Promise<string> {
   const { body } = await createClientFromEnv().get(
     `/sap/bw/modeling/structure/${bwSeg(componentName.toLowerCase())}/a?forceCacheUpdate=true`,
     structureAccept()
   );
-  return walkMembers(structureMembersRegion(body).xml).length;
+  return body;
+}
+
+async function countStoredMembers(componentName: string): Promise<number> {
+  return walkMembers(structureMembersRegion(await readStoredStructure(componentName)).xml).length;
 }
 
 /** Resolve one member of a structure by id or description. */
@@ -1467,9 +1600,15 @@ export interface StructureOperation {
   restrictions?: KeyFigureRestriction[];
   /** Display and planning properties (add_member and set_member_properties). */
   properties?: MemberProperties;
-  /** Nest the new member under this one, by member id or description (add_member). */
+  /**
+   * Nest the member under this one, by member id or description. On
+   * set_member_properties it moves the member; an empty string moves it to the top level.
+   */
   parent?: string;
-  /** Position among the siblings (0-based). Appends when omitted. */
+  /**
+   * Position among the siblings (0-based). add_member appends when omitted;
+   * set_member_properties moves the member to it.
+   */
   position?: number;
 }
 
@@ -1501,6 +1640,15 @@ export async function bwUpdateStructure(client: BwClient, args: UpdateStructureA
   // Resolve component references before locking the document.
   const componentRefs: Array<{ uid: string; xml: string } | undefined> = [];
   for (const op of args.operations) {
+    if (op.position !== undefined && (!Number.isInteger(op.position) || op.position < 0)) {
+      throw new Error(`${op.action}: position must be a non-negative integer, got ${op.position}.`);
+    }
+    if (op.action === 'remove_member' && (op.position !== undefined || op.parent !== undefined)) {
+      throw new Error('remove_member takes neither position nor parent.');
+    }
+    if (op.action === 'set_member_properties' && !op.properties && op.position === undefined && op.parent === undefined) {
+      throw new Error('set_member_properties requires properties, position, or parent.');
+    }
     if (op.action === 'add_member') {
       componentRefs.push(await resolveMemberSpec(client, op, componentCache));
     } else if (op.action === 'remove_member' || op.action === 'set_member_properties') {
@@ -1522,7 +1670,9 @@ export async function bwUpdateStructure(client: BwClient, args: UpdateStructureA
   // A member the backend does not accept is dropped silently and the save still
   // reports "consistent", so counting is the only thing that makes that visible.
   let expectedMembers = 0;
-  const { messages, document } = await withElementDocument(
+  const moved = new Set<string>();
+  let finalDocument = '';
+  const { messages, document, unchanged } = await withElementDocument(
     client,
     'structure',
     nameUpper,
@@ -1591,25 +1741,85 @@ export async function bwUpdateStructure(client: BwClient, args: UpdateStructureA
           expectedMembers -= walkMembers(target.full).length;
           applied.push(`member '${target.id}' removed`);
         } else {
-          if (!op.properties) throw new Error('set_member_properties requires properties.');
-          const updated = applyMemberProperties(target.full, op.properties, next);
-          next = next.slice(0, target.start) + updated + next.slice(target.end);
-          applied.push(`properties of member '${target.id}' changed`);
+          if (op.properties) {
+            const updated = applyMemberProperties(target.full, op.properties, next);
+            if (updated !== target.full) {
+              next = next.slice(0, target.start) + updated + next.slice(target.end);
+              applied.push(`properties of member '${target.id}' changed`);
+            } else {
+              applied.push(`properties of member '${target.id}' already as requested`);
+            }
+          }
+          if (op.position !== undefined || op.parent !== undefined) {
+            const before = structureMemberPlacement(next, target.id)!;
+            next = moveStructureMember(next, target.id, op.parent, op.position);
+            const after = structureMemberPlacement(next, target.id)!;
+            moved.add(target.id);
+            const where =
+              `position ${after.index}` + (after.parentId ? ` under '${after.parentId}'` : ' at the top level');
+            applied.push(
+              before.parentId === after.parentId && before.index === after.index
+                ? `member '${target.id}' already at ${where}`
+                : `member '${target.id}' moved from position ${before.index}` +
+                    (before.parentId === after.parentId
+                      ? ''
+                      : before.parentId
+                        ? ` under '${before.parentId}'`
+                        : ' at the top level') +
+                    ` to ${where}`
+            );
+          }
         }
       });
 
+      finalDocument = next;
       return next;
     },
     args.transport_request?.toUpperCase()
   );
 
-  const storedMembers = await countStoredMembers(nameUpper);
+  if (unchanged) {
+    return JSON.stringify(
+      {
+        success: true,
+        changed: false,
+        object_type: 'structure',
+        technical_name: nameUpper,
+        member_count: expectedMembers,
+        applied_operations: applied,
+        message: `Structure '${nameUpper}' already matches the request — nothing was saved or recorded in a transport.`,
+      },
+      null,
+      2
+    );
+  }
+
+  const stored = await readStoredStructure(nameUpper);
+  const storedMembers = walkMembers(structureMembersRegion(stored).xml).length;
   if (storedMembers !== expectedMembers) {
     throw new Error(
       `Structure '${nameUpper}' was saved with ${storedMembers} member(s) but ${expectedMembers} were ` +
         `expected — the backend accepted the save and dropped part of it. The operations applied were: ` +
         `${applied.join('; ')}. Read the structure back before retrying.`
     );
+  }
+
+  // The save reports "consistent" whether or not the order it was sent survived, so a
+  // move counts as done only once the stored document shows the member in place.
+  for (const id of moved) {
+    const wanted = structureMemberPlacement(finalDocument, id);
+    // A member added in the same call is renamed by the backend, and one removed later
+    // in the call has nothing left to check.
+    if (!wanted || id.startsWith('!VIRTUAL-')) continue;
+    const actual = structureMemberPlacement(stored, id);
+    if (!actual || wanted.parentId !== actual.parentId || wanted.index !== actual.index) {
+      const describe = (p?: { parentId?: string; index: number }) =>
+        p ? `position ${p.index} ${p.parentId ? `under '${p.parentId}'` : 'at the top level'}` : 'not found';
+      throw new Error(
+        `Structure '${nameUpper}' was saved, but member '${id}' is stored at ${describe(actual)} instead of ` +
+          `${describe(wanted)}. The operations applied were: ${applied.join('; ')}.`
+      );
+    }
   }
 
   const elemUid = document.match(/<Qry:mainComponent\b[^>]*?\bid="([^"]+)"/)?.[1];

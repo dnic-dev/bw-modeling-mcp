@@ -68,7 +68,7 @@ A maintenance release: the two connectivity fixes that BTP deployments have been
 
 Until now almost every call against a BW 7.5 system failed with HTTP 406, because the 7.5 REST framework looks the `Accept` header up case-sensitively. A small ABAP **post-exit** neutralises that — an enhancement, no modification. With it in place **every REST endpoint that exists on 7.5 is reachable**.
 
-- **📘 [docs/BW75-SUPPORT.md](docs/BW75-SUPPORT.md)** — root cause, the ABAP code, the SE24 setup steps, and what BW 7.5 ships no REST resource for — split into what is reachable another way and what is not
+- **📘 [bw75/BW75-SUPPORT.md](bw75/BW75-SUPPORT.md)** — root cause, the ABAP code, the SE24 setup steps, and what BW 7.5 ships no REST resource for — split into what is reachable another way and what is not
 - **`bw_system_profile`** — one call and the agent knows what it is working on: BW/4HANA or classic BW, which REST endpoint groups the system publishes, and whether the three preconditions hold (`Accept`-header handling, ADT DataPreview access, query reporting). It can then take the route that works on this release — reading a transformation from the metadata tables where there is no REST resource for one — instead of discovering the release through failed calls
 - **`bw_read_metadata_tables`** — reads straight from the metadata tables what the system publishes no REST resource for:
   - **Transformations** — field mappings with their rule types, and the source of the start, end, expert and field routines

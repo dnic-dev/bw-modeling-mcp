@@ -399,7 +399,15 @@ export async function bwActivateRequest(
 // Storage codes that hold activated data. A request in one of these is an activation
 // request, which the delete endpoint rejects ("Request ist kein löschbarer Request") —
 // it has to be rolled back instead, which also removes the load request underneath it.
-const ACTIVATED_STORAGES = new Set(['AT', 'AX']);
+// aDSOs use AT/AX; InfoObjects load straight into their active tables, one storage per
+// subtype (ATAT attributes, ATTE texts, ATHI hierarchies), so every IOBJ request is one.
+function isActivationStorage(storage: string): boolean {
+  return storage === 'AX' || storage.startsWith('AT');
+}
+
+export function defaultRequestStorages(targetType: string): string {
+  return targetType.toUpperCase() === 'IOBJ' ? 'ATAT,ATTE,ATHI' : 'AQ,AX,AT';
+}
 
 interface DeleteResultEntry {
   storage?: string;
@@ -430,7 +438,7 @@ async function listRequestRefs(
     `/sap/bc/http/sap/bw4/v1/manage/requests` +
     `?tlogo=${encodeURIComponent(targetType.toLowerCase())}` +
     `&datatarget=${encodeURIComponent(target.toLowerCase())}` +
-    `&storage=AQ,AX,AT` +
+    `&storage=${defaultRequestStorages(targetType)}` +
     `&latestrequests=${top}&top=${top}` +
     `&status=N,GG,GR,YG,RR,YR,RG,U,Y,X`;
 
@@ -454,11 +462,41 @@ async function rollbackRequest(
   const url =
     `/sap/bc/http/sap/bw4/v1/manage/requests/${encodeURIComponent(ref.tsn)}` +
     `/${ref.storage.toLowerCase()}/rollback`;
-  await client.rawPost(url, '', {
-    'Content-Type': 'application/json',
-    'Accept': '*/*',
-    'x-csrf-token': csrfToken,
-  });
+  try {
+    await client.rawPost(url, '', {
+      'Content-Type': 'application/json',
+      'Accept': '*/*',
+      'x-csrf-token': csrfToken,
+    });
+  } catch (err) {
+    const message = (err as Error).message;
+    if (isMasterDataStorage(ref.storage) && /HTTP 400/.test(message)) {
+      throw new Error(masterDataRefusal(ref, message));
+    }
+    throw err;
+  }
+}
+
+/** The request storages of an InfoObject: attributes, texts, hierarchies. */
+function isMasterDataStorage(storage: string): boolean {
+  return storage === 'ATAT' || storage === 'ATTE' || storage === 'ATHI';
+}
+
+/**
+ * BW refuses a master data request that loaded successfully on both routes — the rollback
+ * ("cannot be rolled back") and the delete endpoint ("not a deletable request"); only a failed
+ * one can be removed (verified on BW/4HANA). Passing the bare HTTP 400 on reads like a defect
+ * of the tool.
+ */
+function masterDataRefusal(ref: RequestRef, backendMessage: string): string {
+  const detail = backendMessage.split('\n').slice(1).join(' ').trim();
+  return (
+    `BW does not remove master data request ${ref.tsn} (${ref.storage})` +
+    (detail ? ` — "${detail}"` : '') +
+    `. A master data load that finished successfully can be neither rolled back nor deleted; ` +
+    `only a failed request can. The master data it wrote stays in the InfoObject. Removing it ` +
+    `takes the master data deletion of the modeling tools, which this server does not offer.`
+  );
 }
 
 /** POST .../manage/requests/delete — batch-delete load requests. */
@@ -487,7 +525,8 @@ async function deleteRequests(
  *
  *   load request (inbound, AQ)      POST .../manage/requests/delete
  *                                   body {asynchronous, requests:[{request, storage}]}
- *   activation request (AT/AX)      POST .../manage/requests/{tsn}/{storage}/rollback
+ *   activation request (AT/AX,      POST .../manage/requests/{tsn}/{storage}/rollback
+ *   every InfoObject storage AT*)
  *
  * Calling the delete endpoint with an activation request answers HTTP 400 "not a deletable
  * request". A rollback undoes the activation of that request AND every later one, and takes
@@ -525,7 +564,7 @@ export async function bwDeleteRequest(
 
   if (!allRequests) {
     const ref: RequestRef = { tsn: requestTsn!, storage: storage.toUpperCase() };
-    if (ACTIVATED_STORAGES.has(ref.storage)) {
+    if (isActivationStorage(ref.storage)) {
       // Snapshot first so the caller learns which requests the cascade took with it.
       const before = target ? await listRequestRefs(client, target, targetType, 50) : [];
       await rollbackRequest(runClient, ref, csrfToken);
@@ -560,27 +599,42 @@ export async function bwDeleteRequest(
       });
     }
 
-    // Oldest first: rolling back the oldest activation cascades through every later one.
+    // Oldest first: rolling back the oldest activation cascades through every later one of
+    // the same storage. An InfoObject keeps one storage per subtype, each with its own chain.
     const activated = refs
-      .filter((r) => ACTIVATED_STORAGES.has(r.storage))
+      .filter((r) => isActivationStorage(r.storage))
       .sort((a, b) => a.tsn.localeCompare(b.tsn));
 
-    if (activated.length > 0) {
-      await rollbackRequest(runClient, activated[0], csrfToken);
-      rolledBack.push(...activated);
+    const oldestPerStorage = new Map<string, RequestRef>();
+    for (const r of activated) {
+      if (!oldestPerStorage.has(r.storage)) oldestPerStorage.set(r.storage, r);
+    }
+    for (const oldest of oldestPerStorage.values()) {
+      try {
+        await rollbackRequest(runClient, oldest, csrfToken);
+        rolledBack.push(...activated.filter((r) => r.storage === oldest.storage));
+      } catch (err) {
+        // One refused storage of an InfoObject must not stop the others from being cleared.
+        if (!isMasterDataStorage(oldest.storage)) throw err;
+        failed.push({ request: oldest.tsn, storage: oldest.storage, requestExternal: oldest.external });
+        notes.push((err as Error).message);
+      }
     }
 
     // The rollback returns its load requests to the inbound queue, so re-read instead of
     // deleting the pre-rollback list.
     const remaining = await listRequestRefs(client, target!, targetType, 200);
-    const deletable = remaining.filter((r) => !ACTIVATED_STORAGES.has(r.storage));
+    const deletable = remaining.filter((r) => !isActivationStorage(r.storage));
     if (deletable.length > 0) {
       const res = await deleteRequests(runClient, deletable, csrfToken);
       deleted.push(...(res.successfulRequests ?? []));
       failed.push(...(res.failedRequests ?? []));
     }
 
-    const stillThere = await listRequestRefs(client, target!, targetType, 200);
+    const refused = new Set(failed.map((f) => `${f.request}/${f.storage}`));
+    const stillThere = (await listRequestRefs(client, target!, targetType, 200)).filter(
+      (r) => !refused.has(`${r.tsn}/${r.storage}`),
+    );
     if (stillThere.length > 0) {
       notes.push(
         `${stillThere.length} request(s) still present after the run: ` +

@@ -1,6 +1,7 @@
 import { BwClient } from '../bw-client.js';
 import { ensurePlatform, hiddenTools, parseDiscoveryCollections, parseSysProps } from '../platform.js';
 import { CLASSIC_WRITE_HEADINGS, CLASSIC_WRITE_STATUS, type ClassicWriteVerdict } from '../classic-writes.js';
+import { ensureHelper } from '../helper.js';
 
 /**
  * Object types this server addresses through the BW modeling REST API, grouped by
@@ -53,7 +54,7 @@ async function probeContentNegotiation(client: BwClient, accept: string): Promis
     if (/HTTP 406/.test(msg)) {
       return {
         ok: false,
-        detail: 'HTTP 406 — the Accept header is not being read; see docs/BW75-SUPPORT.md',
+        detail: 'HTTP 406 — the Accept header is not being read; see bw75/BW75-SUPPORT.md',
       };
     }
     return { ok: false, detail: msg.split('\n')[0] };
@@ -192,6 +193,19 @@ export async function bwSystemProfile(client: BwClient, toolNames: readonly stri
   const reportingLabel = reporting.ok ? 'OK' : reporting.unclear ? 'UNCLEAR' : 'UNAVAILABLE';
   out.push(`Query reporting:  ${reportingLabel} — ${reporting.detail}`);
 
+  // Only classic releases can benefit: on BW/4HANA the DTP resource answers over REST, so an
+  // installed helper would be a second route to something already covered.
+  if (profile.platform === 'classic') {
+    const helper = await ensureHelper(client);
+    out.push(`Helper endpoint:  ${helper.installed ? 'OK' : 'ABSENT'} — ${helper.detail}`);
+    if (!helper.installed) {
+      out.push(
+        `                  without it, a DTP's filter, filter routine, semantic group and ` +
+          `package sizes stay unreadable; see bw75/README.md`,
+      );
+    }
+  }
+
   const hidden = hiddenTools(toolNames, profile);
   if (hidden.length > 0) {
     out.push('');
@@ -249,14 +263,14 @@ export async function bwSystemProfile(client: BwClient, toolNames: readonly stri
     out.push('cannot be read or written through the REST API on this system — SAP never shipped those');
     out.push('resources here. The BW/4HANA manage API (requests, monitoring, push) does not exist either.');
     out.push('Read those objects with bw_read_metadata_tables (TRFN, DTPA, ADSO, RSPC, ODSO, CUBE, MPRO,');
-    out.push('plus PLSE, PLSQ, PLCR and PLDS for the planning objects and RSPCLOG for chain runs) —');
-    out.push('which is also where the load');
+    out.push('plus PLSE, PLSQ, PLCR and PLDS for the planning objects, RSPCLOG for chain runs, ANPR for');
+    out.push('analysis processes and ISIP for InfoPackages) — which is also where the load');
     out.push('history of a provider comes from on this platform. Every tool listed above as hidden');
     out.push('names its substitute in the same place.');
     if (!negotiation.ok) {
       out.push('');
       out.push('ACTION: header handling is broken — nearly every call will fail with HTTP 406.');
-      out.push('Apply the post-exit enhancement described in docs/BW75-SUPPORT.md first.');
+      out.push('Apply the post-exit enhancement described in bw75/BW75-SUPPORT.md first.');
     }
   }
 

@@ -1145,6 +1145,139 @@ function buildCombinedDirectRule(params: {
 }
 
 /**
+ * True when a target segment element is a key figure bound to a currency or unit — either a
+ * fixed one or a reference to a unit/currency field.
+ */
+export function targetHasUnitOrCurrency(targetElementXml: string): boolean {
+  return /<(?:fixedCurrency|fixedUnit|unitCurrencyElement)\b/.test(targetElementXml);
+}
+
+/**
+ * Set the conversiontype attribute on the opening <rule> tag, replacing any existing value.
+ * A rule on a currency/unit key figure that carries no conversiontype is read by BW as
+ * "conversion requested": it inserts a StepConversion with an empty source-unit input, and
+ * the transformation fails to activate.
+ */
+export function setRuleConversionType(ruleXml: string, conversionType: string): string {
+  return ruleXml.replace(/^<rule\b[^>]*>/, (open) =>
+    /\bconversiontype="/.test(open)
+      ? open.replace(/\bconversiontype="[^"]*"/, `conversiontype="${conversionType}"`)
+      : open.replace(/^<rule\b/, `<rule conversiontype="${conversionType}"`),
+  );
+}
+
+/** Currency/unit handling requested for a direct rule on a currency or unit key figure. */
+export interface RuleConversion {
+  /** "none" (default): no conversion. "currency": currency translation type. "unit": unit conversion type. */
+  type: 'none' | 'currency' | 'unit';
+  /** Name of the currency translation type or unit conversion type. */
+  name?: string;
+  /** Source field that supplies the source currency or unit. */
+  source_unit_field?: string;
+}
+
+export interface ConversionTypeInfo {
+  name: string;
+  description: string;
+  fixedSource: string;
+  fixedTarget: string;
+}
+
+/**
+ * Parse the conversion type catalog the transformation editor reads
+ * (GET /sap/bw/modeling/comp/conv?template=TRFN): currency translation types and unit
+ * conversion types, each with its fixed source and target currency/unit where it has one.
+ */
+export function parseConversionCatalog(xml: string): { currency: ConversionTypeInfo[]; unit: ConversionTypeInfo[] } {
+  const attr = (line: string, name: string) => line.match(new RegExp(`\\b${name}="([^"]*)"`))?.[1] ?? '';
+  const table = (name: string, key: string): ConversionTypeInfo[] => {
+    const body = xml.match(new RegExp(`<tableParam\\b[^>]*name="${name}"[^>]*>([\\s\\S]*?)</tableParam>`))?.[1] ?? '';
+    return [...body.matchAll(/<line\b[^>]*\/?>/g)].map((m) => ({
+      name: attr(m[0], key),
+      description: decodeXmlEntities(attr(m[0], 'longDesc') || attr(m[0], 'desc')),
+      fixedSource: attr(m[0], 'fixSource'),
+      fixedTarget: attr(m[0], 'fixTarget'),
+    }));
+  };
+  return { currency: table('currencyTranslations', 'transType'), unit: table('unitConversions', 'convType') };
+}
+
+/**
+ * Build a direct rule that converts the currency or unit on the way into the target key
+ * figure, through a currency translation type (CTRT) or a unit conversion type (UOMT).
+ *
+ * BW wires such a rule as a MAIN direct step feeding a MINOR conversion step, whose inputs
+ * have fixed ids: 1 = amount/quantity, 2 = source currency/unit. The source currency/unit
+ * field is optional — a conversion type with a fixed source needs none, and BW adds an empty
+ * input 2 itself when it is left out.
+ */
+export function buildConversionRule(params: {
+  groupId: string;
+  ruleId: string;
+  sourceField: string;
+  sourceElementXml: string;
+  targetField: string;
+  targetElementXml: string;
+  conversionTlogo: 'CTRT' | 'UOMT';
+  conversionType: string;
+  unitSourceField?: string;
+  unitSourceElementXml?: string;
+}): string {
+  const { groupId: g, ruleId: rv } = params;
+  const src = params.sourceField.toUpperCase();
+  const tgt = params.targetField.toUpperCase();
+  const srcElem = segmentElementToStepElement(params.sourceElementXml);
+  const tgtElem = segmentElementToStepElement(params.targetElementXml);
+  const unit = params.unitSourceField?.toUpperCase();
+
+  const unitSource = unit
+    ? `
+      <source id="2">
+        <input>#///group${g}/rule${rv}/step1/input2</input>
+        <elementRef>#///source/segment1/${unit}</elementRef>
+      </source>`
+    : '';
+  const unitInput = unit
+    ? `
+        <input id="2">
+          <output>#///group${g}/rule${rv}/source2</output>
+          ${segmentElementToStepElement(params.unitSourceElementXml ?? '')}
+        </input>`
+    : '';
+
+  return `<rule id="${rv}" conversiontype="FROM_CONVERSION" description="">
+      <source id="1">
+        <input>#///group${g}/rule${rv}/step2/input1</input>
+        <elementRef>#///source/segment1/${src}</elementRef>
+      </source>${unitSource}
+      <target id="1">
+        <output>#///group${g}/rule${rv}/step1/output1</output>
+        <elementRef>#///target/segment1/${tgt}</elementRef>
+      </target>
+      <step xsi:type="trfn:StepConversion" conversionTlogo="${params.conversionTlogo}" conversionType="${escapeXmlAttr(params.conversionType)}" id="1" type="CONVERSION" rank="MINOR">
+        <input id="1">
+          <output>#///group${g}/rule${rv}/step2/output1</output>
+          ${tgtElem}
+        </input>${unitInput}
+        <output id="1">
+          <input>#///group${g}/rule${rv}/target1</input>
+          ${tgtElem}
+        </output>
+      </step>
+      <step xsi:type="trfn:StepDirect" id="2" type="DIRECT" rank="MAIN">
+        <input id="1">
+          <output>#///group${g}/rule${rv}/source1</output>
+          ${srcElem}
+        </input>
+        <output id="1">
+          <input>#///group${g}/rule${rv}/step1/input1</input>
+          ${srcElem}
+        </output>
+      </step>
+    </rule>`;
+}
+
+/**
  * Convert any existing rule back to StepNoUpdate (no mapping).
  * Preserves the target reference and step output element from the existing rule.
  */
@@ -1181,6 +1314,10 @@ function buildNoUpdateRule(ruleXml: string, ruleId: string): string {
  *   standalone unit rule is folded into the combined rule, and the transformation
  *   flag allowCurrencyAndUnitConversion is switched on. See
  *   payloads/trfn_unit_currency_mapping.md.
+ *   When conversion is set to a currency or unit conversion, builds a direct rule
+ *   feeding a conversion step (buildConversionRule); the conversion type is checked
+ *   against the system's catalog first. Without it, a rule on a currency/unit key
+ *   figure is written with conversiontype="NO_CONVERSION".
  *
  * rule_type="routine":
  *   Finds the rule for the target InfoObject (StepDirect, StepInitial, or
@@ -1215,9 +1352,20 @@ export async function bwUpdateTransformation(
   transport?: string,
   additionalSourceFields?: string[],
   unitSourceField?: string,
+  conversion?: RuleConversion,
 ): Promise<string> {
   const tgtUpper = targetInfoObject.toUpperCase();
   let srcUpper = sourceField?.toUpperCase() ?? '';
+
+  const conversionKind = conversion?.type ?? 'none';
+  if (conversionKind !== 'none' && (ruleType !== 'direct' || unitSourceField)) {
+    return JSON.stringify({
+      success: false,
+      message:
+        'A currency or unit conversion is set on a direct rule only (rule_type="direct" without ' +
+        'unit_source_field). The rule was not changed.',
+    });
+  }
 
   // Step 1: Read current Transformation (get full XML + timestamp)
   const trfnResult = await freshReadInactive(transformationName.toLowerCase());
@@ -1364,7 +1512,7 @@ export async function bwUpdateTransformation(
       return { name: f, dataType: props.dataType, length: props.length, elementXml: props.elementXml };
     });
 
-    const newRule = buildFormulaRule({
+    let newRule = buildFormulaRule({
       oldRuleXml: ruleInfo.oldRuleXml,
       groupId: ruleInfo.groupId,
       ruleId: ruleInfo.ruleId,
@@ -1372,6 +1520,9 @@ export async function bwUpdateTransformation(
       sourceFields: srcFieldDefs,
       formula,
     });
+    if (targetHasUnitOrCurrency(extractTargetFieldProps(originalXml, tgtUpper).elementXml)) {
+      newRule = setRuleConversionType(newRule, 'NO_CONVERSION');
+    }
 
     updatedXml = originalXml.replace(ruleInfo.oldRuleXml, newRule);
     if (updatedXml === originalXml) {
@@ -1421,7 +1572,7 @@ export async function bwUpdateTransformation(
       });
     }
 
-    const newRule = convertRuleToConstant(ruleInfo.oldRuleXml, constantValue);
+    let newRule = convertRuleToConstant(ruleInfo.oldRuleXml, constantValue);
     if (!newRule.includes('xsi:type="trfn:StepConstant"')) {
       return JSON.stringify({
         success: false,
@@ -1432,6 +1583,9 @@ export async function bwUpdateTransformation(
           `the constant.`,
         current_step_type: ruleInfo.stepType,
       });
+    }
+    if (targetHasUnitOrCurrency(extractTargetFieldProps(originalXml, tgtUpper).elementXml)) {
+      newRule = setRuleConversionType(newRule, 'NO_CONVERSION');
     }
     updatedXml = originalXml.replace(ruleInfo.oldRuleXml, newRule);
     if (updatedXml === originalXml) {
@@ -1697,6 +1851,100 @@ export async function bwUpdateTransformation(
 
   const srcProps = extractSourceFieldProps(originalXml, srcUpper);
 
+  if (conversionKind !== 'none') {
+    const fail = (message: string, extra: Record<string, unknown> = {}) =>
+      JSON.stringify({ success: false, message: `${message} The rule was not changed.`, ...extra });
+
+    if (!targetHasUnitOrCurrency(tgtFieldProps.elementXml)) {
+      return fail(`Target ${tgtUpper} has no currency or unit, so there is nothing to convert.`);
+    }
+    if (!srcProps.elementXml) {
+      return fail(`Source field ${srcUpper} is not in the source segment.`);
+    }
+    const typeName = conversion?.name?.trim().toUpperCase() ?? '';
+    if (!typeName) {
+      return fail(`conversion.name is required for a ${conversionKind} conversion.`);
+    }
+
+    const catalogXml = (await client.rawGet('/sap/bw/modeling/comp/conv?template=TRFN', {
+      Accept: 'application/xml',
+      versionLevel: '1',
+    })).body;
+    const catalog = parseConversionCatalog(catalogXml)[conversionKind];
+    const typeInfo = catalog.find((t) => t.name.toUpperCase() === typeName);
+    if (!typeInfo) {
+      return fail(
+        `${conversionKind === 'currency' ? 'Currency translation type' : 'Unit conversion type'} ` +
+          `${typeName} does not exist on this system.`,
+        { available_types: catalog.map((t) => ({ name: t.name, description: t.description })) },
+      );
+    }
+
+    // The source currency/unit comes from the named field, else from the source key figure's
+    // own unit reference. Only a conversion type with a fixed source can do without one —
+    // otherwise BW is left with an empty input and the rule does not activate.
+    let unitSrc = conversion?.source_unit_field?.trim().toUpperCase() || '';
+    if (!unitSrc) unitSrc = extractUnitCurrencyField(srcProps.elementXml);
+    let unitSrcElementXml = '';
+    if (unitSrc) {
+      unitSrcElementXml = extractSourceFieldProps(originalXml, unitSrc).elementXml;
+      if (!unitSrcElementXml) {
+        return fail(`Source unit/currency field ${unitSrc} is not in the source segment.`);
+      }
+    } else if (!typeInfo.fixedSource) {
+      return fail(
+        `${typeName} has no fixed source ${conversionKind}, so the rule needs one from the source: ` +
+          `pass conversion.source_unit_field.`,
+      );
+    }
+
+    const convRule = buildConversionRule({
+      groupId: ruleInfo.groupId,
+      ruleId: ruleInfo.ruleId,
+      sourceField: srcUpper,
+      sourceElementXml: srcProps.elementXml,
+      targetField: tgtUpper,
+      targetElementXml: tgtFieldProps.elementXml,
+      conversionTlogo: conversionKind === 'currency' ? 'CTRT' : 'UOMT',
+      conversionType: typeInfo.name,
+      unitSourceField: unitSrc || undefined,
+      unitSourceElementXml: unitSrcElementXml || undefined,
+    });
+
+    updatedXml = originalXml
+      .replace(ruleInfo.oldRuleXml, convRule)
+      .replace(/allowCurrencyAndUnitConversion="false"/, 'allowCurrencyAndUnitConversion="true"');
+    if (updatedXml === originalXml) {
+      throw new Error('Rule replacement failed — XML unchanged.');
+    }
+
+    const lockHandle = await client.lock('trfn', transformationName);
+    try {
+      await client.put('trfn', transformationName, lockHandle, updatedXml, timestamp, transport);
+    } catch (err) {
+      await client.unlock('trfn', transformationName).catch(() => {/* ignore */});
+      throw err;
+    }
+
+    return JSON.stringify({
+      success: true,
+      message:
+        `Source field ${srcUpper} mapped to ${tgtUpper} with ${conversionKind} conversion ${typeInfo.name}` +
+        `${unitSrc ? ` (source ${conversionKind} from ${unitSrc})` : ` (fixed source ${typeInfo.fixedSource})`} in ` +
+        `transformation ${transformationName.toUpperCase()}. Call bw_activate to activate.`,
+      conversion: {
+        type: conversionKind,
+        name: typeInfo.name,
+        source_unit_field: unitSrc || null,
+        fixed_source: typeInfo.fixedSource || null,
+        fixed_target: typeInfo.fixedTarget || null,
+      },
+      lock_handle: lockHandle,
+      transformation_name: transformationName.toUpperCase(),
+      object_type: 'trfn',
+    });
+  }
+
   let newRule: string;
   if (tgtFieldProps.isFieldBased) {
     newRule = buildStepDirectFieldRule({
@@ -1726,6 +1974,10 @@ export async function bwUpdateTransformation(
       tgtLength: tgtProps.length,
       tgtLabel: iObjProps.label,
     });
+  }
+
+  if (targetHasUnitOrCurrency(tgtFieldProps.elementXml)) {
+    newRule = setRuleConversionType(newRule, 'NO_CONVERSION');
   }
 
   updatedXml = originalXml.replace(ruleInfo.oldRuleXml, newRule);

@@ -333,6 +333,12 @@ const BW4_ONLY: Record<string, string> = {
  * `bw_read_metadata_tables`. A tool that quietly switched backends would dissolve that
  * boundary, and it would fail silently where hiding fails visibly.
  *
+ * One exception, and it is an addition rather than a switch: on a classic release `bw_xref`
+ * adds the analysis processes of a provider from their metadata table, because the
+ * where-used index leaves them out and no REST route to them exists on any release. The REST
+ * answer is always complete on its own, the addition sits under the same `read` scope, and
+ * without ADT it is skipped with a line saying so instead of failing the call.
+ *
  * `topic` is what the caller was after, and is what the instructions list; several tools can
  * share one. Tools whose question has no answer on this platform at all (query data above
  * all) are absent here — there is nothing to point at yet.
@@ -344,7 +350,7 @@ const CLASSIC_SUBSTITUTE: Record<string, { topic: string; call: string }> = {
   },
   bw_get_dtp: {
     topic: 'DTPs',
-    call: 'bw_read_metadata_tables with object_type="DTPA" (filter selections and the semantic group are not readable that way)',
+    call: 'bw_read_metadata_tables with object_type="DTPA" (the filter definition needs the optional helper endpoint, see bw75/README.md)',
   },
   bw_get_process_chain: {
     topic: 'Process chains (steps, variants, dependencies)',
@@ -360,7 +366,10 @@ const CLASSIC_SUBSTITUTE: Record<string, { topic: string; call: string }> = {
   },
   bw_get_dataflow: {
     topic: 'Data flow around an object',
-    call: 'bw_xref on the object, one hop at a time',
+    call:
+      'bw_xref on the object, one hop at a time — every hit says whether it feeds the object ' +
+      '(upstream) or is fed from it (downstream), analysis processes included; the parts of a ' +
+      'MultiProvider come with their type from bw_read_metadata_tables with object_type="MPRO"',
   },
   bw_get_planning_function: {
     topic: 'Planning functions (type, parameters, FOX formula)',
@@ -501,8 +510,12 @@ export function platformInstructions(profile: PlatformProfile | undefined): stri
     'APIs that BW/4HANA serves over REST do not exist here, so the tools that need them are',
     'not offered at all — nothing is missing from the system, the route is different. Where',
     'there is another route, take it directly instead of looking for a tool:',
-    ...[...routes].map(([topic, call]) => `  ${topic}: ${call}`),
+    // The object types that exist only here come first: clients cut long instructions off,
+    // and these lines have no hidden tool whose error message would name them instead.
     '  Classic DSOs, InfoCubes, MultiProviders: bw_read_metadata_tables with object_type="ODSO", "CUBE" or "MPRO"',
+    '  Analysis processes (nodes, field rules, routines): bw_read_metadata_tables with object_type="ANPR" (a pattern such as "Z*" lists them; bw_search cannot find them)',
+    '  InfoPackages (file settings, selections, routines, load history): bw_read_metadata_tables with object_type="ISIP" (or the DataSource name to list them)',
+    ...[...routes].map(([topic, call]) => `  ${topic}: ${call}`),
     '',
     'bw_read_metadata_tables reads those objects from the BW metadata tables through the ADT',
     'DataPreview service, which is read-only and needs ADT authorization for the caller. Query',

@@ -84,11 +84,24 @@ export interface ApdNode {
   body: string;
 }
 
+/**
+ * One field rule of a mapping: MR_COPY moves a source field into a target field, MR_CONST
+ * sets a target field to a constant. Any other rule type is kept with its tag, so it still
+ * shows up rather than being dropped.
+ */
+export interface ApdRule {
+  type: string;
+  source: string;
+  target: string;
+  value?: string;
+}
+
 export interface ApdEdge {
   name: string;
   text: string;
   source: string;
   target: string;
+  rules: ApdRule[];
 }
 
 function parseAttributes(raw: string): Record<string, string> {
@@ -126,19 +139,46 @@ export function parseApdXml(xml: string): { nodes: ApdNode[]; edges: ApdEdge[]; 
 
   const edges: ApdEdge[] = [];
   const mappings = xml.match(/<MAPPINGS>([\s\S]*?)<\/MAPPINGS>/)?.[1] ?? '';
-  for (const e of mappings.matchAll(/<MAPPING\b([^>]*?)\/?>/g)) {
+  // The field rules of an edge sit in the body of its <MAPPING>, so the element has to be
+  // read with its body, not just its opening tag.
+  for (const e of mappings.matchAll(/<MAPPING\b([^>]*?)(?:\/>|>([\s\S]*?)<\/MAPPING>)/g)) {
     const attrs = parseAttributes(e[1]);
     if (attrs.SOURCE || attrs.TARGET) {
+      const rules: ApdRule[] = [];
+      for (const r of (e[2] ?? '').matchAll(/<(MR_[A-Z_0-9]+)\b([^>]*?)\/?>/g)) {
+        const ra = parseAttributes(r[2]);
+        rules.push({ type: r[1], source: ra.SOURCE ?? '', target: ra.TARGET ?? '', value: ra.VALUE });
+      }
       edges.push({
         name: attrs.NAME ?? '',
         text: attrs.TEXT ?? '',
         source: attrs.SOURCE ?? '',
         target: attrs.TARGET ?? '',
+        rules,
       });
     }
   }
 
   return { nodes, edges, header: parseAttributes(headerRaw) };
+}
+
+/**
+ * Field rules as lines: copies as "source → target", constants as "target = 'value'".
+ * Constants come first — a target field that no copy fills but a constant does, a version
+ * for instance, is usually what the reader is looking for.
+ */
+export function renderRules(rules: ApdRule[], indent: string): string[] {
+  const constants = rules.filter((r) => r.type === 'MR_CONST');
+  const rest = rules.filter((r) => r.type !== 'MR_CONST');
+  return [
+    ...constants.map((r) => `${indent}${r.target} = '${r.value ?? ''}'   (constant)`),
+    ...rest.map((r) =>
+      r.type === 'MR_COPY'
+        ? `${indent}${r.source} → ${r.target}`
+        : `${indent}${r.source || '(none)'} → ${r.target || '(none)'}   ` +
+          `(${r.type}${r.value !== undefined ? `, value '${r.value}'` : ''})`,
+    ),
+  ];
 }
 
 /**
@@ -242,7 +282,65 @@ const VERSION_LABEL: Record<string, string> = {
   M: 'modified (not activated)',
 };
 
+/**
+ * The analysis processes matching a pattern. The BW search index does not contain them on
+ * any release, so this is how they are found by name.
+ */
+async function listAnalysisProcesses(client: BwClient, pattern: string): Promise<string> {
+  const like = sqlLiteral(pattern.trim().toUpperCase()).replace(/\*/g, '%');
+  const rows = await queryTable(
+    client,
+    `SELECT process, objvers, tstpnm, timestmp FROM rsant_process WHERE process LIKE '${like}'`,
+    1000,
+  );
+  const rank = (v: string) => {
+    const i = (VERSION_ORDER as readonly string[]).indexOf(v);
+    return i < 0 ? VERSION_ORDER.length : i;
+  };
+  const heads = new Map<string, Row>();
+  for (const r of rows) {
+    const held = heads.get(r.PROCESS);
+    if (!held || rank(r.OBJVERS) < rank(held.OBJVERS)) {
+      heads.set(r.PROCESS, r);
+    }
+  }
+  if (heads.size === 0) {
+    return (
+      `No analysis process matches ${pattern} (RSANT_PROCESS). Analysis processes exist on ` +
+      `classic SAP BW only — BW/4HANA does not have the object type.`
+    );
+  }
+
+  const texts = new Map<string, string>();
+  for (const batch of inListBatches([...heads.keys()], 150)) {
+    try {
+      const t = await queryTable(
+        client,
+        `SELECT process, spras, txtlg FROM rsant_processt WHERE process IN (${batch}) AND objvers = 'A'`,
+        500,
+      );
+      for (const r of t) {
+        if (r.TXTLG && (r.SPRAS === 'E' || !texts.has(r.PROCESS))) texts.set(r.PROCESS, r.TXTLG.trim());
+      }
+    } catch {
+      // A description is an enrichment; the name identifies the process.
+    }
+  }
+
+  const out = [`Analysis processes matching ${pattern.toUpperCase()}: ${heads.size}`, ''];
+  for (const r of [...heads.values()].sort((a, b) => a.PROCESS.localeCompare(b.PROCESS))) {
+    const text = texts.get(r.PROCESS);
+    out.push(
+      `  ${r.PROCESS}${text ? ` — ${text}` : ''}   [${VERSION_LABEL[r.OBJVERS] ?? r.OBJVERS}, ` +
+        `changed ${formatStamp(r.TIMESTMP)} by ${r.TSTPNM || '(unknown)'}]`,
+    );
+  }
+  out.push('', 'Read one with object_type="ANPR" and its name.');
+  return out.join('\n');
+}
+
 export async function readAnalysisProcess(client: BwClient, processName: string): Promise<string> {
+  if (processName.includes('*')) return listAnalysisProcesses(client, processName);
   const name = sqlLiteral(processName.trim().toUpperCase());
 
   const versions = await queryTable(
@@ -356,7 +454,15 @@ export async function readAnalysisProcess(client: BwClient, processName: string)
   if (edges.length === 0) {
     out.push('  (none — the nodes are not connected)');
   } else {
-    for (const e of edges) out.push(`  ${e.source} → ${e.target}${e.text ? `   (${e.text})` : ''}`);
+    for (const e of edges) {
+      out.push(`  ${e.source} → ${e.target}${e.text ? `   (${e.text})` : ''}`);
+      if (e.rules.length === 0) {
+        out.push('      (no field rules stored for this edge)');
+        continue;
+      }
+      out.push(`      field rules (${e.rules.length}):`);
+      out.push(...renderRules(e.rules, '        '));
+    }
   }
 
   // One row per usage kind (ASC_TYPE), so the same object appears several times. The kind is

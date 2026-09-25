@@ -281,6 +281,56 @@ function explicitSettingAttrs(node: Record<string, unknown> | undefined): Record
 }
 
 /**
+ * Result and single value calculation of a member, in the field names the write tools
+ * take. undefined while the member uses the default calculation.
+ */
+export function parseMemberCalculation(node: Record<string, unknown> | undefined): Record<string, unknown> | undefined {
+  if (isDefaultSetting(node)) return undefined;
+  const bool = (v: unknown) => v === true || v === 'true';
+  const out: Record<string, unknown> = {
+    result_as: (node!['@_resultAs'] as string) ?? 'blank',
+    single_values_as: (node!['@_singleValuesAs'] as string) ?? 'blank',
+    apply_to_result: bool(node!['Qry:applyToResult']),
+    cumulation: bool(node!['Qry:cumulation']),
+  };
+  if (node!['Qry:aggrDirection'] !== undefined) out['aggr_direction'] = node!['Qry:aggrDirection'];
+  return out;
+}
+
+/**
+ * Exception aggregation of a query member or a reusable CKF, in the shape the write tools
+ * take back unchanged. undefined when the member aggregates by its standard behaviour.
+ * The multi-value and exclude fields only appear when they carry information, so the
+ * common single-characteristic case stays a two-field object.
+ */
+export function parseExceptionAggregation(
+  member: Record<string, unknown> | undefined
+): Record<string, unknown> | undefined {
+  const node = member?.['Qry:exceptionAggregation'];
+  if (!node || typeof node !== 'object') return undefined;
+  const ea = node as Record<string, unknown>;
+  const type = ea['@_type'];
+  if (type === undefined || type === '') return undefined;
+  const refs = ensureArray(ea['Qry:referenceCharacteristic'])
+    .map((r) => (r !== null && typeof r === 'object' ? (r as Record<string, unknown>)['#text'] : r))
+    .map((r) => String(r ?? '').trim())
+    .filter(Boolean);
+  const result: Record<string, unknown> = { type: String(type) };
+  if (refs.length > 0) result['reference_characteristic'] = refs[0];
+  if (refs.length > 1) result['reference_characteristics'] = refs;
+  if (ea['@_exclude'] === 'true' || ea['@_exclude'] === true) result['exclude'] = true;
+  return result;
+}
+
+/** Compact text form of an exception aggregation, e.g. "SUM(IOBJ_NAME)". */
+export function formatExceptionAggregation(ea: Record<string, unknown> | undefined): string {
+  if (!ea) return '';
+  const refs = (ea['reference_characteristics'] as string[] | undefined) ??
+    (ea['reference_characteristic'] ? [String(ea['reference_characteristic'])] : []);
+  return `${ea['type']}(${ea['exclude'] === true ? 'all except ' : ''}${refs.join(', ')})`;
+}
+
+/**
  * Planning properties of a structure member: input readiness and disaggregation.
  * Input readiness is what makes a member usable in a planning query; it is carried
  * by a nested Qry:planning element, not by an attribute on the member itself.
@@ -352,8 +402,12 @@ function parseMemberRecursive(
   }
   const scaling = explicitSettingAttrs(member['Qry:scaling'] as Record<string, unknown> | undefined);
   if (scaling) result['scaling'] = scaling;
+  const calculation = parseMemberCalculation(member['Qry:calculation'] as Record<string, unknown> | undefined);
+  if (calculation) result['calculation'] = calculation;
   const planning = parseMemberPlanning(member, localMemberMap);
   if (planning) result['planning'] = planning;
+  const exceptionAggregation = parseExceptionAggregation(member);
+  if (exceptionAggregation) result['exceptionAggregation'] = exceptionAggregation;
 
   if (isFormula) {
     const formulaDef = member['Qry:formulaDefinition'] as Record<string, unknown> | undefined;
@@ -369,10 +423,16 @@ function parseMemberRecursive(
         const rkfEntry = rkfMap.get(hintValue);
         const entry = ckfEntry ?? rkfEntry;
         if (entry) {
+          // The component's own exception aggregation is reported apart from the member's:
+          // a formula that references the component computes with the component's setting,
+          // never with one set on the member that shows it.
+          const componentEa = (ckfEntry as { exceptionAggregation?: Record<string, unknown> } | undefined)
+            ?.exceptionAggregation;
           result['referencedComponent'] = {
             technicalName: entry.technicalName,
             description: entry.description,
             componentType: ckfEntry ? 'CKF' : 'RKF',
+            ...(componentEa ? { exceptionAggregation: componentEa } : {}),
           };
         }
       }
@@ -452,6 +512,20 @@ function renderMemberLines(members: unknown[], indent: string, lines: string[]):
       flags.push(`disaggregation=${planning['disaggregation']}${ref ? ` → ${ref}` : ''}`);
     }
     if (m['decimals'] !== undefined) flags.push(`decimals=${m['decimals']}`);
+    const scaling = m['scaling'] as Record<string, unknown> | undefined;
+    if (scaling?.['number'] !== undefined) flags.push(`scaling=${scaling['number']}`);
+    const calc = m['calculation'] as Record<string, unknown> | undefined;
+    if (calc) {
+      if (calc['result_as'] !== 'blank') flags.push(`resultAs=${calc['result_as']}`);
+      if (calc['single_values_as'] !== 'blank') flags.push(`singleValuesAs=${calc['single_values_as']}`);
+      flags.push(`applyToResult=${calc['apply_to_result']}`);
+      if (calc['cumulation']) flags.push('cumulated');
+    }
+    const memberEa = m['exceptionAggregation'] as Record<string, unknown> | undefined;
+    if (memberEa) flags.push(`exc.agg=${formatExceptionAggregation(memberEa)}`);
+    const refComp = m['referencedComponent'] as Record<string, unknown> | undefined;
+    const refEa = refComp?.['exceptionAggregation'] as Record<string, unknown> | undefined;
+    if (refEa) flags.push(`${refComp!['technicalName']} exc.agg=${formatExceptionAggregation(refEa)}`);
     // The server writes an explicit "not inverted" on every member; only the
     // inverting case carries information for a reader.
     if (m['signInversion'] === true) flags.push('signInversion=true');
@@ -563,6 +637,8 @@ function renderQueryText(q: Record<string, unknown>): string {
     for (const c of ckfs as Record<string, unknown>[]) {
       lines.push(`  ${s(c['technicalName'])}  ${s(c['description'])}`);
       if (c['formula']) lines.push(`    Formula: ${s(c['formula'])}`);
+      const ckfEa = c['exceptionAggregation'] as Record<string, unknown> | undefined;
+      if (ckfEa) lines.push(`    Exception aggregation: ${formatExceptionAggregation(ckfEa)}`);
     }
   }
 
@@ -597,8 +673,17 @@ function renderQueryText(q: Record<string, unknown>): string {
     lines.push('');
     lines.push(`── Cell Definitions ──`);
     lines.push(`  Grid cells: ${gridCells.length}  Help cells: ${helpCells.length}`);
+    for (const hc of helpCells as Record<string, unknown>[]) {
+      lines.push(`  Help cell [${s(hc['type'])}] ${s(hc['description'])}  id=${s(hc['id'])}`);
+      if (hc['formula']) lines.push(`    Formula: ${s(hc['formula'])}`);
+      const sel = hc['selections'] as unknown[] | undefined;
+      if (sel && sel.length > 0) lines.push(`    Selection: ${JSON.stringify(sel)}`);
+    }
     for (const gc of gridCells as Record<string, unknown>[]) {
-      lines.push(`  [${s(gc['type'])}] ${s(gc['description'])}  coord1=${s(gc['coordinateMember1'])}  coord2=${s(gc['coordinateMember2'])}`);
+      lines.push(
+        `  Grid cell [${s(gc['type'])}] ${s(gc['coordinateMember1Description']) || s(gc['coordinateMember1'])} × ` +
+        `${s(gc['coordinateMember2Description']) || s(gc['coordinateMember2'])}  "${s(gc['description'])}"  id=${s(gc['id'])}`
+      );
       if (gc['formula']) lines.push(`    Formula: ${s(gc['formula'])}`);
     }
   }
@@ -658,7 +743,12 @@ export async function bwGetQuery(queryName: string, format: 'text' | 'raw' = 'te
 
   // Step 1: Build subComponent maps
   const variableMap = new Map<string, { technicalName: string; description: string; infoObject: string; type: string; procType: string; inputType: string; represents: string; defaultSelection: unknown }>();
-  const ckfMap = new Map<string, { technicalName: string; description: string; formulaDefinition: unknown }>();
+  const ckfMap = new Map<string, {
+    technicalName: string;
+    description: string;
+    formulaDefinition: unknown;
+    exceptionAggregation?: Record<string, unknown>;
+  }>();
   const rkfMap = new Map<string, { technicalName: string; description: string; member: Record<string, unknown> | undefined }>();
 
   const subComponents = ensureArray(root['Qry:subComponents']) as Record<string, unknown>[];
@@ -682,6 +772,7 @@ export async function bwGetQuery(queryName: string, format: 'text' | 'raw' = 'te
         technicalName: (sc['@_technicalName'] as string) ?? '',
         description: ((sc['Qry:description'] as Record<string, unknown> | undefined)?.['@_value'] as string) ?? '',
         formulaDefinition: member?.['Qry:formulaDefinition'],
+        exceptionAggregation: parseExceptionAggregation(member),
       });
     } else if (scType === 'Qry:RestrictedMeasure') {
       rkfMap.set(id, {
@@ -807,6 +898,7 @@ export async function bwGetQuery(queryName: string, format: 'text' | 'raw' = 'te
       technicalName: ckf.technicalName,
       description: ckf.description,
       formula: formulaToken ? renderFormula(formulaToken, variableMap, ckfMap, rkfMap, new Map()) : '',
+      ...(ckf.exceptionAggregation ? { exceptionAggregation: ckf.exceptionAggregation } : {}),
     });
   }
 
@@ -859,28 +951,66 @@ export async function bwGetQuery(queryName: string, format: 'text' | 'raw' = 'te
   const helpCellsRaw = ensureArray(mainComp['Qry:helpCells']) as Record<string, unknown>[];
   const hasCellDefinitions = gridCellsRaw.length > 0 || helpCellsRaw.length > 0;
 
+  // Cell coordinates and cell formula operands are ids; resolve them to the member
+  // descriptions and cell labels a reader can match against the layout.
+  const structureMemberNames = new Map<string, string>();
+  const collectMembers = (nodes: Record<string, unknown>[]) => {
+    for (const n of nodes) {
+      const id = n['@_id'] as string | undefined;
+      const desc = ((n['Qry:description'] as Record<string, unknown> | undefined)?.['@_value'] as string) ?? '';
+      if (id) structureMemberNames.set(id, desc || id);
+      collectMembers(ensureArray(n['Qry:childMembers']) as Record<string, unknown>[]);
+    }
+  };
+  if (hasCellDefinitions) {
+    for (const axis of [...ensureArray(mainComp['Qry:rows']), ...ensureArray(mainComp['Qry:columns'])] as Record<string, unknown>[]) {
+      if (axis['@_xsi:type'] === 'Qry:CustomDimension') collectMembers(ensureArray(axis['Qry:members']) as Record<string, unknown>[]);
+    }
+  }
+  const cellDescription = (c: Record<string, unknown>) =>
+    ((c['Qry:description'] as Record<string, unknown> | undefined)?.['@_value'] as string) ?? '';
+  const cellLabels = new Map<string, string>();
+  for (const hc of helpCellsRaw) cellLabels.set(hc['@_id'] as string, `[${cellDescription(hc) || (hc['@_id'] as string)}]`);
+  for (const gc of gridCellsRaw) {
+    const c1 = gc['Qry:coordinateMember1'] as string | undefined;
+    const c2 = gc['Qry:coordinateMember2'] as string | undefined;
+    const at = `${structureMemberNames.get(c1 ?? '') ?? c1} × ${structureMemberNames.get(c2 ?? '') ?? c2}`;
+    cellLabels.set(gc['@_id'] as string, `[${at}]`);
+  }
+  const cellFormula = (c: Record<string, unknown>) => {
+    const formulaDef = c['Qry:formulaDefinition'] as Record<string, unknown> | undefined;
+    const formulaToken = formulaDef?.['Qry:formulaToken'] as Record<string, unknown> | undefined;
+    return formulaToken ? renderFormula(formulaToken, variableMap, ckfMap, rkfMap, cellLabels) : '';
+  };
+
   const gridCells = gridCellsRaw.map((gc) => {
     const gcType = gc['@_xsi:type'] as string;
+    const coord1 = (gc['Qry:coordinateMember1'] as string) ?? '';
+    const coord2 = (gc['Qry:coordinateMember2'] as string) ?? '';
     const cell: Record<string, unknown> = {
       id: (gc['@_id'] as string) ?? '',
-      type: gcType === 'Qry:FormulaCell' ? 'FormulaCell' : 'ReferenceCell',
-      description: ((gc['Qry:description'] as Record<string, unknown> | undefined)?.['@_value'] as string) ?? '',
-      coordinateMember1: (gc['Qry:coordinateMember1'] as string) ?? '',
-      coordinateMember2: (gc['Qry:coordinateMember2'] as string) ?? '',
+      type: (gcType ?? '').replace(/^Qry:/, ''),
+      description: cellDescription(gc),
+      coordinateMember1: coord1,
+      coordinateMember1Description: structureMemberNames.get(coord1) ?? '',
+      coordinateMember2: coord2,
+      coordinateMember2Description: structureMemberNames.get(coord2) ?? '',
     };
-    if (gcType === 'Qry:FormulaCell') {
-      const formulaDef = gc['Qry:formulaDefinition'] as Record<string, unknown> | undefined;
-      const formulaToken = formulaDef?.['Qry:formulaToken'] as Record<string, unknown> | undefined;
-      cell['formula'] = formulaToken ? renderFormula(formulaToken, variableMap, ckfMap, rkfMap, new Map()) : '';
-    }
+    if (gcType === 'Qry:FormulaCell') cell['formula'] = cellFormula(gc);
     return cell;
   });
 
-  const helpCells = helpCellsRaw.map((hc) => ({
-    id: (hc['@_id'] as string) ?? '',
-    description: ((hc['Qry:description'] as Record<string, unknown> | undefined)?.['@_value'] as string) ?? '',
-    selections: parseSelectionGroups(ensureArray(hc['Qry:groups']), ckfMap, rkfMap),
-  }));
+  const helpCells = helpCellsRaw.map((hc) => {
+    const hcType = hc['@_xsi:type'] as string;
+    const cell: Record<string, unknown> = {
+      id: (hc['@_id'] as string) ?? '',
+      type: (hcType ?? '').replace(/^Qry:/, ''),
+      description: cellDescription(hc),
+    };
+    if (hcType === 'Qry:FormulaCell') cell['formula'] = cellFormula(hc);
+    else cell['selections'] = parseSelectionGroups(ensureArray(hc['Qry:groups']), ckfMap, rkfMap);
+    return cell;
+  });
 
   // Step 11: Query-level settings
   const zeroSuppr = mainComp['Qry:zeroSuppression'] as Record<string, unknown> | undefined;
@@ -916,7 +1046,10 @@ export async function bwGetQuery(queryName: string, format: 'text' | 'raw' = 'te
     providerType,
     package: (packageRef?.['@_adtCore:name'] as string) ?? '',
     infoArea: stripInfoAreaSentinel((entityProps['infoArea'] as string) ?? ''),
-    status: (entityProps['objectStatus'] as string) ?? '',
+    // A query has no activation step: the A version is written on every save. The server's
+    // objectStatus has been seen reporting "inactive" for a query whose A version exists and
+    // opens with full content, so the status reflects which version was actually read.
+    status: versionNote ? 'inactive (no A version, M version shown)' : 'active',
     responsible: (entityProps['@_adtCore:responsible'] as string) ?? '',
     changedAt: (entityProps['@_adtCore:changedAt'] as string) ?? '',
     createdAt: (entityProps['@_adtCore:createdAt'] as string) ?? '',

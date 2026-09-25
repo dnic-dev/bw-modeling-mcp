@@ -155,7 +155,7 @@ function expandSelfClosingFilter(doc: string): string {
 }
 
 /** Splice a fragment into the document immediately before the given marker. */
-function spliceBefore(doc: string, marker: string, fragment: string, what: string): string {
+export function spliceBefore(doc: string, marker: string, fragment: string, what: string): string {
   const idx = doc.indexOf(marker);
   if (idx < 0) {
     throw new Error(`Could not locate '${marker}' in the query document (${what}).`);
@@ -399,7 +399,7 @@ function clearFirstCustomDimension(doc: string, id: string): string {
 }
 
 /** Find the id of a subComponent by its technical name (uppercased). */
-function findSubComponentIdByTechnicalName(doc: string, techNameUpper: string): string | undefined {
+export function findSubComponentIdByTechnicalName(doc: string, techNameUpper: string): string | undefined {
   const re = /<Qry:subComponents\b[^>]*?(\/>|>[\s\S]*?<\/Qry:subComponents>)/g;
   let m: RegExpExecArray | null;
   while ((m = re.exec(doc)) !== null) {
@@ -1073,8 +1073,23 @@ export interface KeyFigureRestriction {
 
 export interface ExceptionAggregation {
   type: string;
-  reference_characteristic: string;
+  reference_characteristic?: string;
+  /** Several reference characteristics (at most five); takes precedence over reference_characteristic. */
+  reference_characteristics?: string[];
+  exclude?: boolean;
 }
+
+/**
+ * Fixed values of the aggregation domain (RSAGGREXC), identical on a classic release and on
+ * BW/4HANA. The modeling API stores an unknown literal as standard aggregation and still
+ * reports the object as consistent, so anything outside this list is refused up front.
+ */
+export const EXCEPTION_AGGREGATION_TYPES = [
+  'SUM', 'MAX', 'MIN', 'AVG', 'AV0', 'AV1', 'AV2', 'CNT', 'CN0',
+  'FIR', 'LAS', 'NO1', 'NO2', 'NOP', 'STD', 'VAR',
+] as const;
+
+const MAX_REFERENCE_CHARACTERISTICS = 5;
 
 export interface MemberProperties {
   /** Number of decimal places (0-9). */
@@ -1103,6 +1118,86 @@ export interface MemberProperties {
   disaggregation_reference?: string;
   /** Constant selection on the member itself (not on its individual restrictions). */
   constant_selection?: boolean;
+  /** Scaling as a power of ten (0-9, 3 = thousands), or false to restore the default. */
+  scaling?: number | false;
+  /** Result and single value calculation, or false to restore the default. */
+  calculation?: MemberCalculation | false;
+}
+
+export interface MemberCalculation {
+  /** "Calculate results as" — one of RESULT_AS_VALUES. */
+  result_as?: string;
+  /** "Calculate single values as" — one of SINGLE_VALUES_AS_VALUES. */
+  single_values_as?: string;
+  /** Use the calculated single values for the result calculation (stored inverted as the "no subtotal" flag). */
+  apply_to_result?: boolean;
+  /** Show the values cumulated. */
+  cumulation?: boolean;
+}
+
+/**
+ * Literals of the query model for "calculate results as" (STRMEM_LAGGR, domain RRLAGGR).
+ * "mininum" is the model's own spelling. The backend stores a literal it does not know
+ * as the default and reports success, so nothing outside this list is sent.
+ */
+export const RESULT_AS_VALUES = [
+  'blank', 'summation', 'maximum', 'mininum', 'detValuesCounter', 'detValuesCounterNonEmpty',
+  'average', 'averageNonEmpty', 'standardDeviation', 'variance', 'hide', 'firstValue',
+  'lastValue', 'summationRoundedValues',
+] as const;
+
+/**
+ * Literals of the query model for "calculate single values as" (STRMEM_PLEVEL). The
+ * backend stores "movingAverageNonEmpty" correctly but reports it as "movingAverage"
+ * when the query is read, so the two cannot be told apart from the document.
+ */
+export const SINGLE_VALUES_AS_VALUES = [
+  'blank', 'minimum', 'maximum', 'detValuesCounter', 'detValuesCounterNonEmpty', 'movingAverage',
+  'movingAverageNonEmpty', 'normalizeNGLR', 'normalizeOverall', 'normalizeUnrestOverall',
+  'rankNumber', 'olympicRankNumber', 'hide',
+] as const;
+
+const MEMBER_PROPERTY_KEYS = [
+  'decimals', 'hidden', 'sign_inversion', 'exception_aggregation', 'description', 'input_mode',
+  'disaggregation', 'disaggregation_reference', 'constant_selection', 'scaling', 'calculation',
+];
+const CALCULATION_KEYS = ['result_as', 'single_values_as', 'apply_to_result', 'cumulation'];
+
+/**
+ * Build the Qry:calculation element. Fields not given keep the member's current value,
+ * so a call that only sets result_as does not reset a single value calculation. The
+ * element is written complete, the way the modeling tools write it.
+ */
+function calculationEl(memberXml: string, calc: MemberCalculation | false): string {
+  if (calc === false) return '<Qry:calculation default="true"/>';
+  const unknown = Object.keys(calc).filter((k) => !CALCULATION_KEYS.includes(k));
+  if (unknown.length > 0) {
+    throw new Error(`Unknown calculation field(s): ${unknown.join(', ')}. Known: ${CALCULATION_KEYS.join(', ')}.`);
+  }
+  if (calc.result_as !== undefined && !(RESULT_AS_VALUES as readonly string[]).includes(calc.result_as)) {
+    throw new Error(`calculation.result_as must be one of ${RESULT_AS_VALUES.join(', ')}.`);
+  }
+  if (calc.single_values_as !== undefined && !(SINGLE_VALUES_AS_VALUES as readonly string[]).includes(calc.single_values_as)) {
+    throw new Error(`calculation.single_values_as must be one of ${SINGLE_VALUES_AS_VALUES.join(', ')}.`);
+  }
+
+  const own = memberXml.slice(0, memberOwnContentEnd(memberXml));
+  const current = own.match(/<Qry:calculation\b[^>]*?(\/>|>[\s\S]*?<\/Qry:calculation>)/)?.[0] ?? '';
+  const explicit = current !== '' && !/\bdefault="true"/.test(current.match(/^<Qry:calculation\b[^>]*>/)![0]);
+  const attr = (name: string) => (explicit ? current.match(new RegExp(`\\b${name}="([^"]*)"`))?.[1] : undefined);
+  const child = (name: string) =>
+    explicit ? current.match(new RegExp(`<Qry:${name}>([^<]*)</Qry:${name}>`))?.[1] === 'true' : undefined;
+  const aggrDirection = explicit ? current.match(/<Qry:aggrDirection>[^<]*<\/Qry:aggrDirection>/)?.[0] ?? '' : '';
+
+  const singleValuesAs = calc.single_values_as ?? attr('singleValuesAs') ?? 'blank';
+  const resultAs = calc.result_as ?? attr('resultAs') ?? 'blank';
+  const applyToResult = calc.apply_to_result ?? child('applyToResult') ?? false;
+  const cumulation = calc.cumulation ?? child('cumulation') ?? false;
+  return (
+    `<Qry:calculation default="false" singleValuesAs="${singleValuesAs}" resultAs="${resultAs}">` +
+    `<Qry:cumulation>${cumulation}</Qry:cumulation>` +
+    `<Qry:applyToResult>${applyToResult}</Qry:applyToResult>${aggrDirection}</Qry:calculation>`
+  );
 }
 
 /** Recursive formula node; validated structurally at render time. */
@@ -1209,14 +1304,58 @@ function buildComponentMember(vid: string, componentId: string, descEsc: string,
 ${restrictionGroups}</Qry:members>`;
 }
 
-/** Build an exceptionAggregation element (empty when ea is false/undefined). */
-function excAggEl(ea: ExceptionAggregation | false | undefined): string {
-  if (!ea) return '<Qry:exceptionAggregation/>';
-  if (!ea.type || !ea.reference_characteristic) {
-    throw new Error('exception_aggregation requires type and reference_characteristic.');
+/**
+ * A parameter that also accepts false carries no JSON-schema type, and MCP clients then
+ * send an object as its JSON text. Accept that form, along with "false" and "null".
+ */
+export function normalizeExceptionAggregation(
+  ea: ExceptionAggregation | false | null | undefined | string
+): ExceptionAggregation | false | undefined {
+  if (ea === null) return false;
+  if (typeof ea !== 'string') return ea;
+  const text = ea.trim();
+  if (text === '' || text === 'false' || text === 'null') return false;
+  try {
+    const parsed = JSON.parse(text) as unknown;
+    if (parsed === false || parsed === null) return false;
+    if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) return parsed as ExceptionAggregation;
+  } catch {
+    // fall through to the error below
   }
-  return `<Qry:exceptionAggregation exclude="false" type="${escapeXml(ea.type)}">
-    <Qry:referenceCharacteristic>${escapeXml(ea.reference_characteristic.toUpperCase())}</Qry:referenceCharacteristic>
+  throw new Error('exception_aggregation must be an object { type, reference_characteristic } or false.');
+}
+
+/**
+ * Build an exceptionAggregation element (empty when ea is false/undefined). The element has
+ * the same shape on a query member and on a reusable CKF's member.
+ */
+export function excAggEl(ea: ExceptionAggregation | false | undefined): string {
+  ea = normalizeExceptionAggregation(ea);
+  if (!ea) return '<Qry:exceptionAggregation/>';
+  if (typeof ea !== 'object') {
+    throw new Error('exception_aggregation must be an object { type, reference_characteristic } or false.');
+  }
+  const type = String(ea.type ?? '').toUpperCase();
+  if (!type) throw new Error('exception_aggregation requires a type.');
+  if (!(EXCEPTION_AGGREGATION_TYPES as readonly string[]).includes(type)) {
+    throw new Error(
+      `Unknown exception aggregation type '${ea.type}'. Allowed: ${EXCEPTION_AGGREGATION_TYPES.join(', ')}.`
+    );
+  }
+  const refs = (ea.reference_characteristics?.length ? ea.reference_characteristics : [ea.reference_characteristic])
+    .filter((r): r is string => typeof r === 'string' && r.trim() !== '')
+    .map((r) => r.trim().toUpperCase());
+  if (refs.length === 0) {
+    throw new Error('exception_aggregation requires a reference_characteristic.');
+  }
+  if (refs.length > MAX_REFERENCE_CHARACTERISTICS) {
+    throw new Error(`exception_aggregation takes at most ${MAX_REFERENCE_CHARACTERISTICS} reference characteristics.`);
+  }
+  const refEls = refs
+    .map((r) => `<Qry:referenceCharacteristic>${escapeXml(r)}</Qry:referenceCharacteristic>`)
+    .join('\n    ');
+  return `<Qry:exceptionAggregation exclude="${ea.exclude === true}" type="${type}">
+    ${refEls}
   </Qry:exceptionAggregation>`;
 }
 
@@ -1378,9 +1517,41 @@ function setMemberAttribute(memberXml: string, name: string, value: string): str
   return updated + memberXml.slice(openTagEnd);
 }
 
+/**
+ * A selection member (basic key figure, or a reference to a CKF/RKF) has no calculation step
+ * to carry an exception aggregation. The backend accepts one in the document, reports the save
+ * as consistent and stores nothing — on a classic release and on BW/4HANA alike.
+ */
+const SELECTION_MEMBER_EXC_AGG_ERROR =
+  'Exception aggregation cannot be set on a selection member (a basic key figure or a reference to a ' +
+  'CKF/RKF): the backend drops it without an error. Set it on the reusable CKF itself ' +
+  '(bw_create_ckf / bw_update_ckf), or on a local formula member (add_formula).';
+
+function isSelectionMember(memberXml: string): boolean {
+  const openTag = memberXml.slice(0, memberXml.indexOf('>') + 1);
+  return /xsi:type="Qry:MemberSelection"/.test(openTag);
+}
+
 /** Apply a MemberProperties object to a member XML string (each field replaces its element). */
 export function applyMemberProperties(memberXml: string, props: MemberProperties, doc: string): string {
+  // An unknown key would otherwise be dropped while the save still reports success.
+  const unknown = Object.keys(props).filter((k) => !MEMBER_PROPERTY_KEYS.includes(k));
+  if (unknown.length > 0) {
+    throw new Error(`Unknown member propert${unknown.length > 1 ? 'ies' : 'y'}: ${unknown.join(', ')}. Known: ${MEMBER_PROPERTY_KEYS.join(', ')}.`);
+  }
   let out = memberXml;
+  if (props.scaling !== undefined) {
+    if (props.scaling === false) {
+      out = setMemberChildElement(out, 'scaling', '<Qry:scaling default="true"/>');
+    } else if (Number.isInteger(props.scaling) && props.scaling >= 0 && props.scaling <= 9) {
+      out = setMemberChildElement(out, 'scaling', `<Qry:scaling default="false" number="${props.scaling}"/>`);
+    } else {
+      throw new Error('scaling must be an integer between 0 and 9 (a power of ten), or false.');
+    }
+  }
+  if (props.calculation !== undefined) {
+    out = setMemberChildElement(out, 'calculation', calculationEl(out, props.calculation));
+  }
   if (props.decimals !== undefined) {
     if (!Number.isInteger(props.decimals) || props.decimals < 0 || props.decimals > 9) {
       throw new Error('decimals must be an integer between 0 and 9.');
@@ -1400,6 +1571,9 @@ export function applyMemberProperties(memberXml: string, props: MemberProperties
     out = setMemberChildElement(out, 'signInversion', `<Qry:signInversion default="false" invert="${props.sign_inversion ? 'true' : 'false'}"/>`);
   }
   if (props.exception_aggregation !== undefined) {
+    if (normalizeExceptionAggregation(props.exception_aggregation) && isSelectionMember(out)) {
+      throw new Error(SELECTION_MEMBER_EXC_AGG_ERROR);
+    }
     out = setMemberChildElement(out, 'exceptionAggregation', excAggEl(props.exception_aggregation));
   }
   if (props.description !== undefined) {
@@ -1418,7 +1592,7 @@ export function applyMemberProperties(memberXml: string, props: MemberProperties
   return out;
 }
 
-interface MatchedMember {
+export interface MatchedMember {
   id: string;
   description: string;
   start: number;
@@ -1584,13 +1758,21 @@ export const FORMULA_OPERATOR_ARITY: Record<string, [number, number]> = {
 };
 
 /**
+ * Renders operand node types a caller defines itself, returning undefined for the
+ * nodes it leaves to the standard operand types.
+ */
+export type FormulaOperandHook = (node: FormulaNode, tag: string) => string | undefined;
+
+/**
  * Render a formula node tree. The root element is Qry:formulaToken; nested operands
  * are Qry:childToken. Operator codes +,-,*,/ map to FormulaInfixOperator, any other
  * code to FormulaPrefixOperator. Member / component operands resolve against the
  * current document (mainComponent region).
  */
-function renderFormulaNode(node: FormulaNode, doc: string, tag: string): string {
+export function renderFormulaNode(node: FormulaNode, doc: string, tag: string, operand?: FormulaOperandHook): string {
   if (!node || typeof node !== 'object') throw new Error('Invalid formula node.');
+  const custom = operand?.(node, tag);
+  if (custom !== undefined) return custom;
   const type = node['type'];
   if (type === 'operator') {
     const rawCode = String(node['code'] ?? '');
@@ -1620,7 +1802,7 @@ function renderFormulaNode(node: FormulaNode, doc: string, tag: string): string 
       throw new Error(`Formula operator '${code}' requires at least one operand.`);
     }
     const xsiType = ['+', '-', '*', '/'].includes(code) ? 'Qry:FormulaInfixOperator' : 'Qry:FormulaPrefixOperator';
-    const children = operands.map((o) => renderFormulaNode(o, doc, 'Qry:childToken')).join('');
+    const children = operands.map((o) => renderFormulaNode(o, doc, 'Qry:childToken', operand)).join('');
     return `<${tag} xsi:type="${xsiType}" code="${escapeXml(code)}">${children}</${tag}>`;
   }
   if (type === 'member') {
@@ -2042,6 +2224,14 @@ export async function bwUpdateQueryKeyFigures(
     throw new Error(`Invalid structure_target '${structureTarget}' (expected rows or columns).`);
   }
   for (const op of ops) {
+    if (
+      (op.action === 'add_key_figure' || op.action === 'add_ckf' || op.action === 'add_rkf') &&
+      (normalizeExceptionAggregation(op.exception_aggregation) ||
+        normalizeExceptionAggregation(op.properties?.exception_aggregation))
+    ) {
+      throw new Error(`${op.action}: ${SELECTION_MEMBER_EXC_AGG_ERROR}`);
+    }
+    if (op.exception_aggregation) excAggEl(op.exception_aggregation);
     if (op.action === 'add_key_figure') {
       if (!op.infoobject) throw new Error('add_key_figure requires an infoobject.');
     } else if (op.action === 'add_ckf' || op.action === 'add_rkf') {
@@ -2096,9 +2286,6 @@ export async function bwUpdateQueryKeyFigures(
         const restrictionGroups = buildRestrictionGroups(op.restrictions);
         const vid = allocateVirtualId(doc);
         let memberXml = buildKeyFigureMember(vid, kyf, descEsc, op.description !== undefined, restrictionGroups);
-        if (op.exception_aggregation !== undefined) {
-          memberXml = setMemberChildElement(memberXml, 'exceptionAggregation', excAggEl(op.exception_aggregation));
-        }
         if (op.properties) memberXml = applyMemberProperties(memberXml, op.properties, doc);
         doc = insertKeyFigureMember(doc, memberXml, structureTarget, { parent: op.parent, position: op.position });
         summary.push(`add key figure ${kyf}`);
@@ -2122,9 +2309,6 @@ export async function bwUpdateQueryKeyFigures(
         const dupMemberId = findMemberReferencingComponent(doc, resolved.componentId);
         const vid = allocateVirtualId(doc);
         let memberXml = buildComponentMember(vid, resolved.componentId, descEsc, op.description !== undefined, restrictionGroups);
-        if (op.exception_aggregation !== undefined) {
-          memberXml = setMemberChildElement(memberXml, 'exceptionAggregation', excAggEl(op.exception_aggregation));
-        }
         if (op.properties) memberXml = applyMemberProperties(memberXml, op.properties, doc);
         doc = insertKeyFigureMember(doc, memberXml, structureTarget, { parent: op.parent, position: op.position });
         let entry = `add ${kind.toUpperCase()} ${op.component_name!.toUpperCase()}`;
