@@ -26,6 +26,114 @@ function attr(str: string, key: string): string {
   return str.match(new RegExp(`\\b${key}="([^"]*)"`)) ?.[1] ?? '';
 }
 
+// ── Field name usage and field groups (shared by every write path) ───────────
+
+/**
+ * How an InfoObject-bound element is exposed to queries.
+ *
+ * "direct" is BWMT's "use the associated object directly by name": queries see the
+ * InfoObject name. "unique_name" exposes the system-wide unique name "<prefix>-<ELEMENT>"
+ * instead, so a query looking for the InfoObject does not find it. The switch is the
+ * `globalElementName` attribute on the element's `<inlineType>`, not a property of its own.
+ */
+export type NameUsage = 'direct' | 'unique_name';
+
+export const DEFAULT_CHARACTERISTIC_GROUP = 'CHARACTERISTICS';
+export const DEFAULT_KEY_FIGURE_GROUP = 'KEYFIGURES';
+
+/**
+ * The `<inlineType>` a CompositeProvider element carries, built from a source element body.
+ *
+ * Sources differ in shape: BW/4HANA serves the tag self-closing, a classic release wraps a
+ * `<dataElementName>` child in it. The element accepts only the self-closing form, and a
+ * pattern that expects it finds nothing on a classic release — the element is then written
+ * without a type and loses its direct name usage.
+ */
+export function compositeInlineType(elementBody: string): string {
+  const open = elementBody.match(/<inlineType\b([^>]*?)\s*\/?>/);
+  return open ? `<inlineType${open[1]}/>` : '';
+}
+
+/** Set or clear `globalElementName` on an `<inlineType …/>` tag. */
+export function withGlobalElementName(inlineType: string, globalName: string | undefined): string {
+  const stripped = inlineType.replace(/\s+globalElementName="[^"]*"/, '');
+  if (!globalName) return stripped;
+  return /\bname="[^"]*"/.test(stripped)
+    ? stripped.replace(/(<inlineType\b[^>]*?\bname="[^"]*")/, `$1 globalElementName="${globalName}"`)
+    : stripped.replace(/^<inlineType\b/, `<inlineType globalElementName="${globalName}"`);
+}
+
+/**
+ * Name usage for a new element. Without an explicit choice an element named after its
+ * InfoObject uses it directly — the shape BWMT gives it, and the one a query needs.
+ */
+export function resolveNameUsage(
+  requested: NameUsage | undefined,
+  targetName: string,
+  infoObjectName: string | undefined
+): NameUsage | undefined {
+  if (!infoObjectName) {
+    if (requested === 'direct') {
+      throw new Error(
+        `name_usage "direct" needs an element bound to an InfoObject; ${targetName} is a plain field.`
+      );
+    }
+    return undefined;
+  }
+  return requested ?? (targetName === infoObjectName ? 'direct' : 'unique_name');
+}
+
+/** InfoObjects already used directly by an element of the model, as globalElementName values. */
+export function directlyUsedNames(xml: string): Set<string> {
+  return new Set([...xml.matchAll(/<inlineType\b[^>]*\bglobalElementName="([^"]+)"/g)].map((m) => m[1]));
+}
+
+/** Field groups a CompositeProvider declares, as group name → label (empty when it has none). */
+export function compositeGroups(xml: string): Map<string, string> {
+  const groups = new Map<string, string>();
+  const re = /<dimension\b[^>]*\bname="([^"]+)"[^>]*?(?:\/>|>([\s\S]*?)<\/dimension>)/g;
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(xml)) !== null) {
+    groups.set(m[1], decodeXmlEntities(m[2]?.match(/<descriptions\b[^>]*\blabel="([^"]*)"/)?.[1] ?? ''));
+  }
+  return groups;
+}
+
+/** The value an element's `dimension` attribute carries to sit in a group. */
+export function groupRef(group: string): string {
+  return `#///${group}§`;
+}
+
+/** Declare a field group at the end of the model if it is not declared yet. */
+export function ensureGroupDeclared(xml: string, group: string): string {
+  if (compositeGroups(xml).has(group)) return xml;
+  return xml.replace(/(\s*)<\/Composite:compositeView>\s*$/, `\n  <dimension name="${group}"/>$1</Composite:compositeView>`);
+}
+
+/**
+ * The group a new or moved element goes to. A group the caller names must be declared,
+ * except the two defaults, which are declared on demand the way BWMT does it.
+ */
+export function resolveGroup(
+  xml: string,
+  requested: string | undefined,
+  isKeyFigure: boolean,
+  cpUpper: string
+): string {
+  const defaultGroup = isKeyFigure ? DEFAULT_KEY_FIGURE_GROUP : DEFAULT_CHARACTERISTIC_GROUP;
+  const name = requested?.trim().toUpperCase() || defaultGroup;
+  const declared = compositeGroups(xml);
+  if (declared.has(name) || name === DEFAULT_CHARACTERISTIC_GROUP || name === DEFAULT_KEY_FIGURE_GROUP) {
+    return name;
+  }
+  const known = [...declared.keys()].sort();
+  throw new Error(
+    `CompositeProvider ${cpUpper} has no field group "${name}". ` +
+    (known.length ? `Declared groups: ${known.join(', ')}. ` : 'It declares no field groups yet. ') +
+    `Create it first with action "update_group", or use ${DEFAULT_CHARACTERISTIC_GROUP} / ${DEFAULT_KEY_FIGURE_GROUP}.`
+  );
+}
+
 export async function bwGetCompositeProvider(
   client: BwClient,
   compositeProviderName: string
@@ -87,9 +195,11 @@ export async function bwGetCompositeProvider(
       /consumptionViewProperties\b[^>]*objectType="KYF"/.test(elemBody) ||
       /<localProperties\b[^>]*LocalKeyfigureProperties/.test(elemBody) ||
       dimName.includes('__KEYFIGURES');
+    const globalName = attr(compositeInlineType(elemBody), 'globalElementName');
     fields.push({
       name,
       ...(infoObjectName ? { info_object_name: infoObjectName } : {}),
+      ...(infoObjectName ? { name_usage: globalName ? 'direct' : 'unique_name' } : {}),
       dimension: dimName,
       is_key_figure: isKeyFigure,
     });
@@ -98,6 +208,14 @@ export async function bwGetCompositeProvider(
   const totalFields = fields.length;
   const keyFigureCount = fields.filter(f => f['is_key_figure']).length;
   const characteristicCount = totalFields - keyFigureCount;
+
+  const groups = [...compositeGroups(xml)].map(([groupName, label]) => ({
+    name: groupName,
+    ...(label ? { label } : {}),
+    field_count: fields.filter((f) => f['dimension'] === groupName).length,
+  }));
+  const ungroupedCount = fields.filter((f) => !f['dimension']).length;
+  const uniqueNameCount = fields.filter((f) => f['name_usage'] === 'unique_name').length;
 
   // Inputs (source providers)
   const inputs: Array<Record<string, unknown>> = [];
@@ -151,8 +269,12 @@ export async function bwGetCompositeProvider(
       total: totalFields,
       characteristic_count: characteristicCount,
       key_figure_count: keyFigureCount,
+      ...(ungroupedCount ? { ungrouped_count: ungroupedCount } : {}),
+      // A query addresses such a field by "<prefix>-<ELEMENT>", not by its InfoObject name.
+      ...(uniqueNameCount ? { unique_name_count: uniqueNameCount } : {}),
       list: fields,
     },
+    groups,
   };
 
   // Join condition (Join CPs only)
@@ -431,6 +553,16 @@ export interface FieldMapping {
   constantValue?: string;
   /** Binds a newly created target element to an InfoObject instead of leaving it field-based. */
   infoObjectName?: string;
+  /** Name usage of a newly created, InfoObject-bound target element. */
+  nameUsage?: NameUsage;
+  /** Field group of a newly created target element. */
+  dimension?: string;
+}
+
+/** Defaults for every target element one call creates; a mapping's own setting wins. */
+export interface NewElementDefaults {
+  nameUsage?: NameUsage;
+  dimension?: string;
 }
 
 export interface SourceFieldMeta {
@@ -444,11 +576,14 @@ export interface SourceFieldMeta {
   aggregationBehavior: string;
   conversionRoutine?: string;
   fixedUnit?: string;
+  fixedCurrency?: string;
   unitCurrencyRefBareName?: string;
   outputLength: number;
   /** Set when the source models this field through an InfoObject rather than a plain field. */
   infoObjectName?: string;
   conversionType?: string;
+  /** A technical element BW maintains itself (marked metaObject on the source). */
+  isMetaObject: boolean;
 }
 
 // Pure CUKY/UNIT fields are bound to the standard currency/unit characteristics at
@@ -456,10 +591,12 @@ export interface SourceFieldMeta {
 const AUTO_IOBJ_FOR_TYPE: Record<string, string> = { CUKY: '0CURRENCY', UNIT: '0UNIT' };
 
 /**
- * Record-count fields are left out of auto-mapping. BW maintains the row count itself as an
- * internal attribute of the generated column view, and mapping it as an ordinary element
- * makes activation fail on that view with "__numoffacttablerows is missing". An explicit
- * mapping still passes through, so the caller can override this.
+ * Technical elements are left out of auto-mapping. BW maintains them itself as internal
+ * attributes of the generated column view — the record count, the currency/unit dimension —
+ * and mapping one as an ordinary element makes activation fail on that view ("… is missing
+ * in node …"). BWMT does not offer them either. The source marks them metaObject; the row
+ * count is listed by name as well for sources that do not. An explicit mapping still passes
+ * through, so the caller can override this.
  */
 const AUTO_MAP_EXCLUDED = new Set(['1ROWCOUNT']);
 
@@ -503,7 +640,7 @@ export async function fetchCompositeSourceFields(
       const infoObjectBased = !dimension && Boolean(sourceInfoObject) && name === sourceInfoObject;
       if (!name || (!fieldBased && !infoObjectBased)) continue;
 
-      const inlineTypeXml = body.match(/<inlineType\b[^>]*\/>/)?.[0] ?? '';
+      const inlineTypeXml = compositeInlineType(body);
       const unitCurrencyRaw = body.match(/<unitCurrencyElement>([^<]*)<\/unitCurrencyElement>/)?.[1];
       const refPrefix = `#///${fieldNamePrefix}-`;
       const outputLengthRaw = attr(elemAttrs, 'outputLength');
@@ -519,11 +656,13 @@ export async function fetchCompositeSourceFields(
         isKeyFigure: /LocalKeyfigureProperties/.test(body),
         aggregationBehavior: attr(elemAttrs, 'aggregationBehavior') || 'NONE',
         conversionRoutine: attr(elemAttrs, 'conversionRoutine') || undefined,
-        fixedUnit: body.match(/<fixedUnit>([^<]*)<\/fixedUnit>/)?.[1],
+        fixedUnit: body.match(/<fixedUnit\b[^>]*>([^<]*)<\/fixedUnit>/)?.[1],
+        fixedCurrency: body.match(/<fixedCurrency\b[^>]*>([^<]*)<\/fixedCurrency>/)?.[1],
         unitCurrencyRefBareName: unitCurrencyRaw?.startsWith(refPrefix)
           ? unitCurrencyRaw.slice(refPrefix.length)
           : undefined,
         outputLength: outputLengthRaw ? parseInt(outputLengthRaw, 10) : 0,
+        isMetaObject: /<consumptionViewProperties\b[^>]*\bmetaObject="true"/.test(body),
       });
     }
   }
@@ -532,56 +671,88 @@ export async function fetchCompositeSourceFields(
 }
 
 /** Build the target element block for a field that the CompositeProvider does not have yet. */
+interface TargetElementOptions {
+  infoObjectNameOverride?: string;
+  nameUsage?: NameUsage;
+  /** Field group, already resolved and declared. */
+  group: string;
+}
+
+/**
+ * The InfoObject a new target element is bound to, if any: the source's own, the one the
+ * caller names, or the standard currency/unit characteristic for a pure CUKY/UNIT field.
+ */
+function targetInfoObject(field: SourceFieldMeta, override?: string): string | undefined {
+  return field.infoObjectName ?? override ?? AUTO_IOBJ_FOR_TYPE[field.dataType];
+}
+
 function buildTargetElementXml(
   field: SourceFieldMeta,
   targetName: string,
   nodeName: string,
   resolveUnitCurrencyTarget: (bareSourceName: string) => string | undefined,
-  infoObjectNameOverride?: string
+  opts: TargetElementOptions
 ): string {
+  const infoObjectName = targetInfoObject(field, opts.infoObjectNameOverride);
+  const direct = opts.nameUsage === 'direct';
+  const inlineType = field.inlineTypeXml
+    ? withGlobalElementName(field.inlineTypeXml, direct ? infoObjectName : undefined)
+    : '';
+  const dimensionAttr = `dimension="${groupRef(opts.group)}"`;
+  // A directly used InfoObject brings its authorization relevance along; BWMT drops the
+  // local override when switching an element to direct usage.
+  const authorizationLine = direct ? [] : [`      <authorizationRelevant>N</authorizationRelevant>`];
+  const fixedLines = [
+    ...(field.fixedCurrency ? [`    <fixedCurrency>${field.fixedCurrency}</fixedCurrency>`] : []),
+    ...(field.fixedUnit ? [`    <fixedUnit>${field.fixedUnit}</fixedUnit>`] : []),
+  ];
+
   // A field the source models through an InfoObject is rebuilt in the shape an active
-  // CompositeProvider uses for it: no dimension, the label in endUserTexts, and the
-  // association back to the InfoObject. See payloads/hcpr_add_input_infoobject_based.md.
+  // CompositeProvider uses for it: the label in endUserTexts and the association back to
+  // the InfoObject. See payloads/hcpr_add_input_infoobject_based.md.
   if (field.infoObjectName) {
     const iobjAttrs = [
       `name="${targetName}"`,
       ...(field.isKeyFigure ? [`aggregationBehavior="${field.aggregationBehavior}"`] : []),
       `infoObjectName="${field.infoObjectName}"`,
+      dimensionAttr,
       ...(field.conversionRoutine ? [`conversionRoutine="${field.conversionRoutine}"`] : []),
       ...(field.conversionType ? [`conversionType="${field.conversionType}"`] : []),
       ...(field.outputLength ? [`outputLength="${field.outputLength}"`] : []),
     ].join(' ');
     const iobjLines = [`  <element xsi:type="BwCore:BwElement" ${iobjAttrs}>`];
     iobjLines.push(`    <endUserTexts label="${escapeXmlAttr(field.label)}"/>`);
-    if (field.inlineTypeXml) iobjLines.push(`    ${field.inlineTypeXml}`);
+    if (inlineType) iobjLines.push(`    ${inlineType}`);
+    iobjLines.push(...fixedLines);
     if (field.isKeyFigure) {
       iobjLines.push(`    <localProperties xsi:type="BwCore:LocalKeyfigureProperties"/>`);
       const semantics = SEMANTICS_TAG[field.dataType];
       if (semantics) iobjLines.push(`    <semantics>${semantics}</semantics>`);
-    } else {
+    } else if (authorizationLine.length) {
       iobjLines.push(`    <localProperties xsi:type="BwCore:LocalCharacteristicProperties">`);
-      iobjLines.push(`      <authorizationRelevant>N</authorizationRelevant>`);
+      iobjLines.push(...authorizationLine);
       iobjLines.push(`    </localProperties>`);
+    } else {
+      iobjLines.push(`    <localProperties xsi:type="BwCore:LocalCharacteristicProperties"/>`);
     }
     iobjLines.push(`    <associationType>1</associationType>`);
     iobjLines.push(`  </element>`);
     return iobjLines.join('\n');
   }
 
-  const infoObjectName = infoObjectNameOverride ?? AUTO_IOBJ_FOR_TYPE[field.dataType];
   const attrs = [
     `name="${targetName}"`,
     `aggregationBehavior="${field.aggregationBehavior}"`,
     ...(infoObjectName ? [`infoObjectName="${infoObjectName}"`] : []),
     ...(field.conversionRoutine ? [`conversionRoutine="${field.conversionRoutine}"`] : []),
-    `dimension="#///GROUP1§"`,
+    dimensionAttr,
     `outputLength="${field.outputLength}"`,
   ].join(' ');
 
   const label = escapeXmlAttr(field.label);
   const lines: string[] = [`  <element xsi:type="BwCore:BwElement" ${attrs}>`];
-  if (field.inlineTypeXml) lines.push(`    ${field.inlineTypeXml}`);
-  if (field.fixedUnit) lines.push(`    <fixedUnit>${field.fixedUnit}</fixedUnit>`);
+  if (inlineType) lines.push(`    ${inlineType}`);
+  lines.push(...fixedLines);
   if (field.unitCurrencyRefBareName) {
     const refTarget = resolveUnitCurrencyTarget(field.unitCurrencyRefBareName) ?? field.unitCurrencyRefBareName;
     lines.push(`    <unitCurrencyElement>#///${nodeName}/${refTarget}</unitCurrencyElement>`);
@@ -596,7 +767,7 @@ function buildTargetElementXml(
     lines.push(`    <localProperties xsi:type="BwCore:LocalCharacteristicProperties">`);
     lines.push(`      <descriptions label="${label}"/>`);
     lines.push(`      <referentialIntegrity>false</referentialIntegrity>`);
-    lines.push(`      <authorizationRelevant>N</authorizationRelevant>`);
+    lines.push(...authorizationLine);
     lines.push(`    </localProperties>`);
     if (infoObjectName) lines.push(`    <associationType>1</associationType>`);
   }
@@ -622,9 +793,14 @@ function resolveMappings(
   fields: SourceFieldMeta[],
   providerName: string,
   nodeName: string,
-  existingXml: string
-): { mappingsXml: string[]; newElementsXml: string[] } {
+  existingXml: string,
+  defaults: NewElementDefaults = {}
+): { mappingsXml: string[]; newElementsXml: string[]; groups: Set<string> } {
   const byBareName = new Map(fields.map((f) => [f.defaultTargetName, f]));
+  const cpUpper = existingXml.match(/<Composite:compositeView\b[^>]*\bname="([^"]*)"/)?.[1] ?? '';
+  // Two elements using the same InfoObject directly would both answer to its name.
+  const directNames = directlyUsedNames(existingXml);
+  const groups = new Set<string>();
 
   // Resolve target names up front so a unit or currency reference can point at a sibling
   // field of the same batch before that field's element block exists.
@@ -652,13 +828,38 @@ function resolveMappings(
       );
     }
     mappingsXml.push(buildTypeMappingXml(target, field.sourceName));
-    if (!new RegExp(`<element\\b[^>]*\\bname="${escapeRegex(target)}"`).test(existingXml)) {
+    const elementRe = new RegExp(`<element\\b[^>]*\\bname="${escapeRegex(target)}"`);
+    const exists = elementRe.test(existingXml) || newElementsXml.some((block) => elementRe.test(block));
+    if (!exists) {
+      const infoObjectName = targetInfoObject(field, m.infoObjectName);
+      const nameUsage = resolveNameUsage(m.nameUsage ?? defaults.nameUsage, target, infoObjectName);
+      if (nameUsage === 'direct' && infoObjectName) {
+        if (directNames.has(infoObjectName)) {
+          throw new Error(
+            `InfoObject ${infoObjectName} is already used directly by another element of CompositeProvider ` +
+            `${cpUpper}, so ${target} cannot use it directly as well. Map onto that element, or pass ` +
+            `name_usage "unique_name" for ${target}.`
+          );
+        }
+        directNames.add(infoObjectName);
+      }
+      const group = resolveGroup(existingXml, m.dimension ?? defaults.dimension, field.isKeyFigure, cpUpper);
+      groups.add(group);
       newElementsXml.push(
-        buildTargetElementXml(field, target, nodeName, (bare) => targetNameByBareSource.get(bare), m.infoObjectName)
+        buildTargetElementXml(field, target, nodeName, (bare) => targetNameByBareSource.get(bare), {
+          infoObjectNameOverride: m.infoObjectName,
+          nameUsage,
+          group,
+        })
       );
     }
   }
-  return { mappingsXml, newElementsXml };
+  return { mappingsXml, newElementsXml, groups };
+}
+
+function declareGroups(xml: string, groups: Iterable<string>): string {
+  for (const group of groups) xml = ensureGroupDeclared(xml, group);
+  return xml;
 }
 
 /**
@@ -698,7 +899,7 @@ function buildAutoMappings(
   viewNodeType: 'Join' | 'Union' | undefined
 ): FieldMapping[] {
   const usedInBatch = new Set<string>();
-  return fields.filter((f) => !AUTO_MAP_EXCLUDED.has(f.defaultTargetName)).map((f) => {
+  return fields.filter((f) => !f.isMetaObject && !AUTO_MAP_EXCLUDED.has(f.defaultTargetName)).map((f) => {
     const desired = shortenTargetName(f.defaultTargetName);
     const target =
       viewNodeType === 'Union'
@@ -745,9 +946,9 @@ export async function bwUpdateCompositeProviderInput(
   client: BwClient,
   compositeProviderName: string,
   action: 'add_input' | 'remove_input',
-  opts: { input?: InputProviderDef; inputAlias?: string; transport?: string } = {}
+  opts: { input?: InputProviderDef; inputAlias?: string; transport?: string; defaults?: NewElementDefaults } = {}
 ): Promise<string> {
-  const { input, inputAlias, transport } = opts;
+  const { input, inputAlias, transport, defaults } = opts;
   const cpUpper = compositeProviderName.toUpperCase();
   const cpResult = await freshRead(HCPR_PATH(compositeProviderName), HCPR_ACCEPT);
   const timestamp = cpResult.headers['timestamp'] ?? cpResult.headers['TIMESTAMP'];
@@ -792,12 +993,15 @@ export async function bwUpdateCompositeProviderInput(
         : buildAutoMappings(fields, xml, getViewNodeType(xml));
 
     const alias = nextInputAlias(xml, nodeName, input.providerType);
-    const { mappingsXml, newElementsXml } = resolveMappings(requested, fields, input.providerName, nodeName, xml);
+    const { mappingsXml, newElementsXml, groups } = resolveMappings(
+      requested, fields, input.providerName, nodeName, xml, defaults
+    );
     xml = openViewNode(xml);
 
     if (newElementsXml.length > 0) {
       xml = injectBeforeAnchor(xml, newElementsXml.join('\n'), ['<input', '<join'], '</viewNode>');
     }
+    xml = declareGroups(xml, groups);
     xml = ensureNamespace(xml, 'BwCore', 'http://www.sap.com/bw/modeling/BwCore.ecore');
     xml = ensureNamespace(xml, 'Type', 'http://www.sap.com/ndb/DataModelType.ecore');
 
@@ -848,7 +1052,8 @@ export async function bwUpdateCompositeProviderMapping(
   compositeProviderName: string,
   inputAlias: string,
   mappings: FieldMapping[],
-  transport?: string
+  transport?: string,
+  defaults?: NewElementDefaults
 ): Promise<string> {
   const cpUpper = compositeProviderName.toUpperCase();
   const alias = inputAlias.trim();
@@ -874,11 +1079,14 @@ export async function bwUpdateCompositeProviderMapping(
   const { fields } = await fetchCompositeSourceFields(providerName);
 
   const effective = mappings.length > 0 ? mappings : buildAutoMappings(fields, xml, getViewNodeType(xml));
-  const { mappingsXml, newElementsXml } = resolveMappings(effective, fields, providerName, nodeName, xml);
+  const { mappingsXml, newElementsXml, groups } = resolveMappings(
+    effective, fields, providerName, nodeName, xml, defaults
+  );
 
   if (newElementsXml.length > 0) {
     xml = injectBeforeAnchor(openViewNode(xml), newElementsXml.join('\n'), ['<input', '<join'], '</viewNode>');
   }
+  xml = declareGroups(xml, groups);
   xml = ensureNamespace(xml, 'BwCore', 'http://www.sap.com/bw/modeling/BwCore.ecore');
   xml = ensureNamespace(xml, 'Type', 'http://www.sap.com/ndb/DataModelType.ecore');
 
@@ -963,6 +1171,190 @@ export async function bwUpdateCompositeProviderSettings(
     composite_provider_name: cpUpper,
     object_type: 'hcpr',
     applied: settings,
+  });
+}
+
+// ── bw_update_composite_provider: field groups and name usage ────────────────
+
+async function putModel(
+  client: BwClient,
+  compositeProviderName: string,
+  xml: string,
+  timestamp: string | undefined,
+  transport?: string
+): Promise<string> {
+  const lockHandle = await client.lock('hcpr', compositeProviderName);
+  try {
+    await client.put('hcpr', compositeProviderName, lockHandle, xml, timestamp, transport);
+  } catch (err) {
+    await client.unlock('hcpr', compositeProviderName).catch(() => {/* ignore */});
+    throw err;
+  }
+  return lockHandle;
+}
+
+/** The `<element>` block of one CompositeProvider field, taken from the view node only. */
+function findViewElement(xml: string, fieldName: string): string | undefined {
+  const viewNode = xml.match(/<viewNode\b[\s\S]*?<\/viewNode>/)?.[0] ?? '';
+  return viewNode.match(
+    new RegExp(`<element\\b[^>]*\\bname="${escapeRegex(fieldName)}"[^>]*?(?:\\/>|>[\\s\\S]*?<\\/element>)`)
+  )?.[0];
+}
+
+function setElementAttr(openTag: string, key: string, value: string): string {
+  const existing = new RegExp(`\\s${key}="[^"]*"`);
+  return existing.test(openTag)
+    ? openTag.replace(existing, ` ${key}="${value}"`)
+    : openTag.replace(/^(<element\b)/, `$1 ${key}="${value}"`);
+}
+
+/**
+ * bw_update_composite_provider action "update_fields" — move existing fields into a field
+ * group and/or switch how an InfoObject-bound field is exposed (see NameUsage).
+ */
+export async function bwUpdateCompositeProviderFields(
+  client: BwClient,
+  compositeProviderName: string,
+  fieldNames: string[],
+  opts: { dimension?: string; nameUsage?: NameUsage; transport?: string }
+): Promise<string> {
+  const cpUpper = compositeProviderName.toUpperCase();
+  const { dimension, nameUsage, transport } = opts;
+  if (fieldNames.length === 0) throw new Error('update_fields requires info_object_name (one or more field names).');
+  if (dimension === undefined && nameUsage === undefined) {
+    throw new Error('update_fields requires dimension and/or name_usage.');
+  }
+
+  const cpResult = await freshRead(HCPR_PATH(compositeProviderName), HCPR_ACCEPT);
+  const timestamp = cpResult.headers['timestamp'] ?? cpResult.headers['TIMESTAMP'];
+  let xml = cpResult.body;
+
+  const changed: Array<Record<string, string>> = [];
+  const skipped: Array<{ field: string; reason: string }> = [];
+  const groups = new Set<string>();
+
+  for (const raw of fieldNames) {
+    const field = raw.trim().toUpperCase();
+    const element = findViewElement(xml, field);
+    if (!element) {
+      skipped.push({ field, reason: `not a field of CompositeProvider ${cpUpper}` });
+      continue;
+    }
+    const openTag = element.match(/^<element\b[^>]*?\/?>/)?.[0] ?? '';
+    let newOpen = openTag;
+    let newElement = element;
+    const result: Record<string, string> = { field };
+
+    if (dimension !== undefined) {
+      const isKeyFigure = /<localProperties\b[^>]*LocalKeyfigureProperties/.test(element);
+      const group = resolveGroup(xml, dimension, isKeyFigure, cpUpper);
+      groups.add(group);
+      newOpen = setElementAttr(newOpen, 'dimension', groupRef(group));
+      result['dimension'] = group;
+    }
+
+    if (nameUsage !== undefined) {
+      const infoObjectName = attr(openTag, 'infoObjectName');
+      const inlineType = element.match(/<inlineType\b[^>]*\/>/)?.[0];
+      if (!infoObjectName) {
+        skipped.push({ field, reason: 'a plain field without an InfoObject has no name usage to switch' });
+        continue;
+      }
+      if (!inlineType) {
+        skipped.push({ field, reason: 'the element carries no inlineType; remove and re-add the field' });
+        continue;
+      }
+      if (nameUsage === 'direct') {
+        const alreadyDirect = attr(inlineType, 'globalElementName') === infoObjectName;
+        if (!alreadyDirect && directlyUsedNames(xml).has(infoObjectName)) {
+          skipped.push({ field, reason: `InfoObject ${infoObjectName} is already used directly by another element` });
+          continue;
+        }
+        newElement = newElement
+          .replace(inlineType, withGlobalElementName(inlineType, infoObjectName))
+          .replace(/\s*<authorizationRelevant>[^<]*<\/authorizationRelevant>/, '');
+      } else {
+        newElement = newElement.replace(inlineType, withGlobalElementName(inlineType, undefined));
+      }
+      result['name_usage'] = nameUsage;
+    }
+
+    newElement = newElement.replace(openTag, () => newOpen);
+    xml = xml.replace(element, () => newElement);
+    changed.push(result);
+  }
+
+  if (changed.length === 0) {
+    return JSON.stringify({ success: false, message: `No field changed in CompositeProvider ${cpUpper}.`, skipped });
+  }
+  xml = declareGroups(ensureNamespace(xml, 'BwCore', 'http://www.sap.com/bw/modeling/BwCore.ecore'), groups);
+  const lockHandle = await putModel(client, compositeProviderName, xml, timestamp, transport);
+
+  return JSON.stringify({
+    success: true,
+    message: `${changed.length} field(s) of CompositeProvider ${cpUpper} changed. Call bw_activate to activate.`,
+    lock_handle: lockHandle,
+    composite_provider_name: cpUpper,
+    object_type: 'hcpr',
+    changed,
+    ...(skipped.length ? { skipped } : {}),
+  });
+}
+
+/**
+ * bw_update_composite_provider action "update_group" — declare a field group, change its
+ * label, or rename it together with every field that sits in it.
+ */
+export async function bwUpdateCompositeProviderGroup(
+  client: BwClient,
+  compositeProviderName: string,
+  groupName: string,
+  opts: { label?: string; newName?: string; transport?: string }
+): Promise<string> {
+  const cpUpper = compositeProviderName.toUpperCase();
+  const group = groupName?.trim().toUpperCase();
+  if (!group) throw new Error('update_group requires dimension (the group name).');
+  const newName = opts.newName?.trim().toUpperCase();
+
+  const cpResult = await freshRead(HCPR_PATH(compositeProviderName), HCPR_ACCEPT);
+  const timestamp = cpResult.headers['timestamp'] ?? cpResult.headers['TIMESTAMP'];
+  let xml = cpResult.body;
+  const declared = compositeGroups(xml);
+
+  const finalName = newName ?? group;
+  const label = opts.label ?? declared.get(group) ?? '';
+  const declaration = label
+    ? `<dimension name="${finalName}">\n    <descriptions label="${escapeXmlAttr(label)}"/>\n  </dimension>`
+    : `<dimension name="${finalName}"/>`;
+
+  let message: string;
+  if (!declared.has(group)) {
+    if (newName) throw new Error(`CompositeProvider ${cpUpper} has no field group "${group}" to rename.`);
+    xml = ensureGroupDeclared(xml, group).replace(`<dimension name="${group}"/>`, declaration);
+    message = `Field group ${group} created in CompositeProvider ${cpUpper}.`;
+  } else {
+    if (newName && newName !== group && declared.has(newName)) {
+      throw new Error(`CompositeProvider ${cpUpper} already has a field group "${newName}".`);
+    }
+    xml = xml.replace(
+      new RegExp(`<dimension\\b[^>]*\\bname="${escapeRegex(group)}"[^>]*?(?:\\/>|>[\\s\\S]*?<\\/dimension>)`),
+      () => declaration
+    );
+    if (newName) xml = xml.split(`dimension="${groupRef(group)}"`).join(`dimension="${groupRef(newName)}"`);
+    message = newName
+      ? `Field group ${group} of CompositeProvider ${cpUpper} renamed to ${newName}.`
+      : `Field group ${group} of CompositeProvider ${cpUpper} updated.`;
+  }
+
+  const lockHandle = await putModel(client, compositeProviderName, xml, timestamp, opts.transport);
+  return JSON.stringify({
+    success: true,
+    message: `${message} Call bw_activate to activate.`,
+    lock_handle: lockHandle,
+    composite_provider_name: cpUpper,
+    object_type: 'hcpr',
+    group: finalName,
+    ...(label ? { label } : {}),
   });
 }
 

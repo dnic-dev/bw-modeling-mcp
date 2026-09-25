@@ -6,6 +6,17 @@ import {
   bwSeg,
   bwEscapeName,
 } from '../bw-client.js';
+import {
+  NameUsage,
+  NewElementDefaults,
+  compositeInlineType,
+  directlyUsedNames,
+  ensureGroupDeclared,
+  groupRef,
+  resolveGroup,
+  resolveNameUsage,
+  withGlobalElementName,
+} from './composite_provider.js';
 
 /** Resolved per call, not once at import — see the note on adsoAccept() in adso.ts. */
 const hcprAccept = (): string => MEDIA_TYPES['hcpr'];
@@ -81,11 +92,21 @@ function findElement(xml: string, fieldName: string): string | null {
  * `<consumptionViewProperties>` are all server-side annotations and are left out.
  * `<semantics>` is deliberately not generated — the server derives it.
  */
-function buildCompositeElement(providerElement: string, fieldName: string): string {
-  const openTag = providerElement.match(/<element\b[^>]*?>/)?.[0] ?? '';
-  const isKeyFigure =
+function isKeyFigureElement(providerElement: string): boolean {
+  return (
     /consumptionViewProperties\b[^>]*objectType="KYF"/.test(providerElement) ||
-    /<localProperties\b[^>]*LocalKeyfigureProperties/.test(providerElement);
+    /<localProperties\b[^>]*LocalKeyfigureProperties/.test(providerElement)
+  );
+}
+
+function buildCompositeElement(
+  providerElement: string,
+  fieldName: string,
+  nameUsage: NameUsage | undefined,
+  group: string
+): string {
+  const openTag = providerElement.match(/<element\b[^>]*?>/)?.[0] ?? '';
+  const isKeyFigure = isKeyFigureElement(providerElement);
 
   const aggregationBehavior = attr(openTag, 'aggregationBehavior');
   const conversionRoutine = attr(openTag, 'conversionRoutine');
@@ -93,33 +114,40 @@ function buildCompositeElement(providerElement: string, fieldName: string): stri
   const outputLength = outputLengthRaw.replace(/^0+(?=\d)/, '');
   const label = providerElement.match(/<endUserTexts\b[^>]*\blabel="([^"]*)"/)?.[1] ?? '';
 
-  const inlineOpen = providerElement.match(/<inlineType\b[^>]*?\/?>/)?.[0] ?? '';
-  const inlineAttrs = ['name', 'globalElementName', 'length', 'precision', 'scale', 'semanticType']
+  const inlineOpen = compositeInlineType(providerElement);
+  const inlineAttrs = ['name', 'length', 'precision', 'scale', 'semanticType']
     .map((key) => {
       const value = attr(inlineOpen, key);
       return value ? ` ${key}="${value}"` : '';
     })
     .join('');
+  const direct = nameUsage === 'direct';
+  const inlineType = withGlobalElementName(`<inlineType${inlineAttrs}/>`, direct ? fieldName : undefined);
 
   const attrs = [
     ` xsi:type="BwCore:BwElement"`,
     ` name="${fieldName}"`,
     ` infoObjectName="${fieldName}"`,
+    ` dimension="${groupRef(group)}"`,
     aggregationBehavior ? ` aggregationBehavior="${aggregationBehavior}"` : '',
     conversionRoutine ? ` conversionRoutine="${conversionRoutine}"` : '',
     outputLength ? ` outputLength="${outputLength}"` : '',
   ].join('');
 
+  // A directly used InfoObject brings its authorization relevance along, so the local
+  // override is left out the way BWMT drops it when switching to direct usage.
   const localProperties = isKeyFigure
     ? '<localProperties xsi:type="BwCore:LocalKeyfigureProperties"/>'
-    : '<localProperties xsi:type="BwCore:LocalCharacteristicProperties">' +
-      '<authorizationRelevant>N</authorizationRelevant>' +
-      '</localProperties>';
+    : direct
+      ? '<localProperties xsi:type="BwCore:LocalCharacteristicProperties"/>'
+      : '<localProperties xsi:type="BwCore:LocalCharacteristicProperties">' +
+        '<authorizationRelevant>N</authorizationRelevant>' +
+        '</localProperties>';
 
   return (
     `<element${attrs}>` +
     `<endUserTexts label="${label}"/>` +
-    `<inlineType${inlineAttrs}/>` +
+    inlineType +
     localProperties +
     '<associationType>1</associationType>' +
     '</element>'
@@ -166,7 +194,8 @@ export async function bwUpdateCompositeProvider(
   infoObjectName: string,
   action: CompositeProviderFieldAction = 'add_field',
   sourceProviders?: string,
-  transport?: string
+  transport?: string,
+  defaults: NewElementDefaults = {}
 ): Promise<string> {
   const cpUpper = compositeProviderName.toUpperCase();
   const fieldNames = splitList(infoObjectName);
@@ -253,10 +282,17 @@ export async function bwUpdateCompositeProvider(
         continue;
       }
 
-      const elementXml = buildCompositeElement(hits[0].element, field);
+      const nameUsage = resolveNameUsage(defaults.nameUsage, field, field);
+      if (nameUsage === 'direct' && directlyUsedNames(xml).has(field)) {
+        skipped.push({ field, reason: `InfoObject ${field} is already used directly by another element` });
+        continue;
+      }
+      const group = resolveGroup(xml, defaults.dimension, isKeyFigureElement(hits[0].element), cpUpper);
+      const elementXml = buildCompositeElement(hits[0].element, field, nameUsage, group);
       const idx = xml.indexOf('<input');
-      xml = idx === -1 ? xml.replace('</viewNode>', `${elementXml}</viewNode>`)
+      xml = idx === -1 ? xml.replace('</viewNode>', () => `${elementXml}</viewNode>`)
                        : xml.slice(0, idx) + elementXml + xml.slice(idx);
+      xml = ensureGroupDeclared(xml, group);
 
       for (const hit of hits) xml = appendMapping(xml, hit.input, field);
 

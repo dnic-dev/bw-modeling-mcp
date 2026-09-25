@@ -82,10 +82,23 @@ function parseCheckResult(body: string): string[] {
     throw new Error(
       `Query save reported errors: ${errorTitles.join('; ')}. ` +
       `NOTE: the query has still been SAVED in an inconsistent state — the server persists the document ` +
-      `with error markers rather than rolling back. Correct or remove the offending change with a follow-up operation.`
+      `rather than rolling back. Undo the offending change with a follow-up bw_update_query_* call on the same ` +
+      `query, for example bw_update_query_key_figures remove_member with the member_id bw_get_query lists for ` +
+      `the element that was just added; that call saves normally.`
     );
   }
   return messages;
+}
+
+/**
+ * Drop the check-result markers a GET returns inside the document.
+ *
+ * A query saved with errors comes back with `<Qry:messages …/>` entries. They are output only:
+ * sent back in a PUT, a classic release rejects the whole document ("PARSE_MODEL cannot process
+ * XML element messages"), so without this no follow-up call could repair such a query.
+ */
+export function stripCheckMarkers(xml: string): string {
+  return xml.replace(/\s*<(?:[A-Za-z]+:)?messages\b[^>]*?(?:\/>|>[\s\S]*?<\/(?:[A-Za-z]+:)?messages>)/g, '');
 }
 
 /**
@@ -473,7 +486,7 @@ export async function withQueryDocument(
   const lockHandle = lockMatch[1];
 
   try {
-    const mutated = mutate(getResult.body);
+    const mutated = mutate(stripCheckMarkers(getResult.body));
 
     const client2 = createClientFromEnv();
     const csrf2 = await client2.getCsrfToken();

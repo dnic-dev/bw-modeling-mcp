@@ -57,6 +57,47 @@ const typePresets: Record<string, Record<string, boolean>> = {
   },
 };
 
+export type AdsoTypePreset = keyof typeof typePresets;
+
+const ADSO_TYPE_LABELS: Record<string, string> = {
+  standard: 'Standard-DataStore-Objekt',
+  staging_inbound_only: 'Staging — Nur Eingangs-Queue',
+  staging_compress: 'Staging — Daten komprimieren',
+  staging_reporting: 'Staging — Reporting aktiviert',
+  datamart: 'Data-Mart-DataStore-Objekt',
+  direct_update: 'DataStore-Objekt mit direkter Fortschreibung',
+};
+
+/**
+ * The type presets a set of root flags matches, most likely first.
+ *
+ * The inverse of typePresets, checked against what the server keeps after a create on both a
+ * BW/4HANA and a classic release. A classic release does not carry isReportingObject, and
+ * without it a standard aDSO without change log and a compressing staging aDSO leave the
+ * same flags — both are returned then.
+ */
+export function adsoTypeCandidates(rootTag: string): string[] {
+  const value = (name: string) => rootTag.match(new RegExp(`\\b${name}="([^"]*)"`))?.[1];
+  const on = (name: string) => value(name) === 'true';
+  if (on('directUpdate')) return ['direct_update'];
+  if (value('activateData') === 'false') return ['staging_inbound_only'];
+  if (on('cubeDeltaOnly')) return ['datamart'];
+  if (on('noAqDeletion')) return ['staging_reporting'];
+  if (on('writeChangelog')) return ['standard'];
+  const reporting = value('isReportingObject');
+  if (reporting === 'false') return ['staging_compress'];
+  if (reporting === 'true') return ['standard'];
+  return ['standard', 'staging_compress'];
+}
+
+function adsoTypeLabel(candidates: string[]): string {
+  const [first, ...rest] = candidates;
+  const label = `${ADSO_TYPE_LABELS[first] ?? first} (adso_type: ${first})`;
+  return rest.length
+    ? `${label} — on this release not distinguishable from ${rest.map((c) => `${ADSO_TYPE_LABELS[c]} (adso_type: ${c})`).join(', ')}`
+    : label;
+}
+
 /**
  * Set or replace a boolean attribute on the root <adso:dataStore> element.
  * If the attribute already exists, its value is replaced in-place.
@@ -235,33 +276,13 @@ function summarizeAdso(adsoName: string, status: string, xml: string): string {
   lines.push(`Bestand aktiviert:                  ${flag('isNcum')}`);
 
   // ── Section 3: Modelling Type ─────────────────────────────────────────────
-  const directUpdate     = boolAttr('directUpdate');
-  const cubeDeltaOnly    = boolAttr('cubeDeltaOnly');
-  const noAqDeletion     = boolAttr('noAqDeletion');
-  const isReportingObject = boolAttr('isReportingObject', true);
-  const activateData     = boolAttr('activateData', true);
   const writeChangelog   = boolAttr('writeChangelog');
   const snapShotScenario = boolAttr('snapShotScenario');
   const uniqueDataRecords = boolAttr('uniqueDataRecords');
 
-  let modellingType: string;
-  if (directUpdate) {
-    modellingType = 'DataStore-Objekt mit direkter Fortschreibung';
-  } else if (cubeDeltaOnly && !noAqDeletion) {
-    modellingType = 'Staging — Nur Eingangs-Queue';
-  } else if (!cubeDeltaOnly && noAqDeletion) {
-    modellingType = 'Staging — Daten komprimieren';
-  } else if (cubeDeltaOnly && noAqDeletion) {
-    modellingType = 'Staging — Reporting aktiviert';
-  } else if (!isReportingObject && activateData && !cubeDeltaOnly) {
-    modellingType = 'Data-Mart-DataStore-Objekt';
-  } else {
-    modellingType = 'Standard-DataStore-Objekt';
-  }
-
   lines.push('');
   lines.push('── Modelling Type ──');
-  lines.push(modellingType);
+  lines.push(adsoTypeLabel(adsoTypeCandidates(rootTagStr)));
   if (writeChangelog)    lines.push('  Change Log schreiben: yes');
   if (snapShotScenario)  lines.push('  Snapshot-Unterstützung: yes');
   if (uniqueDataRecords) lines.push('  Eindeutige Datensätze: yes');
@@ -953,12 +974,27 @@ export async function bwCreateAdso(
   }
   await client.unlock('adso', adsoName);
 
+  // Read the type back: the server decides which of the sent flags it keeps.
+  const createdRoot =
+    (await freshRead(`/sap/bw/modeling/adso/${bwSeg(adsoName)}/m`, adsoAccept())).body
+      .match(/<adso:dataStore\b[^>]*>/)?.[0] ?? '';
+  const candidates = adsoTypeCandidates(createdRoot);
+  const requestedType = action === 'empty' ? (typePresets[adsoType] ? adsoType : 'standard') : undefined;
+  const typeMismatch = requestedType !== undefined && !candidates.includes(requestedType);
+
   const fromTemplate = templateName ? ` from template ${templateName.toUpperCase()}` : '';
   return JSON.stringify({
     success: true,
-    message: `aDSO ${nameUpper} created${fromTemplate} in package ${pkg}. Call bw_activate to activate.`,
+    message:
+      `aDSO ${nameUpper} created${fromTemplate} in package ${pkg}. Call bw_activate to activate.` +
+      (typeMismatch
+        ? ` WARNING: requested adso_type "${requestedType}", but the server kept the flags of ` +
+          `"${candidates[0]}". Set the type with bw_update_adso action "update_settings".`
+        : ''),
     adso_name: nameUpper,
     object_type: 'adso',
+    adso_type: candidates[0],
+    ...(candidates.length > 1 ? { adso_type_alternatives: candidates.slice(1) } : {}),
   });
 }
 

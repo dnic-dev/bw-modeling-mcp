@@ -17,6 +17,7 @@ import {
   descriptionEl,
   excAggEl,
   normalizeExceptionAggregation,
+  stripCheckMarkers,
   walkMembers,
   type ExceptionAggregation,
   type FormulaNode,
@@ -140,8 +141,9 @@ async function withElementDocument(
 
   // A save of an unchanged document is not free: it records the whole component,
   // with every element it contains, in the transport request.
-  const mutated = mutate(getResult.body);
-  if (mutated === getResult.body) return { messages: [], document: mutated, unchanged: true };
+  const current = stripCheckMarkers(getResult.body);
+  const mutated = mutate(current);
+  if (mutated === current) return { messages: [], document: mutated, unchanged: true };
 
   const lockResponse = await client.rawPost(`${path}?action=lock`, '', {
     Accept: accept,

@@ -64,10 +64,10 @@ Read the complete structural data flow of a BW object — all connected sources 
 ## aDSO
 
 ### `bw_get_adso`
-Read the full structure of an aDSO — fields, key fields, settings, version state.
+Read the full structure of an aDSO — fields, key fields, settings, version state. The modelling type is shown with the `adso_type` preset that creates it. On a classic release a compressing staging aDSO and a standard aDSO without change log carry the same settings; both are named then.
 
 ### `bw_create_adso`
-Create a new aDSO. Supports two modes: `from_template` (copies structure from an existing aDSO) or `empty`. Supports all aDSO type presets including write-interface (`pushMode`).
+Create a new aDSO. Supports two modes: `from_template` (copies structure from an existing aDSO) or `empty`. Supports all aDSO type presets including write-interface (`pushMode`). The result names the type the server kept (`adso_type`) and warns if it differs from the requested preset.
 
 ### `bw_update_adso`
 Modify an existing aDSO. Actions:
@@ -231,13 +231,17 @@ Fetch a live data preview from a DataSource. Resolves field names automatically 
 ## CompositeProvider
 
 ### `bw_get_composite_provider` _(Read only)_
-Read a CompositeProvider (HCPR) — view node type (Union/Join), source providers with input mapping counts, all fields with dimension classification, join conditions, and temporal join details.
+Read a CompositeProvider (HCPR) — view node type (Union/Join), source providers with input mapping counts, all fields with their field group (`dimension`) and, for InfoObject-bound fields, their `name_usage`, the declared field groups with label and field count, join conditions, and temporal join details. A field with `name_usage` `"unique_name"` is found by a query only under `<prefix>-<FIELD>`, not under its InfoObject name; `fields.unique_name_count` says whether there are any.
 
 ### `bw_create_composite_provider`
 Create a CompositeProvider. Without `copy_from`, a view node of the given type with the listed source providers attached — entity only, so give them their mappings afterwards with `bw_update_composite_provider` action `update_mapping`. A Union node may be created empty; a Join node must be created with its sources, since a join node without inputs makes the server dump. With `copy_from`, the server copies view node, inputs and mappings from an existing CompositeProvider. The result is inactive.
 
 ### `bw_update_composite_provider`
-Change a CompositeProvider. Eight actions: `add_field` / `remove_field` for fields, `add_input` / `remove_input` for source providers, `update_mapping` for one input's complete mapping list (omit the mappings to map every source field one to one), `update_join` / `remove_join` per input pair, and `update_settings` for description, stackable, default node and aggregation behaviour. Every action returns a `lock_handle` that `bw_activate` needs — an HCPR cannot be activated without it.
+Change a CompositeProvider. Ten actions: `add_field` / `remove_field` for fields, `add_input` / `remove_input` for source providers, `update_mapping` for one input's complete mapping list (omit the mappings to map every source field one to one), `update_join` / `remove_join` per input pair, `update_fields` / `update_group` for field groups and name usage, and `update_settings` for description, stackable, default node and aggregation behaviour. Every action returns a `lock_handle` that `bw_activate` needs — an HCPR cannot be activated without it.
+
+Fields the tool creates are ready for a query: a field named after its InfoObject uses that InfoObject directly by name (`name_usage` `"direct"`), and every new field goes into the field group `CHARACTERISTICS` or `KEYFIGURES`. `name_usage` (`"direct"` / `"unique_name"`) and `dimension` (a field group) change that for all fields one call creates, or per entry in `mappings`. Two fields cannot use the same InfoObject directly; the second is refused. Technical fields of the source (record count, currency/unit dimension) are left out of auto-mapping.
+
+`update_fields` takes the fields in `info_object_name` and moves them into `dimension` and/or switches them to `name_usage`. `update_group` creates the group named in `dimension` (with `label`), relabels it, or renames it to `new_dimension_name` together with its fields. A group other than `CHARACTERISTICS` / `KEYFIGURES` must be created before fields are put into it; an unknown group is refused with the declared groups listed.
 
 Two things to know: both sides of a join key must be mapped onto the **same** target field, otherwise activation fails with "join fields need at least one common target field" — auto-mapping deliberately does not do this, so map the second side's key fields explicitly. And `remove_input` leaves the removed input's elements and any join referencing it behind; those have to be cleaned up separately.
 

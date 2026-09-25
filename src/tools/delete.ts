@@ -116,8 +116,17 @@ export async function bwDelete(
   // 1. Lock — uses /m before ?action=lock (delete-specific lock URL)
   const lockHandle = await client.lockForDelete(typeLower, objectName, mediaType);
 
-  // 2. DELETE
-  const deleteResult = await client.delete(typeLower, objectName, lockHandle, mediaType);
+  // 2. DELETE. A refused delete ("still in use") must not leave the object locked: the lock
+  // would outlive this call and block every later change until the session times out.
+  let deleteResult: string;
+  try {
+    deleteResult = await client.delete(typeLower, objectName, lockHandle, mediaType);
+  } catch (err) {
+    await client.unlock(typeLower, objectName).catch((unlockErr) => {
+      process.stderr.write(`Warning: failed to unlock ${typeLower} ${objectName} after a failed delete: ${unlockErr}\n`);
+    });
+    throw err;
+  }
 
   // 3. Unlock — no /m (same as normal unlock)
   await client.unlock(typeLower, objectName);

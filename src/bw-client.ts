@@ -538,10 +538,19 @@ export class BwClient {
       response = await this.csrfRequest();
     }
     this.updateCookies(response);
+    // A stateful context the server has already ended is answered with 400 ("Session Timed
+    // Out") rather than a new token — seen on BW/4HANA right after an activation that built a
+    // column view. The token fetch is side-effect free, so it is repeated once without it.
+    if (response.status === 400 && this.cookies.has('sap-contextid') && !this.frozenCookies.has('sap-contextid')) {
+      this.discardSessionContext();
+      response = await this.csrfRequest();
+      this.updateCookies(response);
+    }
     const token = response.headers['x-csrf-token'] as string | undefined;
     if (!token || token.toLowerCase() === 'fetch') {
+      const detail = String(response.data ?? '').replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim().slice(0, 200);
       throw new Error(
-        `Failed to fetch CSRF token (HTTP ${response.status}). ${this.csrfFailureHint()}`
+        `Failed to fetch CSRF token (HTTP ${response.status})${detail ? `: ${detail}` : ''}. ${this.csrfFailureHint()}`
       );
     }
     this.csrfToken = token;

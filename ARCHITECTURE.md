@@ -31,7 +31,7 @@ The token is fetched once at startup and reused for all subsequent write operati
 
 **Cookie mode (BW Bridge / SAML- or OAuth-fronted systems):** When `BW_COOKIE_FILE` is set, the client authenticates with cookies exported from an authenticated browser session instead of Basic Auth (`BW_USER` / `BW_PASSWORD` become optional). The cookie file is read in Netscape format (7 tab-separated fields) or as simple `name=value` lines. In this mode the stateful headers (`sap-client`, `X-sap-adt-sessiontype: stateful`) are not sent as defaults — BW Bridge rejects stateful requests with HTTP 401 when no backend session exists on the targeted app instance. Cookies loaded from the file are "frozen" and never overwritten by `Set-Cookie` responses. When the session expires, refresh the cookies in `BW_COOKIE_FILE` and restart the server.
 
-**A short dump ends the session context.** A request answered with HTTP 500 has usually dumped, and the dump ends the stateful context on the server without saying so: the next request carrying the same `sap-contextid` hangs and fails as well on a classic release, or is answered "400 Session Timed Out" on BW/4HANA. `BwClient.get` therefore drops `sap-contextid` after an HTTP 500, and the next request opens a fresh context under the same logon. Nothing held in the old context survives the dump, a lock included, so nothing is lost. The search service is where this shows: it answers a type filter it does not support with a dump, and `bw_search` falls back to an unfiltered search in the fresh context.
+**A short dump ends the session context.** A request answered with HTTP 500 has usually dumped, and the dump ends the stateful context on the server without saying so: the next request carrying the same `sap-contextid` hangs and fails as well on a classic release, or is answered "400 Session Timed Out" on BW/4HANA. `BwClient.get` therefore drops `sap-contextid` after an HTTP 500, and the next request opens a fresh context under the same logon. Nothing held in the old context survives the dump, a lock included, so nothing is lost. The search service is where this shows: it answers a type filter it does not support with a dump, and `bw_search` falls back to an unfiltered search in the fresh context. A context the server ended without a dump shows the same way on the token fetch: BW/4HANA answers it with HTTP 400 instead of a token (seen right after activating a CompositeProvider), so a token fetch answered 400 drops `sap-contextid` and is repeated once.
 
 **Important:** Lock and write operations on the same object must use separate `BwClient` instances (separate `sap-contextid` session cookies). SAP's internal buffer caches object state per session — reusing the same session for both Lock and PUT causes null pointer crashes in the ABAP backend (`CL_RSTRAN_TRFN=>GET_PROGID`). This is not documented in the API — discovered via ABAP debugging.
 
@@ -68,6 +68,24 @@ All write operations on BW objects follow this protocol:
 - `a` = active version (what is in production)
 
 Always read `m`, write to `m`. Activation promotes `m` → `a`.
+
+**What a GET returns is not always what a PUT accepts.** Two cases are stripped or rewritten
+before sending the document back:
+
+- A query (and a CKF, RKF or structure) saved with errors comes back with `<Qry:messages>`
+  check markers inside the document. They are output only; a classic release rejects a PUT that
+  carries them (`PARSE_MODEL` cannot process element `messages`), so the query engine removes
+  them before the mutation.
+- A CompositeProvider element copies the `<inlineType>` of its source field, which a classic
+  release serves with a child element and BW/4HANA serves self-closing. The element takes the
+  self-closing form only. `globalElementName` on that tag is the "direct usage by name" switch a
+  query depends on (`compositeInlineType` and `withGlobalElementName` in
+  `src/tools/composite_provider.ts`). Field groups are `<dimension>` declarations at the end of
+  the model, referenced from each element's `dimension` attribute; a referenced group is always
+  declared.
+
+A delete that BW refuses releases its lock before the error is returned; a lock left behind
+would block every later change of the object until the session times out.
 
 ---
 
@@ -155,7 +173,8 @@ src/
     ├── activation.ts     # bw_activate, bw_unlock
     ├── adso.ts           # bw_get_adso, bw_create_adso, bw_update_adso
     ├── composite_provider.ts # bw_get_composite_provider, bw_create_composite_provider,
-    │                     # bw_update_composite_provider — inputs, mappings, joins, settings
+    │                     # bw_update_composite_provider — inputs, mappings, joins, field
+    │                     # groups, name usage, settings
     ├── composite_provider_update.ts # bw_update_composite_provider — add_field, remove_field
     ├── cp_components.ts  # bw_get_ckf, bw_get_rkf, bw_get_structure, bw_get_variable
     ├── cto.ts            # bw_change_package — package reassignment via /sap/bw/modeling/cto/write;

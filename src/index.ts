@@ -48,6 +48,9 @@ import {
   bwUpdateCompositeProviderJoin,
   bwRemoveCompositeProviderJoin,
   bwUpdateCompositeProviderSettings,
+  bwUpdateCompositeProviderFields,
+  bwUpdateCompositeProviderGroup,
+  NameUsage,
 } from './tools/composite_provider.js';
 import { bwUpdateCompositeProvider, CompositeProviderFieldAction } from './tools/composite_provider_update.js';
 import { bwGetCkf, bwGetRkf, bwGetStructure, bwGetVariable } from './tools/cp_components.js';
@@ -2884,8 +2887,9 @@ const TOOL_DEFINITIONS = [
       name: 'bw_get_composite_provider',
       description:
         'Read a CompositeProvider (HCPR) structure — general info, view node type (Union/Join), ' +
-        'source providers (inputs) with mapping counts, fields with dimension classification, ' +
-        'join condition, and temporal join details. Returns the inactive version.',
+        'source providers (inputs) with mapping counts, fields with their field group (dimension) and, for InfoObject-bound fields, ' +
+        'their name usage ("direct" or "unique_name" — a query finds a "unique_name" field only under "<prefix>-<FIELD>"), ' +
+        'the declared field groups, join condition, and temporal join details. Returns the inactive version.',
       inputSchema: {
         type: 'object',
         properties: {
@@ -2906,6 +2910,7 @@ const TOOL_DEFINITIONS = [
         'Sources: "add_input" attaches a source provider, creates the target elements it needs and returns the generated alias; "remove_input" strips one by alias, leaving its elements and any join reference behind. ' +
         'Mappings: "update_mapping" replaces the complete mapping list of one input; pass no mappings to map every field of its source one to one. This is also how an input attached at creation time gets its mappings. ' +
         'Joins: "update_join" sets the condition between one pair of inputs — call it once per pair to build an N-way join — and "remove_join" drops one pair. Note that both sides of a join key must be mapped onto the SAME target field, otherwise activation fails with "join fields need at least one common target field"; auto-mapping does not do this, so map the second side\'s key fields explicitly. ' +
+        'Field groups and name usage: every field the tool creates goes into a field group (CHARACTERISTICS or KEYFIGURES unless dimension names another) and, when it is named after its InfoObject, uses that InfoObject directly by name — the form a query needs to find it. "update_fields" moves existing fields into a group and/or switches their name usage; "update_group" creates a group, changes its label or renames it. ' +
         'Settings: "update_settings" edits label, stackable, default node and aggregation behaviour.',
       inputSchema: {
         type: 'object',
@@ -2918,13 +2923,33 @@ const TOOL_DEFINITIONS = [
             type: 'string',
             enum: [
               'add_field', 'remove_field', 'add_input', 'remove_input',
-              'update_mapping', 'update_join', 'remove_join', 'update_settings',
+              'update_mapping', 'update_join', 'remove_join', 'update_fields', 'update_group', 'update_settings',
             ],
             description: 'Defaults to "add_field".',
           },
           info_object_name: {
             type: 'string',
-            description: 'add_field / remove_field: field name or comma-separated list (e.g. "IOBJ_NAME" or "IOBJ_A,IOBJ_B").',
+            description: 'add_field / remove_field / update_fields: field name or comma-separated list (e.g. "IOBJ_NAME" or "IOBJ_A,IOBJ_B").',
+          },
+          name_usage: {
+            type: 'string',
+            enum: ['direct', 'unique_name'],
+            description:
+              'How an InfoObject-bound field is exposed. "direct" uses the InfoObject directly by name, so a query finds the field under the InfoObject name; ' +
+              '"unique_name" exposes it as "<prefix>-<FIELD>" instead. ' +
+              'add_field / add_input / update_mapping: applies to the fields the call creates; defaults to "direct" for a field named after its InfoObject, "unique_name" otherwise. ' +
+              'update_fields: switches the listed existing fields.',
+          },
+          dimension: {
+            type: 'string',
+            description:
+              'Field group name (e.g. "GROUP_NAME"). add_field / add_input / update_mapping: group for the fields the call creates, defaults to CHARACTERISTICS or KEYFIGURES. ' +
+              'update_fields: group to move the listed fields into. A group other than the two defaults must be declared first with "update_group". ' +
+              'update_group: the group to create, relabel or rename.',
+          },
+          new_dimension_name: {
+            type: 'string',
+            description: 'update_group: rename the group to this name; its fields move along.',
           },
           source_providers: {
             type: 'string',
@@ -2955,6 +2980,12 @@ const TOOL_DEFINITIONS = [
                 source: { type: 'string', description: 'Field name on the source; defaults to target.' },
                 constant_value: { type: 'string', description: 'Constant instead of a source field.' },
                 info_object_name: { type: 'string', description: 'Bind a newly created target element to this InfoObject.' },
+                name_usage: {
+                  type: 'string',
+                  enum: ['direct', 'unique_name'],
+                  description: 'Name usage of a newly created target element; overrides the top-level name_usage.',
+                },
+                dimension: { type: 'string', description: 'Field group of a newly created target element; overrides the top-level dimension.' },
               },
               required: ['target'],
             },
@@ -2989,7 +3020,7 @@ const TOOL_DEFINITIONS = [
           },
           label: {
             type: 'string',
-            description: 'update_settings: new description.',
+            description: 'update_settings: new description. update_group: label of the field group.',
           },
           stackable: {
             type: 'boolean',
@@ -5970,7 +6001,13 @@ async function handleToolCall(
           source: m.source,
           constantValue: m.constant_value,
           infoObjectName: m.info_object_name,
+          nameUsage: m.name_usage as NameUsage | undefined,
+          dimension: m.dimension,
         }));
+        const cpDefaults = {
+          nameUsage: args?.name_usage as NameUsage | undefined,
+          dimension: args?.dimension as string | undefined,
+        };
 
         switch (cpAction) {
           case 'add_field':
@@ -5982,7 +6019,23 @@ async function handleToolCall(
               cpAction as CompositeProviderFieldAction,
               args?.source_providers as string | undefined,
               cpTransport,
+              cpDefaults,
             );
+            break;
+          case 'update_fields':
+            text = await bwUpdateCompositeProviderFields(
+              client,
+              cpName,
+              ((args?.info_object_name as string | undefined) ?? '').split(',').map((f) => f.trim()).filter(Boolean),
+              { ...cpDefaults, transport: cpTransport },
+            );
+            break;
+          case 'update_group':
+            text = await bwUpdateCompositeProviderGroup(client, cpName, args?.dimension as string, {
+              label: args?.label as string | undefined,
+              newName: args?.new_dimension_name as string | undefined,
+              transport: cpTransport,
+            });
             break;
           case 'add_input':
             text = await bwUpdateCompositeProviderInput(client, cpName, 'add_input', {
@@ -5992,6 +6045,7 @@ async function handleToolCall(
                 mappings: cpMappings,
               },
               transport: cpTransport,
+              defaults: cpDefaults,
             });
             break;
           case 'remove_input':
@@ -6007,6 +6061,7 @@ async function handleToolCall(
               args?.input_alias as string,
               cpMappings,
               cpTransport,
+              cpDefaults,
             );
             break;
           case 'update_join':

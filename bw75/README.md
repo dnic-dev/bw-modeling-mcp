@@ -144,6 +144,19 @@ along the way:
 The analysis processes in `bw_xref` are read through ADT DataPreview, like everything else
 from the metadata tables. Without ADT access `bw_xref` still answers, without them, and says so.
 
+### CompositeProviders for queries on 7.5
+
+A CompositeProvider built with `bw_create_composite_provider` and `bw_update_composite_provider`
+is usable in a query right away: its InfoObject-based fields use the InfoObject directly by name
+and sit in the groups `CHARACTERISTICS` and `KEYFIGURES`, as the modeling tools create them.
+A query does not find a field that uses the system-wide unique name (`<prefix>-<FIELD>`) under its
+InfoObject name. `bw_get_composite_provider` shows the name usage per field, and a
+CompositeProvider created earlier is switched with action `update_fields`,
+`name_usage="direct"`, and activated.
+
+A query saved with errors can be corrected with a follow-up call, for example
+`bw_update_query_key_figures` `remove_member` with the `member_id` from `bw_get_query`.
+
 ---
 
 ## Step 2 — the DTP filter helper (optional)
