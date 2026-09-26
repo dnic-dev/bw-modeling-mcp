@@ -22,6 +22,8 @@ import {
   platformInstructions,
   unavailableReason,
 } from './platform.js';
+import { auditLog, categoryFor, resultMetrics } from './audit.js';
+import { userLabel } from './destination.js';
 import { bwGetAdso, bwCreateAdso, FieldDef, bwUpdateAdso, bwUpdateAdsoAddPureField, bwUpdateAdsoSettings, AdsoSettings, bwUpdateAdsoManageKeys, bwUpdateAdsoFieldProperties, FieldProperties } from './tools/adso.js';
 import { bwGetInfoObject, bwCreateInfoObject, bwUpdateInfoObject, AttributeDef } from './tools/infoobject.js';
 import { bwGetTransformation, bwUpdateTransformation, bwCreateTransformation, bwSetTransformationRuntime, bwSetTransformationRoutine, bwDeleteTransformationRoutine, bwSetTransformationRoutineFields, bwSetTransformationExpertRoutine, type RuleConversion } from './tools/transformation.js';
@@ -5268,18 +5270,26 @@ async function handleToolCall(
 ): Promise<{ content: Array<{ type: 'text'; text: string }>; isError?: boolean }> {
   const { name, arguments: args } = request.params;
 
+  // One audit record per call, from the one place every call passes through. Undefined
+  // unless an auditlog instance is bound, so stdio and unbound deployments cost nothing.
+  const audit = auditLog();
+  const user = userLabel(extra.authInfo);
+  const startedAt = Date.now();
+
   // Deny before doing any work. stdio has no authInfo and nothing to check.
   if (!mayCall(name, extra.authInfo)) {
     // Naming every scope that would admit the tool, because two of them overlap: a query
     // definition is readable under 'read' and under 'analyst', and a caller told only about
     // one of them would ask for the wrong role.
     const admitted = scopesFor(name).map((s) => `'${s}'`).join(' or ');
+    audit?.write({ tool: name, user, denialReason: `requires the ${admitted} scope` }, 'security-events');
     throw new McpError(ErrorCode.InvalidRequest, `Tool '${name}' requires the ${admitted} scope.`);
   }
 
   // HTTP: the per-request client, whose identity came from XSUAA and the destination.
   // stdio: no request context, so read the environment exactly as before.
   const client = currentClient() ?? createClientFromEnv();
+  const category = categoryFor(name);
 
   try {
     await ensureMediaTypes(client);
@@ -6485,9 +6495,32 @@ async function handleToolCall(
         throw new McpError(ErrorCode.MethodNotFound, `Unknown tool: ${name}`);
     }
 
+    audit?.write(
+      {
+        tool: name,
+        user,
+        args,
+        outcome: 'success',
+        durationMs: Date.now() - startedAt,
+        result: resultMetrics(text),
+      },
+      category,
+    );
     return { content: [{ type: 'text', text }] };
   } catch (error: unknown) {
     const message = error instanceof Error ? error.message : String(error);
+    // A failed call is still an attempt on the data, so it belongs in the trail.
+    audit?.write(
+      {
+        tool: name,
+        user,
+        args,
+        outcome: 'error',
+        durationMs: Date.now() - startedAt,
+        errorMessage: message,
+      },
+      category,
+    );
     // Return as error content so Claude can see the details
     return {
       content: [{ type: 'text', text: `Error: ${message}` }],

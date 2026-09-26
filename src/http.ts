@@ -20,6 +20,7 @@ import { setupHttpAuth, loadXsuaaCredentials, resolveAppUrl } from '@arc-mcp/xsu
 import { createConnectivityProxy, parseVCAPServices } from '@arc-mcp/xsuaa-auth/btp';
 import { createServer } from './index.js';
 import { ensurePlatform } from './platform.js';
+import { initAuditLog } from './audit.js';
 import { runWithClient } from './request-context.js';
 import {
   createPrincipalPropagationClient,
@@ -55,6 +56,10 @@ async function main(): Promise<void> {
         'silently overrides per-user identity — unset them; the HTTP transport takes credentials from the destination.',
     );
   }
+
+  // Before the BW plumbing: an unusable audit binding should stop the deploy, not be
+  // discovered later by the absence of records. No binding at all leaves auditing off.
+  initAuditLog(log, destinationName);
 
   const btpConfig = parseVCAPServices(process.env, log);
   if (!btpConfig) {
