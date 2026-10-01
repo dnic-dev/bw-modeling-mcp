@@ -1,6 +1,27 @@
 import { BwClient, MEDIA_TYPES, createClientFromEnv, bwSeg } from '../bw-client.js';
 
 /**
+ * Release any enqueue the activation session acquired, through that same session.
+ *
+ * Activation runs in a fresh stateful session and can take an enqueue of its own (activating
+ * a DTP locks the referenced transformation). An enqueue is only released by the session that
+ * holds it — the server keeps the lock count in instance state in that session's roll area —
+ * so the release has to go through the activation client, not the caller's.
+ *
+ * Harmless when the session holds nothing: the request answers 200 without calling the
+ * dequeue function module. Best effort — never fails the caller.
+ */
+async function releaseActivationLock(
+  activationClient: BwClient,
+  type: string,
+  name: string,
+): Promise<void> {
+  try {
+    await activationClient.unlock(type, name);
+  } catch { /* best effort */ }
+}
+
+/**
  * Parse all <atom:title> entries from an activation/atom feed response.
  * Used to extract success messages and deactivated DTP names.
  */
@@ -96,6 +117,11 @@ export async function bwActivate(
 
   const activationXml = await activationClient.activate(typeLower, objectName, lockHandle, corrNr, sourceSystem);
 
+  // Release an enqueue the activation session may have taken, through that same session.
+  if (activationClient !== client) {
+    await releaseActivationLock(activationClient, typeLower, objectName);
+  }
+
   // Step 3: Unlock (skipped for dtpa and rsds — both are standalone activations with no lock)
   // Always use the original client session — BW locks are session-bound and can only
   // be released by the session that acquired them. activationClient is a fresh session
@@ -124,6 +150,7 @@ export async function bwActivate(
   if (hasError && hasDeletedRule && typeLower === 'trfn') {
     const retryClient = createClientFromEnv();
     const retryXml = await retryClient.activate(typeLower, objectName, lockHandle, corrNr);
+    await releaseActivationLock(retryClient, typeLower, objectName);
     if (lockHandle) {
       await client.unlock(typeLower, objectName);
     }
@@ -156,6 +183,7 @@ export async function bwActivate(
     await new Promise((resolve) => setTimeout(resolve, 1000));
     const retryClient = createClientFromEnv();
     const retryXml = await retryClient.activate(typeLower, objectName, '', corrNr);
+    await releaseActivationLock(retryClient, typeLower, objectName);
     // No unlock needed here — retrying with empty lockHandle means the object was not locked
     const retryMessages = parseActivationMessages(retryXml);
     const retryDeactivatedDtps = parseDtpsDeactivated(retryXml);
