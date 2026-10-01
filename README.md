@@ -127,7 +127,7 @@ behaviour, never in place of it.
 
 ## What it can do
 
-An overview by area. Every tool in detail — parameters, behaviour, and the sequences it belongs in — is in the **[Tools Reference](TOOLS.md)** (108 tools).
+An overview by area. Every tool in detail — parameters, behaviour, and the sequences it belongs in — is in the **[Tools Reference](TOOLS.md)** (109 tools).
 
 <p align="center">
   <picture>

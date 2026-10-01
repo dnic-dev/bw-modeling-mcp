@@ -1,4 +1,5 @@
 import { BwClient } from '../bw-client.js';
+import { correlateCall, statObjectName } from './query_statistics.js';
 
 const BICS_ACCEPT = 'application/vnd.sap.bw.modeling.bicsresponse-v1_1_0+xml';
 const BICS_CONTENT_TYPE = 'application/vnd.sap.bw.modeling.bicsrequest-v1_1_0+xml';
@@ -67,7 +68,7 @@ function xmlEscape(s: string): string {
 
 // ── Parsing ────────────────────────────────────────────────────────────────────
 
-interface TupleValue {
+export interface TupleValue {
   id: string;
   sid: string;
   selType: string;
@@ -307,9 +308,10 @@ function parseTupleSection(sectionXml: string): TupleSection {
 
 function parseResultSet(xml: string): ResultSet {
   if (/<resultSet\s*\/>/.test(xml)) {
+    // An empty result carries no range of its own; the caller reports the requested one.
     return {
-      fromRow: '0',
-      toRow: '1000',
+      fromRow: '',
+      toRow: '',
       columnHeaders: [],
       columnTuples: [],
       rowHeaders: [],
@@ -396,7 +398,29 @@ function tupleLabel(values: TupleValue[]): string {
   }).filter(s => s).join(' / ');
 }
 
-function renderQueryDataText(xml: string, isGet: boolean): string {
+export interface RenderPaging {
+  /** The range the caller asked for. */
+  fromRow: number;
+  toRow: number;
+  /**
+   * Rows the caller asked for. The request fetched one more; a row beyond this count means
+   * the result continues, and that row is not shown.
+   */
+  pageSize?: number;
+  suppressSubtotals?: boolean;
+}
+
+/** A subtotal carries a TOTAL member on some but not all of its dimensions. */
+function isTotalValue(v: TupleValue): boolean {
+  return v.selType === 'TOTAL' || v.intKey === 'SUMME';
+}
+
+export function isSubtotalRow(values: TupleValue[]): boolean {
+  const totals = values.filter(isTotalValue).length;
+  return totals > 0 && totals < values.length;
+}
+
+export function renderQueryDataText(xml: string, isGet: boolean, paging?: RenderPaging): string {
   const lines: string[] = [];
 
   // 1. Header
@@ -411,7 +435,32 @@ function renderQueryDataText(xml: string, isGet: boolean): string {
   if (viewAttrs.dataRollup) lines.push(`Data as of: ${viewAttrs.dataRollup}`);
 
   const rs = parseResultSet(xml);
-  lines.push(`Row range: ${rs.fromRow}–${rs.toRow}`);
+  const from = paging ? String(paging.fromRow) : rs.fromRow || '0';
+  const to = paging ? String(paging.toRow) : rs.toRow || '1000';
+  lines.push(`Row range: ${from}–${to}`);
+
+  // Rows keep their position in the response: cells address rows by that index.
+  let rowIndexes = rs.rowTuples.map((_, i) => i);
+  let hasMore: boolean | undefined;
+  if (paging?.pageSize !== undefined) {
+    hasMore = rowIndexes.length > paging.pageSize;
+    rowIndexes = rowIndexes.slice(0, paging.pageSize);
+  }
+  let suppressed = 0;
+  if (paging?.suppressSubtotals) {
+    const kept = rowIndexes.filter((i) => !isSubtotalRow(rs.rowTuples[i].values));
+    suppressed = rowIndexes.length - kept.length;
+    rowIndexes = kept;
+  }
+  if (hasMore !== undefined) {
+    lines.push(hasMore
+      ? `More rows: yes — continue with from_row=${to} (BICS reports no total row count)`
+      : 'More rows: no — this page ends the result');
+  }
+  if (suppressed > 0) {
+    lines.push(`Subtotals: ${suppressed} subtotal row${suppressed === 1 ? '' : 's'} suppressed on this page ` +
+      '(they still count towards the row range)');
+  }
 
   // 2. Variables
   const vc = parseVariablesContainer(xml);
@@ -447,9 +496,9 @@ function renderQueryDataText(xml: string, isGet: boolean): string {
 
   // 4. Result table
   lines.push('');
-  lines.push(`── Result (${rs.rowTuples.length} rows × ${rs.columnTuples.length} columns) ──`);
+  lines.push(`── Result (${rowIndexes.length} rows × ${rs.columnTuples.length} columns) ──`);
 
-  if (rs.columnTuples.length === 0 && rs.rowTuples.length === 0) {
+  if (rs.columnTuples.length === 0 && rowIndexes.length === 0) {
     lines.push('  (no data)');
   } else {
     const cellMap = new Map<string, { txt: string; mcu?: boolean }>();
@@ -463,7 +512,7 @@ function renderQueryDataText(xml: string, isGet: boolean): string {
     lines.push([...rowAxisLabels, ...colLabels].join(' | '));
     lines.push('-'.repeat(Math.min(200, [...rowAxisLabels, ...colLabels].join(' | ').length)));
 
-    for (let ri = 0; ri < rs.rowTuples.length; ri++) {
+    for (const ri of rowIndexes) {
       const rt = rs.rowTuples[ri];
       const rowIdx = ri + 1;
       const isTotal = rt.values.some(v => v.selType === 'TOTAL' || v.intKey === 'SUMME');
@@ -596,6 +645,48 @@ function buildPostBody(
 
 // ── Exported functions ─────────────────────────────────────────────────────────
 
+export interface QueryDataOptions {
+  /** Look up the call's BW statistics step and split the time into BW and transfer. */
+  withStatistics?: boolean;
+  /** Drop subtotal rows from the rendered table; the overall result row stays. */
+  suppressSubtotals?: boolean;
+}
+
+/**
+ * Where the time of one call went, measured on this host.
+ *
+ * `http` covers the reporting request(s) alone — request out, last byte of the answer in —
+ * so it holds the BW runtime plus everything between this host and BW: the Cloud Connector,
+ * the network and the XML transfer. CSRF token fetches are timed separately because on a cold
+ * client they are a round trip of their own.
+ */
+export interface QueryTiming {
+  requestStart: Date;
+  responseEnd: Date;
+  csrfMs: number;
+  httpMs: number;
+  attempts: number;
+  requestBytes: number;
+  responseBytes: number;
+}
+
+export function renderTiming(t: QueryTiming, totalMs: number, renderMs: number): string[] {
+  const s = (ms: number) => `${(ms / 1000).toFixed(3)} s`;
+  const kb = (b: number) => `${(b / 1024).toFixed(1)} KB`;
+  const own = Math.max(0, totalMs - t.httpMs - t.csrfMs);
+  return [
+    '',
+    '── Timing (measured by this server) ──',
+    `  Total in server:  ${s(totalMs)}`,
+    `  BW HTTP:          ${s(t.httpMs)}  (${t.attempts} attempt${t.attempts === 1 ? '' : 's'}; BW runtime + Cloud Connector + network + XML)`,
+    ...(t.csrfMs >= 1 ? [`  CSRF token:       ${s(t.csrfMs)}`] : []),
+    `  Server's own:     ${s(own)}  (parsing and rendering ${s(renderMs)})`,
+    `  Request/response: ${kb(t.requestBytes)} / ${kb(t.responseBytes)}`,
+    `  Window (UTC):     ${t.requestStart.toISOString()} – ${t.responseEnd.toISOString()}`,
+    '  Time outside this server (client, LLM, MCP transport) is not part of these figures.',
+  ];
+}
+
 export async function bwQueryData(
   client: BwClient,
   compId: string,
@@ -605,19 +696,55 @@ export async function bwQueryData(
   variables?: VariableInput[],
   fromRow: number = 0,
   toRow: number = 1000,
-  drillOperations?: DrillOperation[]
+  drillOperations?: DrillOperation[],
+  options: QueryDataOptions = {}
 ): Promise<string> {
+  const startedAt = performance.now();
   const effectiveCompId = isProvider ? `!${compId}` : compId;
   const url = `/sap/bw/modeling/comp/reporting?compid=${encodeURIComponent(effectiveCompId)}`;
   const isPost = !!(state || variables || (drillOperations && drillOperations.length > 0));
+
+  // The text rendering asks for one row beyond the page: BICS reports no total row count,
+  // so the only honest statement about the rest of the result is whether that row exists.
+  // The raw format returns exactly what was asked for.
+  const pageSize = Math.max(0, toRow - fromRow);
+  const requestedTo = format === 'text' ? toRow + 1 : toRow;
+
+  const timing: QueryTiming = {
+    requestStart: new Date(),
+    responseEnd: new Date(),
+    csrfMs: 0,
+    httpMs: 0,
+    attempts: 0,
+    requestBytes: 0,
+    responseBytes: 0,
+  };
+  const timed = async <T>(fn: () => Promise<T>): Promise<T> => {
+    const t0 = performance.now();
+    timing.attempts++;
+    try {
+      return await fn();
+    } finally {
+      timing.httpMs += performance.now() - t0;
+    }
+  };
+  const csrf = async (): Promise<string> => {
+    const t0 = performance.now();
+    try {
+      return await client.getCsrfToken();
+    } finally {
+      timing.csrfMs += performance.now() - t0;
+    }
+  };
 
   let responseXml: string;
 
   if (isPost) {
     const postBody = buildPostBody(compId, state, variables, drillOperations);
+    timing.requestBytes = Buffer.byteLength(postBody, 'utf8');
     const doPost = async (): Promise<string> => {
-      const csrfToken = await client.getCsrfToken();
-      const postResult = await client.rawPost(url, postBody, {
+      const csrfToken = await csrf();
+      const postResult = await timed(() => client.rawPost(url, postBody, {
         'Content-Type': BICS_CONTENT_TYPE,
         'X-CSRF-Token': csrfToken,
         Accept: BICS_ACCEPT,
@@ -626,11 +753,12 @@ export async function bwQueryData(
         InclObjectValues: 'true',
         HryLvlAbsRs: 'false',
         FromRow: String(fromRow),
-        ToRow: String(toRow),
+        ToRow: String(requestedTo),
         'X-sap-adt-sessiontype': 'stateless',
-      });
+      }));
       return postResult.body;
     };
+    timing.requestStart = new Date();
     try {
       responseXml = await doPost();
     } catch (err) {
@@ -644,7 +772,9 @@ export async function bwQueryData(
       }
     }
   } else {
-    const { body } = await client.rawGet(url, {
+    await csrf();
+    timing.requestStart = new Date();
+    const { body } = await timed(() => client.rawGet(url, {
       Accept: BICS_ACCEPT,
       InclMetadata: 'true',
       InclExceptDef: 'true',
@@ -652,14 +782,46 @@ export async function bwQueryData(
       CompactMode: 'false',
       HryLvlAbsRs: 'false',
       FromRow: String(fromRow),
-      ToRow: String(toRow),
+      ToRow: String(requestedTo),
       'X-sap-adt-sessiontype': 'stateless',
-    });
+    }));
     responseXml = body;
   }
+  timing.responseEnd = new Date();
+  timing.responseBytes = Buffer.byteLength(responseXml, 'utf8');
 
-  if (format === 'raw') return responseXml;
-  return renderQueryDataText(responseXml, !isPost);
+  const renderStart = performance.now();
+  const rendered = format === 'raw'
+    ? responseXml
+    : renderQueryDataText(responseXml, !isPost, {
+        fromRow,
+        toRow,
+        pageSize,
+        suppressSubtotals: options.suppressSubtotals ?? false,
+      });
+  const renderMs = performance.now() - renderStart;
+  const totalMs = performance.now() - startedAt;
+
+  // Without with_statistics the answer stays exactly as before: raw output in particular is
+  // often written to a file and compared, and a trailing block would change it.
+  if (!options.withStatistics) return rendered;
+
+  const extra = renderTiming(timing, totalMs, renderMs);
+  const statsStart = performance.now();
+  extra.push(...await correlateCall(
+    client,
+    statObjectName(compId, isProvider),
+    timing.requestStart,
+    timing.responseEnd,
+    timing.httpMs / 1000,
+  ));
+  extra.push(`  (statistics lookup took ${((performance.now() - statsStart) / 1000).toFixed(3)} s, not included above)`);
+
+  if (format === 'raw') {
+    // A comment after the root element keeps the document well-formed.
+    return `${rendered}\n<!--\n${extra.join('\n').replace(/--/g, '- -')}\n-->`;
+  }
+  return `${rendered}\n${extra.join('\n')}`;
 }
 
 export async function bwGetFilterValues(

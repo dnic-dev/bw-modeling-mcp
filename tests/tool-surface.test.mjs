@@ -45,21 +45,21 @@ test('the full tool surface is still registered', async () => {
   // This change is additive — a transport and an auth layer. It must not alter the
   // tools stdio users already depend on.
   const names = await listTools();
-  assert.equal(names.length, 108);
+  assert.equal(names.length, 109);
 });
 
 test('every tool is classified, and the split matches the verb audit', async () => {
   const names = await listTools();
   const write = names.filter((n) => requiredScope(n) === 'write');
   assert.equal(write.length, 62);
-  assert.equal(names.length - write.length, 46);
+  assert.equal(names.length - write.length, 47);
 });
 
 test('a reader is offered every read tool, analyst role or not', async () => {
   const names = await listTools();
   const offered = filterToolsByScope(names.map((name) => ({ name })), { token: 't', clientId: 'c', scopes: ['read'] });
   // Unchanged by the analyst role, which is additive: a reader kept bw_query_data.
-  assert.equal(offered.length, 46);
+  assert.equal(offered.length, 47);
   assert.ok(!offered.some((t) => requiredScope(t.name) === 'write'));
   assert.ok(offered.some((t) => t.name === 'bw_query_data'));
 });
@@ -67,7 +67,7 @@ test('a reader is offered every read tool, analyst role or not', async () => {
 test('an analyst is offered a reporting surface small enough to work with', async () => {
   const names = await listTools();
   const offered = filterToolsByScope(names.map((name) => ({ name })), { token: 't', clientId: 'c', scopes: ['analyst'] });
-  // The count is the point: a business client carrying all 107 tools picks the wrong one far
+  // The count is the point: a business client carrying all 109 tools picks the wrong one far
   // more often than one carrying fourteen, so growth here is a decision, not an accident.
   assert.equal(offered.length, 14);
   assert.ok(offered.some((t) => t.name === 'bw_query_data'));
@@ -98,19 +98,19 @@ function profileOf(platform, collections = []) {
 test('detection failure leaves the full surface in place', async () => {
   // Fail open: a transient error must never hand a caller an empty or half server.
   const names = await listTools();
-  assert.equal(names.length, 108);
+  assert.equal(names.length, 109);
 });
 
 test('a classic verdict filters even when discovery could not be read', async () => {
   // The static fallback layer: no collections to go by, so the platform verdict decides.
   const names = await listTools({ BW_PLATFORM: 'classic' });
-  assert.equal(names.length, 63);
+  assert.equal(names.length, 64);
   for (const gone of ['bw_get_transformation', 'bw_get_dtp', 'bw_get_process_chain', 'bw_query_data', 'bw_push_data', 'bw_list_process_chain_runs', 'bw_list_requests', 'bw_get_dataflow']) {
     assert.ok(!names.includes(gone), `${gone} should be hidden on classic BW`);
   }
   // The reads that do work on classic stay — including the one tool every hidden read points
   // at, which is what makes hiding them an answer rather than a dead end.
-  for (const kept of ['bw_get_adso', 'bw_get_infoobject', 'bw_get_query', 'bw_get_dtps', 'bw_read_metadata_tables', 'bw_create_transport_task', 'bw_get_filter_values']) {
+  for (const kept of ['bw_get_adso', 'bw_get_infoobject', 'bw_get_query', 'bw_get_dtps', 'bw_read_metadata_tables', 'bw_query_statistics', 'bw_create_transport_task', 'bw_get_filter_values']) {
     assert.ok(names.includes(kept), `${kept} should stay on classic BW`);
   }
 });
@@ -118,7 +118,7 @@ test('a classic verdict filters even when discovery could not be read', async ()
 test('BW_PLATFORM=bw4 switches the platform filter off entirely', async () => {
   // The escape hatch for a tool this catalog misjudges.
   const names = await listTools({ BW_PLATFORM: 'bw4' });
-  assert.equal(names.length, 108);
+  assert.equal(names.length, 109);
 });
 
 test('published collections decide, not the platform label', async () => {

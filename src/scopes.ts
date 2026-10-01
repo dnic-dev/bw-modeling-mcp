@@ -81,6 +81,7 @@ const READ_TOOLS = new Set([
   'bw_list_source_systems',
   'bw_preview_datasource',
   'bw_query_data',
+  'bw_query_statistics',
   'bw_read_metadata_tables',
   'bw_search',
   'bw_system_profile',

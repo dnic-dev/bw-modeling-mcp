@@ -74,6 +74,7 @@ import { bwListContents } from './tools/repository.js';
 import { bwListSourceSystems, bwListDatasources, bwGetSourceSystem, bwGetDatasource, bwPreviewDatasource, bwListRemoteEntities, bwCreateDatasource, bwChangeDatasourceDelta, bwSetDatasourceFields } from './tools/datasource.js';
 import { bwGetDataflow } from './tools/dataflow.js';
 import { bwQueryData, bwGetFilterValues, InfoObjectState, VariableInput, DrillOperation } from './tools/reporting.js';
+import { bwQueryStatistics } from './tools/query_statistics.js';
 import { bwGetRoles, bwGetQueryRoles, bwSetQueryRoles, bwGetRoleQueries } from './tools/roles.js';
 import { bwGetProcessChain } from './tools/processchain.js';
 import { bwGetProcessVariant } from './tools/processvariant.js';
@@ -3907,8 +3908,13 @@ const TOOL_DEFINITIONS = [
           state: {
             type: 'object',
             description:
-              'Axis layout and optional per-characteristic filters. ' +
-              'All InfoObjects from the query must be listed (even those staying on FREE axis). ' +
+              'Axis layout and optional per-characteristic filters. A state is the complete layout of rows and ' +
+              'columns: the result shows there exactly the characteristics and structures the state lists on ' +
+              'ROWS and COLUMNS, in the order given, and every other one drops out — even when only a FREE ' +
+              'characteristic is listed, and although BW still echoes the old layout. So to filter a ' +
+              'characteristic and keep the layout, list everything that should stay on rows and columns ' +
+              '(from the GET, the key-figure structure included), in order. Characteristics staying on FREE ' +
+              'need not be listed. Without a state (variables only) the query layout stays. ' +
               'id values must come from the GET metadata response.',
             properties: {
               infoObjects: {
@@ -4001,7 +4007,25 @@ const TOOL_DEFINITIONS = [
           },
           to_row: {
             type: 'number',
-            description: 'End row for pagination (default 1000).',
+            description:
+              'End row for pagination (default 1000). The text answer says whether more rows follow ' +
+              '("More rows: yes — continue with from_row=…"); BICS reports no total row count.',
+          },
+          suppress_subtotals: {
+            type: 'boolean',
+            description:
+              'Text format only: leave subtotal rows out of the table (the overall result row stays). ' +
+              'They still occupy positions in the row range, so paging is unchanged.',
+          },
+          with_statistics: {
+            type: 'boolean',
+            description:
+              'Measure the call: time in this server, time of the BW HTTP request, request and response ' +
+              'size — and look up the BW statistics step of the call (RSDDSTAT*), splitting the time into ' +
+              'BW runtime by layer (OLAP, data manager/database, BICS, authorizations, front end transfer, ' +
+              'records read and transferred) and the transfer between BW and this server. Costs a few ' +
+              'extra DataPreview reads after the call; needs the statistics switched on for the object. ' +
+              'Use this for any performance question instead of timing calls from the outside.',
           },
           drill_operations: {
             type: 'array',
@@ -4011,7 +4035,7 @@ const TOOL_DEFINITIONS = [
               'drill_state: 3 = expand, 2 = collapse. ' +
               'element_idx: which dimension within the tuple (1 = first, 2 = second, etc.) — ' +
               'use 2 when ROWS has multiple dimensions and the target node is on the second one. ' +
-              'Requires the full state and variables to be sent again in the same POST (stateless endpoint). ' +
+              'Requires the same state and variables to be sent again in the same POST (stateless endpoint). ' +
               'Use after an initial bw_query_data call to drill into a collapsed structure node or hierarchy node.',
             items: {
               type: 'object',
@@ -4026,6 +4050,55 @@ const TOOL_DEFINITIONS = [
           },
         },
         required: ['comp_id'],
+      },
+    },
+    {
+      name: 'bw_query_statistics',
+      description:
+        'Read the BW runtime statistics of query executions (RSDDSTAT* tables through ADT DataPreview, read-only). ' +
+        'Two modes. step_uid: the full breakdown of one navigation step — runtime by layer (OLAP processor, ' +
+        'OLAP cache, data manager/database, BICS provider, authorizations, transfer to front end), the top ' +
+        'events with their texts (including event 3115, the effective "Operations in HANA" setting), records ' +
+        'read and transferred, and the data manager time per provider and part provider. ' +
+        'comp_id + window: every execution of that query (or provider with is_provider=true) between from and ' +
+        'to — count, min/median/p90/max runtime, users — plus the breakdown of the slowest ones and their ' +
+        'average split by layer. This covers what RSRT statistics and ST03 show, without SAP GUI. ' +
+        'Calls from any frontend appear (Analysis for Office, SAC, this server under principal propagation). ' +
+        'For the statistics of a bw_query_data call made through this server, pass with_statistics=true there ' +
+        'instead. Empty results usually mean the statistics are switched off for the object (RSDDSTAT).',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          step_uid: {
+            type: 'string',
+            description: 'A statistics step id (25 characters, e.g. from a previous answer). Takes precedence over comp_id.',
+          },
+          comp_id: {
+            type: 'string',
+            description: 'Technical name of the BEx query, or of the provider with is_provider=true.',
+          },
+          is_provider: {
+            type: 'boolean',
+            description: 'true for direct provider calls (statistics record them as "$" + provider name). Default false.',
+          },
+          from: {
+            type: 'string',
+            description: 'Window start: ISO timestamp (UTC unless a zone is given) or YYYYMMDDhhmmss UTC. Default: 24 hours before "to".',
+          },
+          to: {
+            type: 'string',
+            description: 'Window end, same formats. Default: now.',
+          },
+          user: {
+            type: 'string',
+            description: 'Restrict to one ABAP user. Default: all users.',
+          },
+          top: {
+            type: 'number',
+            description: 'How many of the slowest executions to break down (1–10, default 3).',
+          },
+        },
+        required: [],
       },
     },
     {
@@ -6219,10 +6292,26 @@ async function handleToolCall(
           variables,
           (args?.from_row as number) ?? 0,
           (args?.to_row as number) ?? 1000,
-          drillOperations
+          drillOperations,
+          {
+            withStatistics: (args?.with_statistics as boolean) ?? false,
+            suppressSubtotals: (args?.suppress_subtotals as boolean) ?? false,
+          }
         );
         break;
       }
+
+      case 'bw_query_statistics':
+        text = await bwQueryStatistics(client, {
+          step_uid: args?.step_uid as string | undefined,
+          comp_id: args?.comp_id as string | undefined,
+          is_provider: args?.is_provider as boolean | undefined,
+          from: args?.from as string | undefined,
+          to: args?.to as string | undefined,
+          user: args?.user as string | undefined,
+          top: args?.top as number | undefined,
+        });
+        break;
 
       case 'bw_get_filter_values':
         text = await bwGetFilterValues(
