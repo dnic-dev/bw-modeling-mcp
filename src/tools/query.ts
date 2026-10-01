@@ -670,6 +670,8 @@ function renderQueryText(q: Record<string, unknown>): string {
 
   const dimLine = (d: Record<string, unknown>) => {
     lines.push(`    ${dimLabel(d)}  ${s(d['description'])}  [${s(d['type'])}]`);
+    const hierarchy = d['hierarchy'] as Record<string, unknown> | undefined;
+    if (hierarchy) lines.push(`      Hierarchy: ${formatHierarchy(hierarchy)}`);
     const members = (d['members'] as unknown[]) ?? [];
     if (members.length > 0) renderMemberLines(members, '      ', lines);
   };
@@ -928,6 +930,27 @@ export function parseQueryDocument(
     return result;
   });
 
+  // Hierarchy assignments, read from a second pass that keeps element text literal: the
+  // main parser turns a hierarchy named "0001" into 1 and a key date "00000000" into 0.
+  const literalMain = (new XMLParser({
+    ignoreAttributes: false,
+    attributeNamePrefix: '@_',
+    parseTagValue: false,
+    isArray: (tagName) => ['Qry:rows', 'Qry:columns', 'Qry:free'].includes(tagName),
+  }).parse(xmlBody)['Qry:queryResource'] as Record<string, unknown> | undefined)?.['Qry:mainComponent'] as
+    Record<string, unknown> | undefined;
+  const attachHierarchy = (parsed: Record<string, unknown>[], container: string) => {
+    const literal = ensureArray(literalMain?.[container]) as Record<string, unknown>[];
+    parsed.forEach((p, i) => {
+      if (p['type'] === 'CustomDimension') return;
+      const hierarchy = parseHierarchy(literal[i]?.['Qry:hierarchy'], variableMap);
+      if (hierarchy) p['hierarchy'] = hierarchy;
+    });
+  };
+  attachHierarchy(columns, 'Qry:columns');
+  attachHierarchy(rows, 'Qry:rows');
+  attachHierarchy(freeCharacteristics, 'Qry:free');
+
   // Step 7: Calculated Measures (CKFs only)
   const calculatedMeasures: Record<string, unknown>[] = [];
   for (const [, ckf] of ckfMap) {
@@ -1138,6 +1161,75 @@ export function parseKeyDate(
   }
   if (value !== undefined && value !== '') return { kind: 'fixed', date: String(value) };
   return { kind: 'systemDate' };
+}
+
+/**
+ * The display hierarchy a characteristic of the layout carries in the query definition, or
+ * undefined when none is assigned. Only settings that differ from the default are reported.
+ *
+ * This is the hierarchy a data call shows: the reporting endpoint behind `bw_query_data`
+ * takes it from the definition and does not let a request switch it off or replace it.
+ * Expects a node parsed with literal element text (`parseTagValue: false`).
+ */
+export function parseHierarchy(
+  node: unknown,
+  variableMap: Map<string, VariableRef>,
+): Record<string, unknown> | undefined {
+  if (!node || typeof node !== 'object') return undefined;
+  const h = node as Record<string, unknown>;
+  // A parameter is a literal value, or a variable referenced by its subcomponent id.
+  const param = (n: unknown): string | undefined => {
+    if (!n || typeof n !== 'object') return undefined;
+    const p = n as Record<string, unknown>;
+    const varId = p['Qry:variable'];
+    if (varId !== undefined && varId !== '') {
+      const v = variableMap.get(String(varId));
+      return `variable ${v?.technicalName || String(p['Qry:value'] ?? varId)}`;
+    }
+    const value = p['Qry:value'];
+    return value === undefined || value === '' ? undefined : String(value);
+  };
+  const name = param(h['Qry:name']);
+  if (!name) return undefined;
+
+  const out: Record<string, unknown> = { name, active: h['@_active'] === 'true' };
+  const version = param(h['Qry:version']);
+  if (version) out['version'] = version;
+  const keyDate = param(h['Qry:dateTo']);
+  if (keyDate && !/^0+$/.test(keyDate)) out['keyDate'] = keyDate;
+
+  const explicit = (tag: string): Record<string, unknown> | undefined => {
+    const n = h[tag];
+    return n && typeof n === 'object' && (n as Record<string, unknown>)['@_default'] === 'false'
+      ? (n as Record<string, unknown>)
+      : undefined;
+  };
+  const level = explicit('Qry:expandToLevel')?.['@_level'];
+  if (level !== undefined) out['expandToLevel'] = Number(level);
+  const childNodes = explicit('Qry:positionOfChildNodes');
+  if (childNodes) out['childNodePosition'] = childNodes['@_up'] === 'true' ? 'above' : 'below';
+  const postable = explicit('Qry:valuesOfPostableNodes');
+  if (postable) out['postableNodeValues'] = postable['@_show'] === 'true' ? 'show' : 'hide';
+  const suppress = explicit('Qry:suppressNodes');
+  if (suppress) out['suppressSingleChildNodes'] = suppress['@_suppress'] === 'true';
+  const sorting = explicit('Qry:sorting');
+  if (sorting) out['sorting'] = `${sorting['@_sortBy']} ${sorting['@_sortDirection'] ?? 'Ascending'}`;
+  return out;
+}
+
+/** One line for a layout characteristic's hierarchy, as `bw_get_query` prints it. */
+export function formatHierarchy(h: Record<string, unknown>): string {
+  const parts = [`${h['name']} (${h['active'] ? 'active' : 'assigned, not active'})`];
+  if (h['version']) parts.push(`version ${h['version']}`);
+  if (h['keyDate']) parts.push(`key date ${h['keyDate']}`);
+  if (h['expandToLevel'] !== undefined) parts.push(`expand to level ${h['expandToLevel']}`);
+  if (h['childNodePosition']) parts.push(`child nodes ${h['childNodePosition']}`);
+  if (h['postableNodeValues']) parts.push(`${h['postableNodeValues']} values of postable nodes`);
+  if (h['suppressSingleChildNodes'] !== undefined) {
+    parts.push(h['suppressSingleChildNodes'] ? 'suppress nodes with one child' : 'show nodes with one child');
+  }
+  if (h['sorting']) parts.push(`sorted by ${h['sorting']}`);
+  return parts.join(', ');
 }
 
 const ownDescription = (n: Record<string, unknown>) =>

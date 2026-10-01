@@ -1968,7 +1968,8 @@ const TOOL_DEFINITIONS = [
     {
       name: 'bw_get_query',
       description:
-        'Read a BW Query definition — variables, filter, layout (rows/columns/free characteristics), ' +
+        'Read a BW Query definition — variables, filter, layout (rows/columns/free characteristics, each with ' +
+        'its display hierarchy if one is assigned: name, active or not, version, key date, expand level), ' +
         'calculated and restricted measures, exceptions, and cell definitions. ' +
         'Structure members are reported with their properties: input readiness and disaggregation ' +
         '(the planning settings), decimals, scaling, sign inversion, constant selection, the local ' +
@@ -3909,7 +3910,11 @@ const TOOL_DEFINITIONS = [
             description:
               'Axis layout and optional per-characteristic filters. ' +
               'All InfoObjects from the query must be listed (even those staying on FREE axis). ' +
-              'id values must come from the GET metadata response.',
+              'id values must come from the GET metadata response. ' +
+              'BW applies some requests differently without an error — a characteristic or structure the state ' +
+              'does not list drops off rows and columns, an excluded hierarchy node becomes an included one; the text ' +
+              'answer lists every such difference under "Not applied", judged against the selection BW reports ' +
+              'as effective.',
             properties: {
               infoObjects: {
                 type: 'array',
@@ -3922,8 +3927,13 @@ const TOOL_DEFINITIONS = [
                     hierarchy: {
                       type: 'object',
                       description:
-                        'Active hierarchy for this characteristic. Required when filtering by hierarchy node (nodeId=1). ' +
-                        'Copy id, name, hryId, hryDateFrom, hryDateTo from the <hierarchy> element in the GET response.',
+                        'Not applied by BW: the reporting endpoint reads this element and discards it, so the ' +
+                        'hierarchy always comes from the query definition (bw_get_query lists it per characteristic). ' +
+                        'It cannot switch a hierarchy off or to another one — that takes a change to the query ' +
+                        '(bw_update_query_characteristic) or a copy of it. A hierarchy-node filter (nodeId=1) is ' +
+                        'evaluated against the query\'s own hierarchy too; passing this object does not change the ' +
+                        'result. When it is passed and the hierarchy BW reports for the characteristic differs, the ' +
+                        'text answer says so.',
                       properties: {
                         id: { type: 'string', description: 'Hierarchy id attribute from GET response.' },
                         name: { type: 'string', description: 'Hierarchy name (technical name).' },
@@ -3945,12 +3955,28 @@ const TOOL_DEFINITIONS = [
                         type: 'object',
                         properties: {
                           low: { type: 'string', description: 'Filter value in external key format (e.g. altName or CHAVL_EXT). Use this for members that have a named external key.' },
-                          lowInt: { type: 'string', description: 'Filter value in internal key format (e.g. GUID like 00O2...). Use when the member has no altName and only an internal GUID is known. Sends presentationMode="INT" in BICS XML.' },
+                          lowInt: { type: 'string', description: 'Filter value in internal key format (e.g. GUID like 00O2...). Use when the member has no altName and only an internal GUID is known, and always for a hierarchy node (its intKey in the result): BW does not convert an external node key correctly. Sends presentationMode="INT" in BICS XML.' },
                           lowText: { type: 'string', description: 'Display text for the value (optional).' },
-                          high: { type: 'string', description: 'Upper bound for interval operator BT.' },
+                          high: { type: 'string', description: 'Upper bound for interval operator BT, in the same format as the lower bound (internal with lowInt, external with low).' },
                           op: { type: 'string', description: 'Operator: EQ (default), BT, GT, LT, GE, LE.' },
                           sign: { type: 'string', description: 'I=include (default), E=exclude.' },
-                          nodeId: { type: 'number', description: 'Node selection mode: 0=leaf member (default), 1=hierarchy node (use when filtering a collapsed hierarchy node like a group).' },
+                          nodeId: {
+                            type: 'number',
+                            description:
+                              '1 = the value is a node of the query\'s hierarchy (a group), 0 = a plain member (default). ' +
+                              'With 1 and no nodeType, the node is taken to be a characteristic value of this ' +
+                              'characteristic. Excluding a node (sign E) is not supported by BW here: it is applied as included, and the ' +
+                              'answer says so under "Not applied". Pass the node key as lowInt (the intKey of the node row, e.g. from a ' +
+                              'result with the hierarchy on rows).',
+                          },
+                          nodeType: {
+                            type: 'string',
+                            description:
+                              'Type of the hierarchy node, i.e. its InfoObject: "0HIER_NODE" for text nodes (e.g. the ' +
+                              'root "~ROOT" or a pure grouping node), or the characteristic for nodes that are ' +
+                              'characteristic values (the default with nodeId=1). BW selects a node only with the right ' +
+                              'type; with the wrong one it filters the key as a plain member.',
+                          },
                         },
                       },
                     },

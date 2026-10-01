@@ -23,7 +23,29 @@ export interface InfoObjectState {
     op?: string;
     sign?: string;
     nodeId?: number;
+    nodeType?: string;
   }>;
+}
+
+/**
+ * The node type a hierarchy-node filter value is sent with, or undefined for a plain member.
+ *
+ * BW selects a hierarchy node only through the `nodeName` attribute of a selectValue: the
+ * reporting endpoint looks that name up among the node types of the query's hierarchy and
+ * sets it on the selection. `nodeId` is read and never used, so a value sent with nodeId=1
+ * alone is filtered as an ordinary member — "No data available" for a node key, or "Filter
+ * changed" when the key does not convert. A node type is the InfoObject of the node:
+ * 0HIER_NODE for text nodes, the characteristic itself for nodes that are characteristic
+ * values. Without an explicit type, nodeId=1 assumes the latter, the characteristic of the
+ * state entry (its attribute for a navigation attribute).
+ */
+export function hierarchyNodeType(
+  iobjName: string,
+  fv: { nodeId?: number; nodeType?: string },
+): string | undefined {
+  if (fv.nodeType) return fv.nodeType;
+  if (fv.nodeId !== 1) return undefined;
+  return iobjName.includes('__') ? iobjName.slice(iobjName.lastIndexOf('__') + 2) : iobjName;
 }
 
 export interface DrillOperation {
@@ -366,6 +388,198 @@ function parseMessages(xml: string): Array<{ type: string; txt: string }> {
   return msgs;
 }
 
+/**
+ * The hierarchy BW reports per InfoObject in the `<state>` of a response, keyed by
+ * InfoObject id; an InfoObject without a hierarchy maps to null.
+ */
+export function parseStateHierarchies(xml: string): Map<string, { name: string; hryId: string } | null> {
+  const result = new Map<string, { name: string; hryId: string } | null>();
+  const stateMatch = xml.match(/<state>([\s\S]*?)<\/state>/);
+  if (!stateMatch) return result;
+  const ioRe = /<infoObject\b([^>]*?)(?:\/>|>([\s\S]*?)<\/infoObject>)/g;
+  let io: RegExpExecArray | null;
+  while ((io = ioRe.exec(stateMatch[1])) !== null) {
+    const id = attr(io[1], 'id');
+    if (id === null) continue;
+    const hry = io[2]?.match(/<hierarchy\b([^>]*?)\/?>/);
+    result.set(id, hry ? { name: attr(hry[1], 'name') ?? '', hryId: attr(hry[1], 'hryId') ?? '' } : null);
+  }
+  return result;
+}
+
+/**
+ * One line per requested hierarchy that BW did not apply. The reporting endpoint reads the
+ * `<hierarchy>` element of a request and discards it — the hierarchy always comes from the
+ * query definition — and it says nothing about that. A caller that tried to switch a
+ * hierarchy off or to another one would otherwise read the unchanged result as an answer.
+ */
+export function hierarchyMismatchNotes(state: { infoObjects: InfoObjectState[] } | undefined, xml: string): string[] {
+  const requested = (state?.infoObjects ?? []).filter((io) => io.hierarchy);
+  if (requested.length === 0) return [];
+  const reported = parseStateHierarchies(xml);
+  const notes: string[] = [];
+  for (const io of requested) {
+    if (!reported.has(io.id)) continue;
+    const want = io.hierarchy!.name ?? '';
+    const got = reported.get(io.id);
+    if ((got?.name ?? '') === want) continue;
+    const wantText = want ? `hierarchy ${want}` : 'no hierarchy';
+    const gotText = got ? `hierarchy ${got.name}${got.hryId ? ` (${got.hryId})` : ''}` : 'no hierarchy';
+    notes.push(
+      `  ${io.name}: ${wantText} was requested, BW applied ${gotText}. The hierarchy comes from the query ` +
+      'definition and cannot be changed through the request; change the query (bw_update_query_characteristic) ' +
+      'or use a copy of it.',
+    );
+  }
+  return notes;
+}
+
+interface SelectValueAttrs {
+  sign: string;
+  op: string;
+  low: string;
+  lowInt: string;
+  high: string;
+  highInt: string;
+}
+
+function parseSelectValueAttrs(body: string): SelectValueAttrs[] {
+  const values: SelectValueAttrs[] = [];
+  const svRe = /<selectValue\b([^>]*?)\/?>/g;
+  let sv: RegExpExecArray | null;
+  while ((sv = svRe.exec(body)) !== null) {
+    const a = sv[1];
+    values.push({
+      sign: attr(a, 'sign') ?? 'I',
+      op: attr(a, 'op') ?? 'EQ',
+      low: attr(a, 'low') ?? '',
+      lowInt: attr(a, 'lowInt') ?? '',
+      high: attr(a, 'high') ?? '',
+      highInt: attr(a, 'highInt') ?? '',
+    });
+  }
+  return values;
+}
+
+/**
+ * The selection BW actually applied, per InfoObject id, from the `<effective>` element of a
+ * response. A value BW rejected is missing there or changed: an excluded hierarchy node, for
+ * instance, comes back as included, and an interval without its upper bound as "BT low".
+ */
+export function parseEffectiveSelections(xml: string): Map<string, SelectValueAttrs[]> {
+  const result = new Map<string, SelectValueAttrs[]>();
+  const effMatch = xml.match(/<effective>([\s\S]*?)<\/effective>/);
+  if (!effMatch) return result;
+  const ioRe = /<infoObject\b([^>]*?)(?:\/>|>([\s\S]*?)<\/infoObject>)/g;
+  let io: RegExpExecArray | null;
+  while ((io = ioRe.exec(effMatch[1])) !== null) {
+    const id = attr(io[1], 'id');
+    if (id !== null) result.set(id, parseSelectValueAttrs(io[2] ?? ''));
+  }
+  return result;
+}
+
+const sameKey = (a: string, b: string) => a !== '' && a.toUpperCase() === b.toUpperCase();
+
+function describeValue(sign: string, op: string, low: string, high: string): string {
+  return `${sign === 'E' ? 'exclude ' : ''}${op} ${low}${high ? `..${high}` : ''}`;
+}
+
+/**
+ * One line per requested filter value that BW applied differently, or not at all, judged
+ * against the effective selection of the response. BW raises a message for some of these
+ * ("Filter changed") and for others none: an excluded hierarchy node is silently turned into
+ * an included one. A value given as low is compared only where it can be matched, since BW
+ * may convert an external key to another internal form; a missing internal key is reported.
+ */
+export function filterMismatchNotes(state: { infoObjects: InfoObjectState[] } | undefined, xml: string): string[] {
+  const requested = (state?.infoObjects ?? []).filter((io) => (io.filterValues ?? []).length > 0);
+  if (requested.length === 0 || !/<effective\b/.test(xml)) return [];
+  const effective = parseEffectiveSelections(xml);
+  // An empty effective element says nothing: BW leaves it empty, for one, when a filter meets a
+  // query-defined restriction on the same characteristic and the result is empty.
+  if (effective.size === 0) return [];
+  const notes: string[] = [];
+  for (const io of requested) {
+    const applied = effective.get(io.id) ?? [];
+    if (applied.length === 0) {
+      notes.push(`  ${io.name}: the filter was not applied — BW reports no effective selection for it.`);
+      continue;
+    }
+    for (const fv of io.filterValues ?? []) {
+      const key = fv.lowInt || fv.low || '';
+      const match = applied.find((e) => sameKey(e.lowInt, key) || sameKey(e.low, key));
+      const wantSign = fv.sign ?? 'I';
+      const wantOp = fv.op ?? 'EQ';
+      const wantHigh = fv.high ?? '';
+      if (!match) {
+        if (fv.lowInt) {
+          notes.push(`  ${io.name}: ${describeValue(wantSign, wantOp, key, wantHigh)} is not in the effective selection.`);
+        }
+        continue;
+      }
+      const gotHigh = match.highInt || match.high;
+      const highDiffers = wantHigh !== '' ? !sameKey(gotHigh, wantHigh) : false;
+      if (match.sign !== wantSign || match.op !== wantOp || highDiffers) {
+        notes.push(
+          `  ${io.name}: ${describeValue(wantSign, wantOp, key, wantHigh)} was requested, ` +
+          `BW applied ${describeValue(match.sign, match.op, match.lowInt || match.low, gotHigh)}.`,
+        );
+      }
+    }
+  }
+  return notes;
+}
+
+/**
+ * Characteristics and structures that dropped out of rows and columns. In a request with a
+ * state, the result shows on ROWS and COLUMNS exactly what the state lists there, in that
+ * order: every other one drops out — even when only a FREE characteristic is listed — while
+ * the state BW echoes still shows it on its old axis. A request without a state keeps the
+ * query's layout. Judged against the result headers; an empty result is not judged.
+ */
+export function axisDropNotes(state: { infoObjects: InfoObjectState[] } | undefined, xml: string): string[] {
+  const listed = state?.infoObjects ?? [];
+  if (listed.length === 0) return [];
+  const stateMatch = xml.match(/<state>([\s\S]*?)<\/state>/);
+  const rsBody = xml.match(/<resultSet\b[^>]*>([\s\S]*?)<\/resultSet>/)?.[1];
+  if (!stateMatch || !rsBody) return [];
+  const shown = new Set<string>();
+  for (const section of ['rows', 'columns']) {
+    const headers = rsBody.match(new RegExp(`<${section}\\b[^>]*>[\\s\\S]*?<headers>([\\s\\S]*?)</headers>`))?.[1] ?? '';
+    for (const h of headers.matchAll(/<entry\b([^>]*?)\/?>/g)) {
+      const id = attr(h[1], 'id');
+      if (id) shown.add(id);
+    }
+  }
+  const listedIds = new Set(listed.map((io) => io.id));
+  const notes: string[] = [];
+  for (const axis of ['ROWS', 'COLUMNS']) {
+    const dropped: Array<{ name: string; pos: number }> = [];
+    for (const io of stateMatch[1].matchAll(/<infoObject\b([^>]*?)(?:\/>|>)/g)) {
+      const id = attr(io[1], 'id');
+      if (!id || listedIds.has(id) || attr(io[1], 'axis') !== axis || shown.has(id)) continue;
+      dropped.push({ name: attr(io[1], 'name') ?? id, pos: Number(attr(io[1], 'pos') ?? 0) });
+    }
+    if (dropped.length > 0) {
+      // In the query's order, which is the order to list them in.
+      const names = dropped.sort((a, b) => a.pos - b.pos).map((d) => d.name);
+      const one = names.length === 1;
+      notes.push(
+        `  ${axis}: ${names.join(', ')} ${one ? 'is' : 'are'} not in the result. With a state, rows and columns ` +
+        `show only what it lists there; list ${one ? 'it' : 'them'} on ${axis} too (in the order wanted, ` +
+        'structures included) to keep the query\'s layout.',
+      );
+    }
+  }
+  return notes;
+}
+
+/** Everything the request asked for that BW did not apply as asked, for the text answer. */
+export function notAppliedNotes(state: { infoObjects: InfoObjectState[] } | undefined, xml: string): string[] {
+  return [...hierarchyMismatchNotes(state, xml), ...filterMismatchNotes(state, xml), ...axisDropNotes(state, xml)];
+}
+
 // ── Text rendering ──────────────────────────────────────────────────────────────
 
 // Renders a human-readable label for a tuple's values.
@@ -513,7 +727,7 @@ function renderQueryDataText(xml: string, isGet: boolean): string {
 
 // ── POST body builder ──────────────────────────────────────────────────────────
 
-function buildPostBody(
+export function buildPostBody(
   compId: string,
   state?: { infoObjects: InfoObjectState[] },
   variables?: VariableInput[],
@@ -562,12 +776,17 @@ function buildPostBody(
           const op = fv.op ?? 'EQ';
           const sign = fv.sign ?? 'I';
           const lowText = fv.lowText ? ` lowText="${xmlEscape(fv.lowText)}"` : '';
-          const high = fv.high ? ` high="${xmlEscape(fv.high)}"` : '';
           const nodeId = fv.nodeId ?? 0;
+          const nodeType = hierarchyNodeType(io.name, fv);
+          const nodeName = nodeType ? ` nodeName="${xmlEscape(nodeType)}"` : '';
+          // The upper bound goes in the same format as the lower one: with an internal low the
+          // endpoint reads highInt and ignores high, so "BT 01..03" arrived as "BT 01".
           if (fv.lowInt) {
-            parts.push(`        <selectValue id="${svId++}" lowInt="${xmlEscape(fv.lowInt)}"${high} nodeId="${nodeId}" hryMinLvl="0" op="${op}" sign="${sign}" presentationMode="INT"/>`);
+            const high = fv.high ? ` highInt="${xmlEscape(fv.high)}"` : '';
+            parts.push(`        <selectValue id="${svId++}" lowInt="${xmlEscape(fv.lowInt)}"${high} nodeId="${nodeId}"${nodeName} hryMinLvl="0" op="${op}" sign="${sign}" presentationMode="INT"/>`);
           } else {
-            parts.push(`        <selectValue id="${svId++}" low="${xmlEscape(fv.low ?? '')}"${lowText}${high} nodeId="${nodeId}" hryMinLvl="0" op="${op}" sign="${sign}" presentationMode="EXT_NC"/>`);
+            const high = fv.high ? ` high="${xmlEscape(fv.high)}"` : '';
+            parts.push(`        <selectValue id="${svId++}" low="${xmlEscape(fv.low ?? '')}"${lowText}${high} nodeId="${nodeId}"${nodeName} hryMinLvl="0" op="${op}" sign="${sign}" presentationMode="EXT_NC"/>`);
           }
         }
         parts.push(`      </infoObject>`);
@@ -659,7 +878,9 @@ export async function bwQueryData(
   }
 
   if (format === 'raw') return responseXml;
-  return renderQueryDataText(responseXml, !isPost);
+  const text = renderQueryDataText(responseXml, !isPost);
+  const notes = notAppliedNotes(state, responseXml);
+  return notes.length > 0 ? `${text}\n\n── Not applied ──\n${notes.join('\n')}` : text;
 }
 
 export async function bwGetFilterValues(
