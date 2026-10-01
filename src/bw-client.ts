@@ -6,8 +6,13 @@ import { currentClient } from './request-context.js';
 // Value import, but no cycle at runtime: platform.ts takes BwClient as a type only.
 import { cachedPlatform } from './platform.js';
 
-const ECLIPSE_USER_AGENT =
+export const ECLIPSE_USER_AGENT =
   'Eclipse/4.38.0.v20251201-0920 (win32; x86_64; Java 21.0.9) ADT/3.56.0 (devedition)';
+
+/** ADT request id as Eclipse sends it: 32 hex chars, no dashes. */
+export function adtRequestId(): string {
+  return randomUUID().replace(/-/g, '');
+}
 
 // Media types for each BW object type (from BW/4HANA discovery)
 // These hardcoded values serve as fallback defaults; loadMediaTypes() overwrites them at runtime.
