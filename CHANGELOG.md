@@ -1,5 +1,11 @@
 # Changelog
 
+## [Unreleased]
+
+### Improved
+
+- **An InfoArea can be moved to the top level** — `bw_move_object` takes `position: "before"`, which places an InfoArea before the target on its level, as the modeling tools do. The root of the tree is not an InfoArea, so until now an InfoArea could only be moved into another one, never back to the top. Verified on BW/4HANA: an InfoArea moved to the top level next to an existing one and back into its parent.
+
 ## [1.8.1] — 2026-10-15
 
 ### Fixed

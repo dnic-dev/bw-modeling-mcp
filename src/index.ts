@@ -826,7 +826,8 @@ const TOOL_DEFINITIONS = [
       name: 'bw_move_object',
       description:
         'Move a BW object (aDSO, InfoObject, InfoArea, …) to a different InfoArea. ' +
-        'Single POST operation — no lock/unlock needed.',
+        'Single POST operation — no lock/unlock needed. ' +
+        'To put an InfoArea at the top level of the tree, move it with position "before" next to an InfoArea that is already there — bw_list_contents with path "/" lists them. An InfoArea can also be created at the top level directly (bw_create_infoarea without a parent); other objects always belong to an InfoArea.',
       inputSchema: {
         type: 'object',
         properties: {
@@ -841,6 +842,11 @@ const TOOL_DEFINITIONS = [
           target_info_area: {
             type: 'string',
             description: 'Technical name of the target InfoArea (e.g. "MCPBW").',
+          },
+          position: {
+            type: 'string',
+            enum: ['child', 'before'],
+            description: '"child" (default): into the target InfoArea. "before": an InfoArea only — placed before the target on its level, so it gets the same parent; with a top-level target it moves to the top level.',
           },
         },
         required: ['object_type', 'object_name', 'target_info_area'],
@@ -6202,6 +6208,7 @@ async function handleToolCall(
           objectType: args?.object_type as string,
           objectName: args?.object_name as string,
           targetInfoArea: args?.target_info_area as string,
+          position: args?.position as 'child' | 'before' | undefined,
         });
         break;
 

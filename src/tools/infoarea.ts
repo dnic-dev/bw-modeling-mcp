@@ -7,12 +7,17 @@ export interface MoveObjectArgs {
   objectType: string;
   objectName: string;
   targetInfoArea: string;
+  position?: 'child' | 'before';
 }
 
 /**
  * bw_move_object — move any BW object to a different InfoArea.
  *
  * Single POST to /sap/bw/modeling/move_requests — no lock needed.
+ *
+ * The root of the InfoArea tree is not an InfoArea, so nothing can be moved "into" it. The
+ * modeling tools place an InfoArea at the top level by moving it before one that is already
+ * there (movePosition PREV, on the active version), and "before" does the same.
  */
 export async function bwMoveObject(
   client: BwClient,
@@ -21,6 +26,10 @@ export async function bwMoveObject(
   const typeLower = args.objectType.toLowerCase();
   const nameLower = args.objectName.toLowerCase();
   const targetUpper = args.targetInfoArea.toUpperCase();
+  const before = args.position === 'before';
+  if (before && typeLower !== 'area') {
+    throw new Error('position "before" places an InfoArea beside another one; other objects move into an InfoArea (position "child").');
+  }
 
   const xml = `<?xml version="1.0" encoding="UTF-8"?>
 <atom:feed xmlns:atom="http://www.w3.org/2005/Atom" xmlns:bwModel="http://www.sap.com/bw/modeling">
@@ -29,13 +38,13 @@ export async function bwMoveObject(
       <bwModel:moveProperties
         targetObjectType="AREA"
         targetObjectName="${targetUpper}"
-        movePosition="CHILD"
+        movePosition="${before ? 'PREV' : 'CHILD'}"
         version="inactive"
         lockHandle="">
       </bwModel:moveProperties>
     </atom:content>
     <atom:link
-      href="/sap/bw/modeling/${typeLower}/${bwSeg(nameLower)}/m"
+      href="/sap/bw/modeling/${typeLower}/${bwSeg(nameLower)}/${before ? 'a' : 'm'}"
       type="application/*"
       rel="self">
     </atom:link>
@@ -49,7 +58,10 @@ export async function bwMoveObject(
     objectType: typeLower,
     objectName: nameLower,
     targetInfoArea: targetUpper,
-    message: `Object '${args.objectName.toUpperCase()}' moved to InfoArea '${targetUpper}'.`,
+    position: before ? 'before' : 'child',
+    message: before
+      ? `InfoArea '${args.objectName.toUpperCase()}' placed before InfoArea '${targetUpper}', on its level.`
+      : `Object '${args.objectName.toUpperCase()}' moved to InfoArea '${targetUpper}'.`,
   });
 }
 

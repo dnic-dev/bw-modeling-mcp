@@ -145,7 +145,7 @@ Read an InfoArea definition — name, label, parent area, object status.
 Create a new InfoArea. Immediately active after creation, no activation step needed.
 
 ### `bw_move_object`
-Move any BW object (aDSO, InfoObject, InfoArea, etc.) to a different InfoArea.
+Move any BW object (aDSO, InfoObject, InfoArea, etc.) to a different InfoArea. With `position: "before"` an InfoArea is placed before the target on its level instead of inside it; next to a top-level InfoArea this moves it to the top level of the tree, which has no InfoArea of its own to move into.
 
 ### `bw_change_package`
 Reassign an existing BW object to a different package (Development Class) and record the change on a transport request via the CTO write endpoint. A single write, no activation — afterwards the object is inactive and must be re-activated with `bw_activate` (passing the same transport). For DataSources (`object_type="RSDS"`) `source_system` is mandatory (compound key) and the applied package is verified by re-reading the DataSource. Verified for `TRFN` and `RSDS`; other TLOGO types use the same mechanism but are not trace-verified.
