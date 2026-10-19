@@ -2,6 +2,13 @@
 
 ## [Unreleased]
 
+### Added
+
+- **The planning mode of an aDSO can be switched** — `bw_set_adso_planning_mode` switches a planning-enabled aDSO between interactive planning and loading, as the toggle in the BW/4HANA Cockpit does. It reads the mode before and after the switch, the second time from a new session because the session that switched keeps reporting the old mode, and reports an error when BW accepted the switch but the mode did not change. `bw_get_adso` shows the current mode of a planning-enabled aDSO. Not a modeling change: no lock, no transport, no activation.
+- **Selective deletion of aDSO data** — `bw_delete_adso_data_selective` deletes the records of an aDSO that match conditions on its characteristics, as the selective deletion of the BW/4HANA Cockpit does, or only counts them. It simulates by default. The conditions are select-option rows per field. Several rows on one field are combined with OR, rows on different fields with AND. When the aDSO has a key, only key fields are accepted, and an invalid field is answered with the fields that are allowed. A deletion without any condition is refused. BW decides from the aDSO type which tables are affected. The answer sums the records over those tables and lists BW's message for each one. Values must be in external format: BW accepts an internal value as well, but it matches nothing, which is why the tool simulates first.
+
+Both tools use the BW/4HANA manage API and are hidden on a classic release.
+
 ### Improved
 
 - **An InfoArea can be moved to the top level** — `bw_move_object` takes `position: "before"`, which places an InfoArea before the target on its level, as the modeling tools do. The root of the tree is not an InfoArea, so until now an InfoArea could only be moved into another one, never back to the top. Verified on BW/4HANA: an InfoArea moved to the top level next to an existing one and back into its parent.

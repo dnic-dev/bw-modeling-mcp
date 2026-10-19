@@ -93,6 +93,12 @@ import {
   defaultRequestStorages,
 } from './tools/request_monitor.js';
 import {
+  bwSetAdsoPlanningMode,
+  bwDeleteAdsoDataSelective,
+  type PlanningMode,
+  type SelectiveDeletionCondition,
+} from './tools/adso_data.js';
+import {
   bwListRemodelingRequests,
   bwGetRemodelingRequest,
   bwRunRemodeling,
@@ -437,7 +443,9 @@ const TOOL_DEFINITIONS = [
     {
       name: 'bw_get_adso',
       description:
-        'Read an aDSO (Advanced DataStore Object) structure — fields, settings, version.',
+        'Read an aDSO (Advanced DataStore Object) structure — fields, settings, version. ' +
+        'For a planning-enabled aDSO on BW/4HANA the text output also shows the current ' +
+        'runtime mode (planning or loading), which bw_set_adso_planning_mode switches.',
       inputSchema: {
         type: 'object',
         properties: {
@@ -1798,6 +1806,113 @@ const TOOL_DEFINITIONS = [
           },
         },
         required: [],
+      },
+    },
+    {
+      name: 'bw_set_adso_planning_mode',
+      description:
+        'Switch a planning-enabled aDSO between interactive planning ("planning") and loading ' +
+        '("loading", shown as "Staging" in the BW cockpit). In planning mode, input-ready ' +
+        'queries and planning functions write to the aDSO; in loading mode, DTPs load it. ' +
+        'Reads the mode before and after the switch and returns both. ' +
+        'Not a modeling change: no lock, no transport, no activation.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          adso_name: {
+            type: 'string',
+            description: 'Technical name of the aDSO (e.g. "OBJECT_NAME").',
+          },
+          mode: {
+            type: 'string',
+            enum: ['planning', 'loading'],
+            description: '"planning" for interactive planning, "loading" for staging/loading.',
+          },
+        },
+        required: ['adso_name', 'mode'],
+      },
+    },
+    {
+      name: 'bw_delete_adso_data_selective',
+      description:
+        'Selectively delete records from an aDSO by conditions on its ' +
+        'characteristics, or simulate the deletion to count the matching records. ' +
+        'Simulates by default; pass simulate=false to actually delete. ' +
+        'Conditions are select-option rows per field; several rows on one field are combined ' +
+        'with OR, rows on different fields with AND. ' +
+        'BW decides by aDSO type which tables the deletion covers (for a standard aDSO the ' +
+        'active table only, for other types also the inbound table); the change log is not ' +
+        'touched, and the requests stay in the request management. To remove whole load ' +
+        'requests, use bw_delete_request instead. ' +
+        'Returns the record count summed over all affected tables, with the BW messages that ' +
+        'name each table and its count.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          adso_name: {
+            type: 'string',
+            description: 'Technical name of the aDSO (e.g. "OBJECT_NAME").',
+          },
+          conditions: {
+            type: 'array',
+            minItems: 1,
+            description:
+              'At least one condition. Only key fields can be restricted when the aDSO has a ' +
+              'key; an invalid field is answered with the list of allowed ones.',
+            items: {
+              type: 'object',
+              properties: {
+                field: {
+                  type: 'string',
+                  description: 'Field or InfoObject name in the aDSO (e.g. "FIELD_NAME").',
+                },
+                sign: {
+                  type: 'string',
+                  enum: ['I', 'E'],
+                  description: '"I" include (default) or "E" exclude.',
+                },
+                option: {
+                  type: 'string',
+                  enum: ['EQ', 'NE', 'LT', 'LE', 'GT', 'GE', 'BT', 'CP'],
+                  description:
+                    'Comparison operator (default "EQ"). BT needs high. CP takes a pattern with ' +
+                    '"*" and is refused for fields with a conversion exit and date/time fields.',
+                },
+                low: {
+                  type: 'string',
+                  description:
+                    'Value in external format, as shown in the BW UI (e.g. a calendar month ' +
+                    'as "MM.YYYY"). An internal value is accepted by BW but matches nothing, so ' +
+                    'simulate first. "#" stands for the initial (empty) value.',
+                },
+                high: {
+                  type: 'string',
+                  description: 'Upper bound, only for BT.',
+                },
+              },
+              required: ['field', 'low'],
+            },
+          },
+          simulate: {
+            type: 'boolean',
+            description: 'Only count the matching records, delete nothing (default true).',
+          },
+          propagate_deletion: {
+            type: 'boolean',
+            description:
+              'The cockpit option "Propagate deletion" (default false). BW offers it only for ' +
+              'aDSOs that write a change log.',
+          },
+          force_deletion: {
+            type: 'boolean',
+            description: 'Force the deletion where BW otherwise refuses it (default false).',
+          },
+          job_name: {
+            type: 'string',
+            description: 'Name of the background job (default: BW-generated).',
+          },
+        },
+        required: ['adso_name', 'conditions'],
       },
     },
     {
@@ -6475,6 +6590,26 @@ async function handleToolCall(
           args?.target as string | undefined,
           args?.target_type as string | undefined ?? 'ADSO',
           args?.all_requests as boolean | undefined ?? false,
+        );
+        break;
+
+      case 'bw_set_adso_planning_mode':
+        text = await bwSetAdsoPlanningMode(
+          args?.adso_name as string,
+          args?.mode as PlanningMode,
+        );
+        break;
+
+      case 'bw_delete_adso_data_selective':
+        text = await bwDeleteAdsoDataSelective(
+          args?.adso_name as string,
+          args?.conditions as SelectiveDeletionCondition[],
+          {
+            simulate: args?.simulate as boolean | undefined,
+            propagateDeletion: args?.propagate_deletion as boolean | undefined,
+            forceDeletion: args?.force_deletion as boolean | undefined,
+            jobName: args?.job_name as string | undefined,
+          },
         );
         break;
 

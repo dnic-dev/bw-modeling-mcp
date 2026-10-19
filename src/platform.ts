@@ -309,6 +309,8 @@ const BW4_ONLY: Record<string, string> = {
   bw_get_request: 'the BW/4HANA manage API (/sap/bw4/v1/manage)',
   bw_activate_request: 'the BW/4HANA manage API (/sap/bw4/v1/manage)',
   bw_delete_request: 'the BW/4HANA manage API (/sap/bw4/v1/manage)',
+  bw_set_adso_planning_mode: 'the BW/4HANA manage API (/sap/bw4/v1/manage)',
+  bw_delete_adso_data_selective: 'the BW/4HANA manage API (/sap/bw4/v1/manage)',
 
   // Push API — /sap/bw4/v1/push.
   bw_push_data: 'the BW/4HANA push API (/sap/bw4/v1/push)',

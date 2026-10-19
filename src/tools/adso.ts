@@ -7,6 +7,7 @@ import {
   stripInfoAreaSentinel,
 } from '../bw-client.js';
 import { parseInfoObjectProps } from './infoobject.js';
+import { readPlanningMode, type PlanningMode } from './adso_data.js';
 
 // ── aDSO type presets ────────────────────────────────────────────────────────
 
@@ -220,10 +221,17 @@ export async function bwGetAdso(
   const ts = result.headers['timestamp'] ?? '';
   const rawOutput = `aDSO: ${adsoName.toUpperCase()}\nStatus: ${status}\nTimestamp: ${ts}\n\n${result.body}`;
   if (format === 'raw') return rawOutput;
-  return summarizeAdso(adsoName.toUpperCase(), status, result.body);
+  const planningEnabled = /<adso:dataStore\b[^>]*\bplanningMode="true"/.test(result.body);
+  const runtimeMode = planningEnabled ? await readPlanningMode(adsoName) : undefined;
+  return summarizeAdso(adsoName.toUpperCase(), status, result.body, runtimeMode);
 }
 
-function summarizeAdso(adsoName: string, status: string, xml: string): string {
+function summarizeAdso(
+  adsoName: string,
+  status: string,
+  xml: string,
+  runtimeMode?: PlanningMode,
+): string {
   const lines: string[] = [];
 
   // ── Attribute helpers ─────────────────────────────────────────────────────
@@ -273,6 +281,10 @@ function summarizeAdso(adsoName: string, status: string, xml: string): string {
   lines.push(`Lesezugriffsausgabe protokollieren: ${flag('logRalOutput')}`);
   lines.push(`Schreib-Interface aktiviert:        ${flag('pushMode')}`);
   lines.push(`Planung aktiviert:                  ${flag('planningMode')}`);
+  if (runtimeMode) {
+    const label = runtimeMode === 'planning' ? 'Planung' : 'Laden';
+    lines.push(`Aktueller Modus:                    ${label} (${runtimeMode})`);
+  }
   lines.push(`Bestand aktiviert:                  ${flag('isNcum')}`);
 
   // ── Section 3: Modelling Type ─────────────────────────────────────────────
