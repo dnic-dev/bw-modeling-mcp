@@ -18,6 +18,7 @@ import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/
 import type { AuthInfo } from '@modelcontextprotocol/sdk/server/auth/types.js';
 import { setupHttpAuth, loadXsuaaCredentials, resolveAppUrl } from '@arc-mcp/xsuaa-auth';
 import { createConnectivityProxy, parseVCAPServices } from '@arc-mcp/xsuaa-auth/btp';
+import { withSessionScope } from './bw-client.js';
 import { createServer } from './index.js';
 import { ensurePlatform } from './platform.js';
 import { trustedProxyHops } from './proxy-trust.js';
@@ -149,7 +150,7 @@ async function main(): Promise<void> {
     // Detect the platform before the server is built: createServer() puts the platform
     // paragraph into the instructions from the cached verdict and cannot await anything
     // itself. Cached process-wide after the first request, and it never rejects.
-    await ensurePlatform(client);
+    await withSessionScope(() => ensurePlatform(client));
 
     // Stateless: a fresh Server and transport per request. The SDK binds a Server to one
     // transport for its lifetime, so a shared instance fails after the first call. Per

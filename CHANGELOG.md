@@ -9,8 +9,13 @@
 
 Both tools use the BW/4HANA manage API and are hidden on a classic release.
 
+### Fixed
+
+- **SAP sessions stayed open after every tool call** — each call logged on several times (its own client, the fresh sessions some tools need, the tool list) and ended none of these logons, so each one stayed in SM04 with its user context until the ICF timeout, which is an hour or more on most systems. Ten read calls left about eleven sessions with roughly 800 MB between them. A server also allows only a limited number of such idle logons per user (100 by default); a few dozen tool calls in half an hour could reach it, and from then on every logon of that user was refused with "Service cannot be reached" until the old ones timed out. Every session a call opened is now ended once the call is answered. The answer does not wait for that. A session that holds a lock stays open until the lock is released through it. When the server stops, it ends every session it still holds, locks included. `BW_SESSION_CLOSE=off` keeps the old behaviour for a proxy that holds the SAP session itself. Verified on BW/4HANA and on a classic release: logons ended after reads, lock sessions kept across calls and ended after the unlock, and the enqueue of an unreleased lock freed on shutdown. Reported in #48. Thanks to @army113 and @MWKAnalytics for the analysis.
+
 ### Improved
 
+- **Connections to the backend are reused** — every request used to open a TCP and TLS connection of its own. Connections are now kept open and shared across requests, and closed after 30 seconds of idle time. Read calls answer faster (median 280 instead of 530 ms on a classic release, 665 instead of 790 ms on BW/4HANA, measured over the same sequence of reads), and a host that occasionally lets a new connection stall for about 20 seconds now stalls far less often, since few new connections are opened.
 - **An InfoArea can be moved to the top level** — `bw_move_object` takes `position: "before"`, which places an InfoArea before the target on its level, as the modeling tools do. The root of the tree is not an InfoArea, so until now an InfoArea could only be moved into another one, never back to the top. Verified on BW/4HANA: an InfoArea moved to the top level next to an existing one and back into its parent.
 
 ## [1.8.1] — 2026-10-15

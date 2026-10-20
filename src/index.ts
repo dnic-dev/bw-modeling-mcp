@@ -12,7 +12,7 @@ import { fileURLToPath } from 'node:url';
 import { realpathSync } from 'node:fs';
 import { createRequire } from 'node:module';
 
-import { createClientFromEnv, type BwClient } from './bw-client.js';
+import { closeAllSessions, createClientFromEnv, withSessionScope, type BwClient } from './bw-client.js';
 import { currentClient } from './request-context.js';
 import { filterToolsByScope, mayCall, requiredScope, scopesFor } from './scopes.js';
 import { undeclaredArguments } from './arguments.js';
@@ -7568,14 +7568,15 @@ export function createServer(): Server {
     // system yields the cached verdict if there is one, and otherwise no platform filter.
     let profile;
     try {
-      profile = await ensurePlatform(currentClient() ?? createClientFromEnv());
+      profile = await withSessionScope(() => ensurePlatform(currentClient() ?? createClientFromEnv()));
     } catch {
       profile = cachedPlatform();
     }
     return { tools: filterToolsByPlatform(filterToolsByScope(TOOL_DEFINITIONS, extra.authInfo), profile) };
   });
 
-  server.setRequestHandler(CallToolRequestSchema, handleToolCall);
+  server.setRequestHandler(CallToolRequestSchema, (request, extra) =>
+    withSessionScope(() => handleToolCall(request, extra)));
 
   return server;
 }
@@ -7610,11 +7611,25 @@ export async function startStdio(): Promise<void> {
   // credentials are present at startup here — unlike the HTTP transport, where they
   // arrive with the request.
   try {
-    const profile = await ensurePlatform(createClientFromEnv());
+    const profile = await withSessionScope(() => ensurePlatform(createClientFromEnv()));
     process.stderr.write(`[bw-modeling-mcp] Platform: ${profile.detail}\n`);
   } catch (err) {
     process.stderr.write(`[bw-modeling-mcp] Warning: platform detection skipped (${err})\n`);
   }
+
+  // The client is gone once stdin ends. Sessions still open then — a lock nobody will release,
+  // a call still running — are ended rather than left to the ICF timeout, bounded so a dead
+  // backend cannot keep the process alive.
+  let stopping = false;
+  const stop = () => {
+    if (stopping) return;
+    stopping = true;
+    const limit = new Promise((resolve) => setTimeout(resolve, 5000).unref());
+    void Promise.race([closeAllSessions(), limit]).finally(() => process.exit(0));
+  };
+  process.stdin.on('end', stop);
+  process.stdin.on('close', stop);
+  for (const signal of ['SIGINT', 'SIGTERM', 'SIGHUP', 'SIGBREAK'] as const) process.on(signal, stop);
 
   const transport = new StdioServerTransport();
   await createServer().connect(transport);

@@ -2,6 +2,7 @@ import axios, { AxiosInstance, AxiosResponse } from 'axios';
 import https from 'https';
 import { randomUUID } from 'crypto';
 import * as fs from 'fs';
+import { AsyncLocalStorage } from 'node:async_hooks';
 import { currentClient } from './request-context.js';
 // Value import, but no cycle at runtime: platform.ts takes BwClient as a type only.
 import { cachedPlatform } from './platform.js';
@@ -308,6 +309,86 @@ function tracksLock(type: string): boolean {
   return !NO_UNLOCK_TYPES.has(type.toLowerCase());
 }
 
+/**
+ * One connection pool for every client. Without keep-alive each request opened a TCP and TLS
+ * connection of its own, and on some hosts a share of new connections stalls for about 20
+ * seconds before failing. The SAP session travels in the cookies, not in the connection, so
+ * clients can share sockets. Idle sockets are closed after 30 s, far below the ICM's own idle
+ * limit (300 s measured), so a request is never sent on a socket the server is closing.
+ */
+const sharedHttpsAgent = new https.Agent({ rejectUnauthorized: false, keepAlive: true, timeout: 30_000 });
+
+function holdsLock(client: BwClient): boolean {
+  for (const entry of lockSessions.values()) if (entry.client === client) return true;
+  return false;
+}
+
+/**
+ * The clients built during one tool call, so their sessions can be ended when it is over.
+ *
+ * Every client logs on with its own CSRF fetch, and every request it sends is stateful, so each
+ * one leaves an ICF session with its user context behind — tens of MB each, several per call
+ * once the fresh sessions are counted — until the plug-in timeout ends it, which is an hour or
+ * more on most systems. Collecting them here is what lets the ~50 call sites that build a fresh
+ * client stay as they are.
+ */
+const sessionScope = new AsyncLocalStorage<Set<BwClient>>();
+const openScopes = new Set<Set<BwClient>>();
+const SESSION_CLOSE_TIMEOUT_MS = 5000;
+
+/** `BW_SESSION_CLOSE=off` keeps sessions open, for a proxy that holds the session itself. */
+function sessionCloseEnabled(): boolean {
+  return !/^(off|false|0|no)$/i.test(process.env.BW_SESSION_CLOSE ?? '');
+}
+
+/** Logoffs still under way, so shutdown can wait for them. */
+const pendingLogoffs = new Set<Promise<void>>();
+
+/**
+ * End the sessions without making the caller wait: the answer to the tool call is ready, and a
+ * backend slow to answer the logoff must not hold it up.
+ */
+function logoffInBackground(clients: Iterable<BwClient>): void {
+  for (const client of clients) {
+    const done = client.logoff().finally(() => pendingLogoffs.delete(done));
+    pendingLogoffs.add(done);
+  }
+}
+
+/**
+ * Run `fn` and then end the session of every client that sent a request during it, unless the
+ * client holds a lock: the lock registry routes the unlock through that session, so it stays
+ * until `unlock()` releases the lock and ends it there.
+ */
+export async function withSessionScope<T>(fn: () => Promise<T>): Promise<T> {
+  const scope = new Set<BwClient>();
+  openScopes.add(scope);
+  try {
+    return await sessionScope.run(scope, fn);
+  } finally {
+    openScopes.delete(scope);
+    if (sessionCloseEnabled()) logoffInBackground([...scope].filter((c) => !holdsLock(c)));
+  }
+}
+
+/** Resolves once every logoff started so far has finished. */
+export async function sessionsClosed(): Promise<void> {
+  await Promise.all([...pendingLogoffs]);
+}
+
+/**
+ * End every session the process still holds, lock holders included — ending the logon
+ * releases their enqueues. For shutdown, when no unlock will come any more.
+ */
+export async function closeAllSessions(): Promise<void> {
+  const clients = new Set<BwClient>();
+  for (const entry of lockSessions.values()) clients.add(entry.client);
+  for (const scope of openScopes) for (const c of scope) clients.add(c);
+  lockSessions.clear();
+  logoffInBackground(clients);
+  await sessionsClosed();
+}
+
 export class BwClient {
   private http: AxiosInstance;
   private csrfToken: string | null = null;
@@ -358,7 +439,7 @@ export class BwClient {
         }),
         ...(opts.language ? { 'sap-language': opts.language } : {}),
       },
-      httpsAgent: new https.Agent({ rejectUnauthorized: false }),
+      httpsAgent: sharedHttpsAgent,
       validateStatus: () => true,
     });
     delete this.http.defaults.headers.post['Content-Type'];
@@ -402,14 +483,43 @@ export class BwClient {
   }
 
   /**
-   * End this client's logon on the server, which ends every context it holds and the locks in
-   * them. Meant for a session of its own (see freshSession) whose work leaves an enqueue that
-   * only the end of the logon releases. Not done in cookie mode: the cookies belong to a browser
-   * logon the server merely borrows, and ending it would cut the server off.
+   * End this client's session on the server: its stateful context, its logon, and the locks
+   * held in them. The client stays usable — the next request logs on afresh.
+   *
+   * Two requests, because neither does both: a stateless request ends the stateful context
+   * (`sap-sessioncmd=close` does not, on `/sap/bw/modeling`), and the ICF logoff ends the logon.
+   * Neither goes through `ensureCsrf`, which would log on again just to log off. Best effort and
+   * bounded, so an unreachable backend cannot hold up the answer to a tool call.
+   *
+   * The logoff leaves out `sap-contextid`: it names the context the first request just ended,
+   * and the ICM rejects a request for an ended context with 400 before the logoff handler runs.
+   * Neither request carries the SSO ticket (`MYSAPSSO2`): if the session has already timed out,
+   * the server would log on afresh with it and leave behind a session nothing ends.
+   *
+   * Not done in cookie mode: the cookies belong to a browser logon the server merely borrows,
+   * and ending it would cut the server off.
    */
   async logoff(): Promise<void> {
-    if (this.opts.auth.kind === 'cookies') return;
-    await this.rawGet('/sap/public/bc/icf/logoff', { Accept: '*/*' }).catch(() => {/* best effort */});
+    if (this.opts.auth.kind === 'cookies' || this.cookies.size === 0) return;
+    // The jar is emptied before the requests go out, so a client reused while they run starts a
+    // logon of its own instead of losing its cookies halfway through.
+    const jar = [...this.cookies.entries()].filter(([k]) => k !== 'MYSAPSSO2');
+    this.cookies.clear();
+    this.csrfToken = null;
+    const cookieHeader = (keep: (name: string) => boolean) =>
+      jar.filter(([k]) => keep(k)).map(([k, v]) => `${k}=${v}`).join('; ');
+    const send = (path: string, sessionType: string | undefined, cookie: string) =>
+      this.http.get(path, {
+        headers: { Accept: '*/*', 'X-sap-adt-sessiontype': sessionType, ...(cookie ? { Cookie: cookie } : {}) },
+        responseType: 'text',
+        timeout: SESSION_CLOSE_TIMEOUT_MS,
+      });
+    try {
+      await send('/sap/bw/modeling/repo/is/systeminfo', 'stateless', cookieHeader(() => true));
+      await send('/sap/public/bc/icf/logoff', undefined, cookieHeader((k) => k !== 'sap-contextid'));
+    } catch {
+      /* best effort: the session times out on its own */
+    }
   }
 
   /**
@@ -491,6 +601,9 @@ export class BwClient {
   }
 
   private updateCookies(response: AxiosResponse): void {
+    // On every response rather than at construction: a client cached across calls has to be
+    // ended by each call that used it, not only by the one that built it.
+    sessionScope.getStore()?.add(this);
     const setCookies = response.headers['set-cookie'];
     if (!setCookies) return;
     if (this.sessionDebug) {
@@ -1080,7 +1193,7 @@ export class BwClient {
     const freshHttp = axios.create({
       baseURL: this.http.defaults.baseURL,
       proxy: this.proxyConfig(),
-      httpsAgent: new https.Agent({ rejectUnauthorized: false }),
+      httpsAgent: sharedHttpsAgent,
       validateStatus: () => true,
       // Wipe every axios default-header bucket so nothing leaks through
       headers: { common: {}, get: {}, post: {}, put: {}, patch: {}, delete: {}, head: {} } as any,
@@ -1159,7 +1272,7 @@ export class BwClient {
     const freshHttp = axios.create({
       baseURL: this.http.defaults.baseURL,
       proxy: this.proxyConfig(),
-      httpsAgent: new https.Agent({ rejectUnauthorized: false }),
+      httpsAgent: sharedHttpsAgent,
       validateStatus: () => true,
       headers: { common: {}, get: {}, post: {}, put: {}, patch: {}, delete: {}, head: {} } as any,
     });
@@ -1196,7 +1309,7 @@ export class BwClient {
     const freshHttp = axios.create({
       baseURL: this.http.defaults.baseURL,
       proxy: this.proxyConfig(),
-      httpsAgent: new https.Agent({ rejectUnauthorized: false }),
+      httpsAgent: sharedHttpsAgent,
       validateStatus: () => true,
       headers: { common: {}, get: {}, post: {}, put: {}, patch: {}, delete: {}, head: {} } as any,
     });
@@ -1441,6 +1554,10 @@ export class BwClient {
       throw bwHttpError(`UNLOCK ${type.toUpperCase()} ${name}`, response.status, response.data);
     }
     lockSessions.delete(key);
+    // A lock session from an earlier call belongs to no scope, so nothing else would end it.
+    if (sessionCloseEnabled() && !holdsLock(this) && !sessionScope.getStore()?.has(this)) {
+      logoffInBackground([this]);
+    }
   }
 }
 
