@@ -1,4 +1,5 @@
 import axios, { AxiosInstance, AxiosResponse } from 'axios';
+import http from 'http';
 import https from 'https';
 import { randomUUID } from 'crypto';
 import * as fs from 'fs';
@@ -318,6 +319,22 @@ function tracksLock(type: string): boolean {
  */
 const sharedHttpsAgent = new https.Agent({ rejectUnauthorized: false, keepAlive: true, timeout: 30_000 });
 
+/**
+ * Behind the Cloud Connector proxy no connection is reused. The connectivity proxy ties a
+ * connection to the authentication of its first request and refuses a later request on it that
+ * carries `SAP-Connectivity-Authentication` when the first one did not — which is every logon
+ * after a cookie-only request, and with several users on one server it would also mix
+ * principals on one socket. The proxy runs next to the app, so a new connection costs little.
+ */
+const proxyHttpAgent = new http.Agent({ keepAlive: false });
+const proxyHttpsAgent = new https.Agent({ rejectUnauthorized: false, keepAlive: false });
+
+function agentsFor(proxied: boolean): { httpAgent?: http.Agent; httpsAgent: https.Agent } {
+  return proxied
+    ? { httpAgent: proxyHttpAgent, httpsAgent: proxyHttpsAgent }
+    : { httpsAgent: sharedHttpsAgent };
+}
+
 function holdsLock(client: BwClient): boolean {
   for (const entry of lockSessions.values()) if (entry.client === client) return true;
   return false;
@@ -439,7 +456,7 @@ export class BwClient {
         }),
         ...(opts.language ? { 'sap-language': opts.language } : {}),
       },
-      httpsAgent: sharedHttpsAgent,
+      ...agentsFor(!!opts.proxy),
       validateStatus: () => true,
     });
     delete this.http.defaults.headers.post['Content-Type'];
@@ -1193,7 +1210,7 @@ export class BwClient {
     const freshHttp = axios.create({
       baseURL: this.http.defaults.baseURL,
       proxy: this.proxyConfig(),
-      httpsAgent: sharedHttpsAgent,
+      ...agentsFor(!!this.opts.proxy),
       validateStatus: () => true,
       // Wipe every axios default-header bucket so nothing leaks through
       headers: { common: {}, get: {}, post: {}, put: {}, patch: {}, delete: {}, head: {} } as any,
@@ -1272,7 +1289,7 @@ export class BwClient {
     const freshHttp = axios.create({
       baseURL: this.http.defaults.baseURL,
       proxy: this.proxyConfig(),
-      httpsAgent: sharedHttpsAgent,
+      ...agentsFor(!!this.opts.proxy),
       validateStatus: () => true,
       headers: { common: {}, get: {}, post: {}, put: {}, patch: {}, delete: {}, head: {} } as any,
     });
@@ -1309,7 +1326,7 @@ export class BwClient {
     const freshHttp = axios.create({
       baseURL: this.http.defaults.baseURL,
       proxy: this.proxyConfig(),
-      httpsAgent: sharedHttpsAgent,
+      ...agentsFor(!!this.opts.proxy),
       validateStatus: () => true,
       headers: { common: {}, get: {}, post: {}, put: {}, patch: {}, delete: {}, head: {} } as any,
     });
