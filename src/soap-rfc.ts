@@ -20,10 +20,32 @@ function escapeXml(value: string): string {
   return value.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
 }
 
-/** Scalar importing parameters only; that is all the modules called here take. */
-export function rfcEnvelope(fm: string, params: Record<string, string>): string {
+function unescapeXml(value: string): string {
+  return value
+    .replace(/&lt;/g, '<')
+    .replace(/&gt;/g, '>')
+    .replace(/&quot;/g, '"')
+    .replace(/&apos;/g, "'")
+    .replace(/&#(\d+);/g, (_, d) => String.fromCharCode(Number(d)))
+    .replace(/&amp;/g, '&');
+}
+
+/** A scalar, a structure (its fields by name) or a table (its rows, each sent as an item). */
+export type RfcValue = string | RfcValue[] | { [field: string]: RfcValue };
+
+function serialize(name: string, value: RfcValue): string {
+  if (typeof value === 'string') return `<${name}>${escapeXml(value)}</${name}>`;
+  if (Array.isArray(value)) return `<${name}>${value.map((row) => serialize('item', row)).join('')}</${name}>`;
+  return `<${name}>${Object.entries(value).map(([k, v]) => serialize(k, v)).join('')}</${name}>`;
+}
+
+/**
+ * A table parameter comes back only when the request names it, so an output table is passed
+ * as an empty array.
+ */
+export function rfcEnvelope(fm: string, params: Record<string, RfcValue>): string {
   const body = Object.entries(params)
-    .map(([k, v]) => `<${k}>${escapeXml(v)}</${k}>`)
+    .map(([k, v]) => serialize(k, v))
     .join('');
   return (
     '<?xml version="1.0" encoding="utf-8"?>' +
@@ -41,7 +63,7 @@ export function soapFault(xml: string): string | undefined {
   return [exception, fault].filter(Boolean).join(': ') || 'SOAP fault without a message';
 }
 
-export async function callRfc(client: BwClient, fm: string, params: Record<string, string>): Promise<string> {
+export async function callRfc(client: BwClient, fm: string, params: Record<string, RfcValue>): Promise<string> {
   let body: string;
   try {
     ({ body } = await client.rawPost(SOAP_RFC_PATH, rfcEnvelope(fm, params), {
@@ -74,4 +96,23 @@ export async function callRfc(client: BwClient, fm: string, params: Record<strin
 export function rfcField(xml: string, name: string): string {
   const m = xml.match(new RegExp(`<${name}>([\\s\\S]*?)</${name}>`));
   return m ? m[1].trim() : '';
+}
+
+/**
+ * The rows of a table or the fields of a structure in the response, values unescaped and
+ * untrimmed: some keys carry meaning in their padding, such as a role key, which is the role
+ * name padded to 30 characters followed by a node number.
+ */
+export function rfcRows(xml: string, name: string): Array<Record<string, string>> {
+  const section = xml.match(new RegExp(`<${name}>([\\s\\S]*?)</${name}>`))?.[1] ?? '';
+  return [...section.matchAll(/<item>([\s\S]*?)<\/item>/g)].map((m) => rfcStruct(m[1]));
+}
+
+export function rfcStruct(xml: string): Record<string, string> {
+  const out: Record<string, string> = {};
+  for (const m of xml.matchAll(/<([A-Za-z_][\w]*)>([^<]*)<\/\1>|<([A-Za-z_][\w]*)\s*\/>/g)) {
+    if (m[1]) out[m[1]] = unescapeXml(m[2]);
+    else out[m[3]] = '';
+  }
+  return out;
 }

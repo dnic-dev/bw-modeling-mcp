@@ -341,14 +341,14 @@ export interface ListAfoWorkbooksArgs {
   max_results?: number;
 }
 
-interface Collected {
+export interface Collected {
   list: Workbook[];
   notes: string[];
   from?: string;
   to?: string;
 }
 
-async function collectWorkbooks(client: BwClient, args: ListAfoWorkbooksArgs): Promise<Collected> {
+export async function collectWorkbooks(client: BwClient, args: ListAfoWorkbooksArgs): Promise<Collected> {
   const from = args.changed_from ? boundStamp(args.changed_from, 'changed_from', false) : undefined;
   const to = args.changed_to ? boundStamp(args.changed_to, 'changed_to', true) : undefined;
   if (from && to && from > to) throw new Error('changed_from must lie before changed_to.');

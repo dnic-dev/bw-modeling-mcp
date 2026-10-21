@@ -195,6 +195,9 @@ src/
 └── tools/
     ├── activation.ts     # bw_activate, bw_unlock
     ├── adso.ts           # bw_get_adso, bw_create_adso, bw_update_adso
+    ├── afo_workbook_save.ts # bw_save_afo_workbook — RSAO_BICS_SAVE with the where-used list read from
+    │                        # the AfO definition in the file, RSOBJS_ALTER_NODE_REFS for the role menu,
+    │                        # RSAO_BICS_CLOSE to release the edit lock; all over SOAP RFC
     ├── afo_workbooks.ts  # bw_list_afo_workbooks, bw_get_afo_workbook (the file through RSAO_BICS_OPEN
     │                     # over SOAP RFC, no lock) — RSAOOBJ / RSAOOBJXREF through ADT DataPreview,
     │                     # query element UIDs resolved via RSZELTDIR, role menus from the

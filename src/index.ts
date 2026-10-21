@@ -82,6 +82,7 @@ import { bwListSourceSystems, bwListDatasources, bwGetSourceSystem, bwGetDatasou
 import { bwGetDataflow } from './tools/dataflow.js';
 import { bwQueryStatistics } from './tools/query_statistics.js';
 import { bwListAfoWorkbooks, bwGetAfoWorkbook } from './tools/afo_workbooks.js';
+import { bwSaveAfoWorkbook } from './tools/afo_workbook_save.js';
 import { bwQueryData, bwGetFilterValues, InfoObjectState, VariableInput, DrillOperation } from './tools/reporting.js';
 import { bwGetRoles, bwGetQueryRoles, bwSetQueryRoles, bwGetRoleQueries } from './tools/roles.js';
 import { bwGetProcessChain } from './tools/processchain.js';
@@ -4537,6 +4538,32 @@ const TOOL_DEFINITIONS = [
       },
     },
     {
+      name: 'bw_save_afo_workbook',
+      description:
+        'Save an Analysis for Office workbook to BW, as Analysis for Office does, and optionally place it in a role menu. ' +
+        'Typical use: fetch a workbook with bw_get_afo_workbook, extend it with a workbook tool, save it back under a new name. ' +
+        'If a workbook of that name exists, nothing is saved unless overwrite is true — confirm with the user before passing it. ' +
+        'The where-used list is built from the workbook itself (queries, planning functions and sequences, BPC model); a data ' +
+        'source of another kind stops the save. With role (and folder) the workbook is added to that role menu, once. ' +
+        'BW checks the caller\'s authorization and locks. Needs the SOAP RFC service (/sap/bc/soap/rfc).',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          name: { type: 'string', description: 'Technical name to save under (e.g. "WORKBOOK_NAME").' },
+          file_path: { type: 'string', description: 'Local .xlsx/.xlsm file to save. Local server only.' },
+          content_base64: { type: 'string', description: 'The workbook as base64, instead of file_path.' },
+          description: {
+            type: 'string',
+            description: 'Workbook text, at most 60 characters. Required for a new workbook; an existing one keeps its text when omitted.',
+          },
+          overwrite: { type: 'boolean', description: 'Replace an existing workbook of the same name (default false). Only after the user confirmed it.' },
+          role: { type: 'string', description: 'Role whose menu the workbook is added to (e.g. "ROLE_NAME").' },
+          folder: { type: 'string', description: 'Folder path inside the role menu, separated by "/" (e.g. "Planning/Prices"); default the top level.' },
+        },
+        required: ['name'],
+      },
+    },
+    {
       name: 'bw_get_filter_values',
       description:
         'Look up valid characteristic values for use in query filters or variable inputs. ' +
@@ -7224,6 +7251,22 @@ async function handleToolCall(
             include_content: args?.include_content as boolean | undefined,
           },
           // Under the HTTP transport a request client is active; only stdio runs on the caller's machine.
+          currentClient() === undefined,
+        );
+        break;
+
+      case 'bw_save_afo_workbook':
+        text = await bwSaveAfoWorkbook(
+          client,
+          {
+            name: args?.name as string,
+            file_path: args?.file_path as string | undefined,
+            content_base64: args?.content_base64 as string | undefined,
+            description: args?.description as string | undefined,
+            overwrite: args?.overwrite as boolean | undefined,
+            role: args?.role as string | undefined,
+            folder: args?.folder as string | undefined,
+          },
           currentClient() === undefined,
         );
         break;
