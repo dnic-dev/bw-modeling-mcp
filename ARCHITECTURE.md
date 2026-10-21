@@ -186,6 +186,8 @@ src/
 ├── destination.ts        # builds a BwClient from a BTP destination (PrincipalPropagation or BasicAuthentication)
 ├── request-context.ts    # AsyncLocalStorage holding the per-request BW client under principal propagation
 ├── scopes.ts             # read/write scope classification and tools/list filtering for XSUAA role-based access
+├── soap-rfc.ts           # calling an RFC-enabled function module over /sap/bc/soap/rfc, with a clear
+│                         # message when the ICF service is inactive
 ├── arguments.ts          # refusal of undeclared arguments to writing tools
 ├── platform.ts           # BW/4HANA vs classic BW detection and the platform half of the tools/list filter
 ├── classic-writes.ts     # per-write-tool status on a classic release, printed by bw_system_profile
@@ -193,7 +195,8 @@ src/
 └── tools/
     ├── activation.ts     # bw_activate, bw_unlock
     ├── adso.ts           # bw_get_adso, bw_create_adso, bw_update_adso
-    ├── afo_workbooks.ts  # bw_list_afo_workbooks — RSAOOBJ / RSAOOBJXREF through ADT DataPreview,
+    ├── afo_workbooks.ts  # bw_list_afo_workbooks, bw_get_afo_workbook (the file through RSAO_BICS_OPEN
+    │                     # over SOAP RFC, no lock) — RSAOOBJ / RSAOOBJXREF through ADT DataPreview,
     │                     # query element UIDs resolved via RSZELTDIR, role menus from the
     │                     # RAAOE nodes in AGR_HIER (workbook name in SAP_GUID)
     ├── composite_provider.ts # bw_get_composite_provider, bw_create_composite_provider,

@@ -40,6 +40,7 @@ export const SCOPES: readonly Scope[] = ['read', 'analyst', 'write'];
 
 const READ_TOOLS = new Set([
   'bw_get_adso',
+  'bw_get_afo_workbook',
   'bw_get_aggregation_level',
   'bw_get_ckf',
   'bw_get_composite_provider',

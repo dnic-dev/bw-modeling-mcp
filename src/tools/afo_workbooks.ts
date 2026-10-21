@@ -1,4 +1,7 @@
 import { BwClient } from '../bw-client.js';
+import { existsSync, mkdirSync, statSync, writeFileSync } from 'node:fs';
+import { dirname, extname, join } from 'node:path';
+import { callRfc, rfcField } from '../soap-rfc.js';
 import { queryTable, sqlLiteral, formatStamp, inListBatches, SAP_LANGUAGE, type Row } from './metadata_sql.js';
 
 /**
@@ -8,7 +11,8 @@ import { queryTable, sqlLiteral, formatStamp, inListBatches, SAP_LANGUAGE, type 
  * A data source that is a query is recorded under the query's element UID, not its name, so
  * those entries are joined to RSZELTDIR. Other data sources (an aggregation level or a
  * provider queried directly) and planning objects are recorded by name. The document itself
- * sits in RSAOOBJ-CONTENT as one raw string and is never selected here.
+ * sits in RSAOOBJ-CONTENT as one raw string, which DataPreview cuts after a few bytes, so it is
+ * never selected; the file is fetched through RSAO_BICS_OPEN over SOAP RFC instead.
  *
  * The tables exist on classic releases and on BW/4HANA alike; RSAOOBJ also holds Design Studio
  * applications (OBJTYPE 10), which are not Analysis for Office documents and are left out.
@@ -309,14 +313,20 @@ export function formatWorkbooks(list: Workbook[], header: string, limit: number)
   for (const wb of shown) {
     lines.push('', `${wb.name}${wb.text ? ` — ${wb.text}` : ''}`);
     lines.push(`  ${wb.docType} (${wb.fileType}), last changed ${wb.changedAt || '?'} UTC by ${wb.changedBy || '?'}`);
-    lines.push(`  Data sources: ${wb.dataSources.length ? wb.dataSources.map(describe).join(', ') : 'none recorded'}`);
-    if (wb.planning.length) lines.push(`  Planning: ${wb.planning.map(describe).join(', ')}`);
-    for (const m of wb.menus) {
-      const where = m.path.length ? m.path.join(' › ') : 'top level';
-      lines.push(`  In role menu ${m.role}${m.roleText ? ` (${m.roleText})` : ''}: ${where}`);
-    }
+    lines.push(...usageLines(wb));
   }
   return lines.join('\n');
+}
+
+/** Data sources, planning objects and role menus of one workbook. */
+export function usageLines(wb: Workbook): string[] {
+  const lines = [`  Data sources: ${wb.dataSources.length ? wb.dataSources.map(describe).join(', ') : 'none recorded'}`];
+  if (wb.planning.length) lines.push(`  Planning: ${wb.planning.map(describe).join(', ')}`);
+  for (const m of wb.menus) {
+    const where = m.path.length ? m.path.join(' › ') : 'top level';
+    lines.push(`  In role menu ${m.role}${m.roleText ? ` (${m.roleText})` : ''}: ${where}`);
+  }
+  return lines;
 }
 
 // ── Tool: bw_list_afo_workbooks ──────────────────────────────────────────────
@@ -331,7 +341,14 @@ export interface ListAfoWorkbooksArgs {
   max_results?: number;
 }
 
-export async function bwListAfoWorkbooks(client: BwClient, args: ListAfoWorkbooksArgs): Promise<string> {
+interface Collected {
+  list: Workbook[];
+  notes: string[];
+  from?: string;
+  to?: string;
+}
+
+async function collectWorkbooks(client: BwClient, args: ListAfoWorkbooksArgs): Promise<Collected> {
   const from = args.changed_from ? boundStamp(args.changed_from, 'changed_from', false) : undefined;
   const to = args.changed_to ? boundStamp(args.changed_to, 'changed_to', true) : undefined;
   if (from && to && from > to) throw new Error('changed_from must lie before changed_to.');
@@ -364,6 +381,15 @@ export async function bwListAfoWorkbooks(client: BwClient, args: ListAfoWorkbook
     to,
   }).sort((a, b) => b.stamp.localeCompare(a.stamp) || a.name.localeCompare(b.name));
 
+  const notes = [menuNote];
+  if ([workbookRows, textRows, xrefRows, ...menuRows].some((rows) => rows.length >= MAX_ROWS)) {
+    notes.push(`Note: a table returned ${MAX_ROWS} rows, the read limit; narrow the search with name.`);
+  }
+  return { list, notes: notes.filter(Boolean), from, to };
+}
+
+export async function bwListAfoWorkbooks(client: BwClient, args: ListAfoWorkbooksArgs): Promise<string> {
+  const { list, notes, from, to } = await collectWorkbooks(client, args);
   const criteria = [
     args.name ? `name ${args.name.trim().toUpperCase()}` : '',
     args.role ? `in a role menu matching ${args.role.trim()}` : '',
@@ -373,9 +399,139 @@ export async function bwListAfoWorkbooks(client: BwClient, args: ListAfoWorkbook
   ].filter(Boolean);
   const header = `Analysis for Office workbooks stored in BW${criteria.length ? ` (${criteria.join(', ')})` : ''}:`;
   const limit = Math.max(1, Math.min(args.max_results ?? 100, 1000));
-  const notes = [menuNote];
-  if ([workbookRows, textRows, xrefRows, ...menuRows].some((rows) => rows.length >= MAX_ROWS)) {
-    notes.push(`Note: a table returned ${MAX_ROWS} rows, the read limit; narrow the search with name.`);
+  return [formatWorkbooks(list, header, limit), ...notes].join('\n\n');
+}
+
+// ── Tool: bw_get_afo_workbook ────────────────────────────────────────────────
+
+const AUTH_FIELDS: Array<[string, string]> = [
+  ['DISPLAY', 'display'],
+  ['CHANGE', 'change'],
+  ['CREATE', 'create'],
+  ['DELETE', 'delete'],
+  ['EXECUTE', 'execute'],
+];
+
+export interface FetchedWorkbook {
+  name: string;
+  objType: string;
+  fileType: string;
+  owner: string;
+  changedBy: string;
+  stamp: string;
+  docVersion: string;
+  content: Buffer;
+  /** What the calling user may do with the workbook, as BW reports it. */
+  authorizations: string[];
+}
+
+/** The workbook part of an RSAO_BICS_OPEN response; undefined when BW returned no workbook. */
+export function parseOpenResponse(xml: string): FetchedWorkbook | undefined {
+  const root = rfcField(xml, 'E_S_AO_ROOT_OBJ');
+  const auth = rfcField(xml, 'E_S_AUTH_PROFILE');
+  const content = rfcField(root, 'CONTENT').replace(/\s+/g, '');
+  const name = rfcField(root, 'TECHNAME');
+  if (!name || !content) return undefined;
+  return {
+    name,
+    objType: rfcField(root, 'OBJTYPE'),
+    fileType: rfcField(root, 'FILETYPE'),
+    owner: rfcField(root, 'OWNER'),
+    changedBy: rfcField(root, 'TSTPNM'),
+    stamp: rfcField(root, 'TIMESTMP'),
+    docVersion: rfcField(root, 'DOCVERSION'),
+    content: Buffer.from(content, 'base64'),
+    authorizations: AUTH_FIELDS.filter(([field]) => rfcField(auth, field) === 'X').map(([, label]) => label),
+  };
+}
+
+/**
+ * The file as Analysis for Office opens it. IV_IGNORELOCKS neither checks nor sets the edit
+ * lock, so fetching a workbook someone has open in AfO neither fails nor blocks them.
+ */
+export async function fetchWorkbook(client: BwClient, name: string): Promise<FetchedWorkbook | undefined> {
+  const techname = name.trim().toUpperCase();
+  // IV_OBJTYPE is the document type: 0 an Excel workbook, 1 a PowerPoint presentation.
+  for (const objType of ['0', '1']) {
+    const xml = await callRfc(client, 'RSAO_BICS_OPEN', { IV_TECHNAME: techname, IV_OBJTYPE: objType, IV_IGNORELOCKS: 'X' });
+    const wb = parseOpenResponse(xml);
+    if (wb) return wb;
   }
-  return [formatWorkbooks(list, header, limit), ...notes.filter(Boolean)].join('\n\n');
+  return undefined;
+}
+
+/** An Office document is a ZIP package; anything else is not what was asked for. */
+export function isOfficePackage(content: Buffer): boolean {
+  return content.length > 4 && content[0] === 0x50 && content[1] === 0x4b && content[2] === 0x03 && content[3] === 0x04;
+}
+
+export interface GetAfoWorkbookArgs {
+  name: string;
+  save_path?: string;
+  overwrite?: boolean;
+  include_content?: boolean;
+}
+
+/** A directory gets the workbook's own file name; a path without an extension gets the file type. */
+export function targetFile(savePath: string, wb: Pick<FetchedWorkbook, 'name' | 'fileType'>, isDirectory: boolean): string {
+  const ext = wb.fileType || 'xlsx';
+  if (isDirectory) return join(savePath, `${wb.name}.${ext}`);
+  return extname(savePath) ? savePath : `${savePath}.${ext}`;
+}
+
+export async function bwGetAfoWorkbook(client: BwClient, args: GetAfoWorkbookArgs, local: boolean): Promise<string> {
+  if (!args.name?.trim()) throw new Error('name is required.');
+  if (args.save_path && !local) {
+    throw new Error(
+      'save_path writes to the disk of the machine the server runs on, which on a hosted server is not yours. ' +
+        'Use include_content to receive the file as base64.',
+    );
+  }
+
+  const wb = await fetchWorkbook(client, args.name);
+  if (!wb) {
+    return `Workbook ${args.name.trim().toUpperCase()}: not found in BW, or not open to this user.`;
+  }
+  if (!isOfficePackage(wb.content)) {
+    throw new Error(`BW returned ${wb.content.length} bytes for ${wb.name} that are not an Office document.`);
+  }
+
+  // The text, the where-used list and the role menus come from the metadata tables; the file
+  // is already in hand when they cannot be read, so their absence is reported, not raised.
+  let listed: Workbook | undefined;
+  let usageNote = '';
+  try {
+    const { list, notes } = await collectWorkbooks(client, { name: wb.name });
+    listed = list.find((w) => w.name === wb.name);
+    usageNote = notes.join(' ');
+  } catch (err) {
+    usageNote = `Where-used list not read: ${(err as Error).message.split('\n')[0]}`;
+  }
+
+  const lines = [
+    `Workbook ${wb.name}${listed?.text ? ` — ${listed.text}` : ''}`,
+    `  ${DOC_TYPES[wb.objType] ?? 'Document'} (${wb.fileType}), ${wb.content.length.toLocaleString('en-US')} bytes`,
+    `  Owner ${wb.owner || '?'}, last changed ${formatStamp(wb.stamp) || '?'} UTC by ${wb.changedBy || '?'}`,
+    `  This user may: ${wb.authorizations.length ? wb.authorizations.join(', ') : 'nothing beyond opening it'}`,
+  ];
+
+  if (args.save_path) {
+    const isDirectory =
+      /[\\/]$/.test(args.save_path) || (existsSync(args.save_path) && statSync(args.save_path).isDirectory());
+    const file = targetFile(args.save_path, wb, isDirectory);
+    if (existsSync(file) && !args.overwrite) {
+      throw new Error(`${file} exists. Pass overwrite: true to replace it, or choose another path.`);
+    }
+    mkdirSync(dirname(file), { recursive: true });
+    writeFileSync(file, wb.content);
+    lines.push(`  Saved to ${file}`);
+  }
+
+  if (listed) lines.push(...usageLines(listed));
+  if (usageNote) lines.push(`  ${usageNote}`);
+
+  if (args.include_content) {
+    lines.push('', `Content (base64, ${wb.fileType}):`, wb.content.toString('base64'));
+  }
+  return lines.join('\n');
 }

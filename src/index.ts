@@ -81,7 +81,7 @@ import { bwListContents } from './tools/repository.js';
 import { bwListSourceSystems, bwListDatasources, bwGetSourceSystem, bwGetDatasource, bwPreviewDatasource, bwListRemoteEntities, bwCreateDatasource, bwChangeDatasourceDelta, bwSetDatasourceFields } from './tools/datasource.js';
 import { bwGetDataflow } from './tools/dataflow.js';
 import { bwQueryStatistics } from './tools/query_statistics.js';
-import { bwListAfoWorkbooks } from './tools/afo_workbooks.js';
+import { bwListAfoWorkbooks, bwGetAfoWorkbook } from './tools/afo_workbooks.js';
 import { bwQueryData, bwGetFilterValues, InfoObjectState, VariableInput, DrillOperation } from './tools/reporting.js';
 import { bwGetRoles, bwGetQueryRoles, bwSetQueryRoles, bwGetRoleQueries } from './tools/roles.js';
 import { bwGetProcessChain } from './tools/processchain.js';
@@ -4513,6 +4513,30 @@ const TOOL_DEFINITIONS = [
       },
     },
     {
+      name: 'bw_get_afo_workbook',
+      description:
+        'Fetch one Analysis for Office workbook stored in BW, as Analysis for Office opens it, without locking it. ' +
+        'Returns its size, owner, last change, what the calling user may do with it, and its where-used list and role ' +
+        'menus (as bw_list_afo_workbooks). With save_path the file is written to disk — only when the server runs ' +
+        'locally; with include_content it comes back as base64. BW checks the caller\'s authorization for the workbook. ' +
+        'Needs the SOAP RFC service (/sap/bc/soap/rfc) to be active; the answer says so when it is not.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          name: { type: 'string', description: 'Workbook technical name (e.g. "WORKBOOK_NAME").' },
+          save_path: {
+            type: 'string',
+            description:
+              'Local file or directory to save the workbook to. An existing directory, or a path ending in a slash, gets the ' +
+              'workbook name and file type; a file name without an extension gets the file type. Local server only.',
+          },
+          overwrite: { type: 'boolean', description: 'Replace an existing file at save_path (default false).' },
+          include_content: { type: 'boolean', description: 'Return the file as base64 (default false). Large: about 4/3 of the file size.' },
+        },
+        required: ['name'],
+      },
+    },
+    {
       name: 'bw_get_filter_values',
       description:
         'Look up valid characteristic values for use in query filters or variable inputs. ' +
@@ -7188,6 +7212,20 @@ async function handleToolCall(
           changed_to: args?.changed_to as string | undefined,
           max_results: args?.max_results as number | undefined,
         });
+        break;
+
+      case 'bw_get_afo_workbook':
+        text = await bwGetAfoWorkbook(
+          client,
+          {
+            name: args?.name as string,
+            save_path: args?.save_path as string | undefined,
+            overwrite: args?.overwrite as boolean | undefined,
+            include_content: args?.include_content as boolean | undefined,
+          },
+          // Under the HTTP transport a request client is active; only stdio runs on the caller's machine.
+          currentClient() === undefined,
+        );
         break;
 
       case 'bw_get_filter_values':
