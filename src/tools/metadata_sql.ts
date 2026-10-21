@@ -142,6 +142,9 @@ async function runStatement(client: BwClient, sql: string, maxRows: number): Pro
 
 // ── Shared helpers ──────────────────────────────────────────────────────────
 
+/** Text tables key texts by the one-letter SAP language; the client is configured in ISO. */
+export const SAP_LANGUAGE: Record<string, string> = { DE: 'D', EN: 'E', FR: 'F', ES: 'S', IT: 'I', NL: 'N', PT: 'P' };
+
 /** Tables store `/NAMESPACE/FIELD`; the REST API and the frontend render `$NAMESPACE$FIELD`. */
 export function toDisplayName(field: string): string {
   const m = field.match(/^\/([^/]+)\/(.+)$/);

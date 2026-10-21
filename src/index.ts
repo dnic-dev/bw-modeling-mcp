@@ -81,6 +81,7 @@ import { bwListContents } from './tools/repository.js';
 import { bwListSourceSystems, bwListDatasources, bwGetSourceSystem, bwGetDatasource, bwPreviewDatasource, bwListRemoteEntities, bwCreateDatasource, bwChangeDatasourceDelta, bwSetDatasourceFields } from './tools/datasource.js';
 import { bwGetDataflow } from './tools/dataflow.js';
 import { bwQueryStatistics } from './tools/query_statistics.js';
+import { bwListAfoWorkbooks } from './tools/afo_workbooks.js';
 import { bwQueryData, bwGetFilterValues, InfoObjectState, VariableInput, DrillOperation } from './tools/reporting.js';
 import { bwGetRoles, bwGetQueryRoles, bwSetQueryRoles, bwGetRoleQueries } from './tools/roles.js';
 import { bwGetProcessChain } from './tools/processchain.js';
@@ -4482,6 +4483,36 @@ const TOOL_DEFINITIONS = [
       },
     },
     {
+      name: 'bw_list_afo_workbooks',
+      description:
+        'List the Analysis for Office workbooks stored in BW, with the where-used list BW keeps for them: per workbook ' +
+        'its text, document and file type, last change (user and time), its data sources (alias → query name, or an ' +
+        'aggregation level or provider used directly), its planning functions and sequences, and the role menus and ' +
+        'folders it is placed in. Answers "which workbooks use query X / planning function Y?" (used_object) and ' +
+        '"which workbooks are in the menu of role Z?" (role) without downloading a workbook. ' +
+        'Newest first. Workbooks kept only on a file share are not stored in BW and do not appear here.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          name: { type: 'string', description: 'Workbook technical name or pattern with * (e.g. "WORKBOOK_*").' },
+          role: {
+            type: 'string',
+            description:
+              'Only workbooks placed in the menu of a matching role: the role name, or a pattern with *, matched in full, ' +
+              'or a term found in the role description (e.g. "ROLE_NAME" or "*APPLICATION*"). Not the workbooks a role is authorized for.',
+          },
+          used_object: {
+            type: 'string',
+            description: 'Only workbooks that use this object: a query name, planning function, planning sequence, aggregation level or provider (e.g. "QUERY_NAME").',
+          },
+          user: { type: 'string', description: 'Only workbooks last changed by this user.' },
+          changed_from: { type: 'string', description: 'Only workbooks last changed on or after this date or timestamp (ISO, UTC).' },
+          changed_to: { type: 'string', description: 'Only workbooks last changed on or before this date or timestamp (ISO, UTC).' },
+          max_results: { type: 'number', description: 'How many workbooks to show (default 100, at most 1000); the total is always reported.' },
+        },
+      },
+    },
+    {
       name: 'bw_get_filter_values',
       description:
         'Look up valid characteristic values for use in query filters or variable inputs. ' +
@@ -7144,6 +7175,18 @@ async function handleToolCall(
           to: args?.to as string | undefined,
           hours: args?.hours as number | undefined,
           slowest: args?.slowest as number | undefined,
+        });
+        break;
+
+      case 'bw_list_afo_workbooks':
+        text = await bwListAfoWorkbooks(client, {
+          name: args?.name as string | undefined,
+          role: args?.role as string | undefined,
+          used_object: args?.used_object as string | undefined,
+          user: args?.user as string | undefined,
+          changed_from: args?.changed_from as string | undefined,
+          changed_to: args?.changed_to as string | undefined,
+          max_results: args?.max_results as number | undefined,
         });
         break;
 

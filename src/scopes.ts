@@ -75,6 +75,7 @@ const READ_TOOLS = new Set([
   'bw_get_variable',
   'bw_list_changeable_transports',
   'bw_list_contents',
+  'bw_list_afo_workbooks',
   'bw_list_datasources',
   'bw_list_process_chain_last_status',
   'bw_list_process_chain_runs',

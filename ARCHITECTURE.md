@@ -193,6 +193,9 @@ src/
 └── tools/
     ├── activation.ts     # bw_activate, bw_unlock
     ├── adso.ts           # bw_get_adso, bw_create_adso, bw_update_adso
+    ├── afo_workbooks.ts  # bw_list_afo_workbooks — RSAOOBJ / RSAOOBJXREF through ADT DataPreview,
+    │                     # query element UIDs resolved via RSZELTDIR, role menus from the
+    │                     # RAAOE nodes in AGR_HIER (workbook name in SAP_GUID)
     ├── composite_provider.ts # bw_get_composite_provider, bw_create_composite_provider,
     │                     # bw_update_composite_provider — inputs, mappings, joins, field
     │                     # groups, name usage, settings

@@ -7,6 +7,7 @@ import {
   toDisplayName,
   formatStamp,
   durationSeconds,
+  SAP_LANGUAGE,
   type Row,
 } from './metadata_sql.js';
 
@@ -613,9 +614,6 @@ const IOBJ_KINDS: Record<string, string> = {
   UNI: 'unit',
   DPA: 'technical (package)',
 };
-
-/** RSDIOBJT keys texts by the one-letter SAP language; the client is configured in ISO. */
-const SAP_LANGUAGE: Record<string, string> = { DE: 'D', EN: 'E', FR: 'F', ES: 'S', IT: 'I', NL: 'N', PT: 'P' };
 
 /**
  * Kind, data type and text of each InfoObject a provider uses, in a handful of statements
