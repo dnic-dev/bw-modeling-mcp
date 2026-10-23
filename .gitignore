@@ -141,7 +141,9 @@ payloads/
 playbooks/
 notes/
 docs/plans/
-tests/
+# Keep local test scratch files ignored; commit the executable OAuth regression.
+tests/*
+!tests/oauth-approval.test.mjs
 poc/
 .claude/
 CLAUDE.md

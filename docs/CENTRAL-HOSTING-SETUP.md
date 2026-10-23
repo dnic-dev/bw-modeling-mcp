@@ -144,6 +144,10 @@ For principal propagation, set `Authentication = PrincipalPropagation` instead a
 
 ## Step 4 — Create the backing services
 
+Before creating or updating XSUAA, configure the exact public `/oauth/callback` in
+`xs-security.json`; the checked-in localhost example is not a production route. See the
+[OAuth upgrade guide](XSUAA-AUTH-UPGRADE.md).
+
 From the repository root, create the three BTP service instances the app binds to. The
 XSUAA instance is configured from the repo's `xs-security.json` (scopes and role
 collections).
