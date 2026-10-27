@@ -97,7 +97,9 @@ export interface WorkbookUsage {
 export function workbookUsage(definition: string): WorkbookUsage {
   const dataSources = [...definition.matchAll(/<DataProvider>([\s\S]*?)<\/DataProvider>/g)].map((m) => {
     const info = xmlText(m[1], 'DataSourceInfo') ?? '';
-    return { alias: xmlText(m[1], 'Key') ?? '', name: xmlText(info, 'Name') ?? '', type: xmlText(info, 'Type') ?? '' };
+    // Id holds the technical name; Name is the query text when AfO stored one.
+    const name = xmlText(info, 'Id') || xmlText(info, 'Name') || '';
+    return { alias: xmlText(m[1], 'Key') ?? '', name, type: xmlText(info, 'Type') ?? '' };
   });
   const objects = xmlText(definition, 'PlanningObjects') ?? '';
   const planning = [...objects.matchAll(/<Planning(\w+)Usage>([\s\S]*?)<\/Planning\1Usage>/g)].map((m) => ({
