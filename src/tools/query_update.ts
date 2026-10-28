@@ -1,5 +1,6 @@
 import { BwClient, createClientFromEnv, bwSeg, lockSessionHeader } from '../bw-client.js';
 import { QUERY_ACCEPT_LIST, queryAccept, queryWriteMediaType, variableAccept, ckfAccept, rkfAccept, structureAccept } from './query.js';
+import { hierarchyNodesByName, TEXT_NODE, type HierarchyNodeRow } from './hierarchy.js';
 
 /**
  * Query update tools (bw_update_query_layout, bw_update_query_filter).
@@ -352,6 +353,35 @@ export function findKeyFigureStructure(
     if (!fallback && structureHoldsKeyFigures(full)) fallback = hit;
   }
   return fallback;
+}
+
+export type StructureKind = 'key_figures' | 'characteristics';
+
+type StructureHit = { container: string; id: string | undefined; element: string; start: number; end: number };
+
+/**
+ * Locate the characteristic structure: the structure in rows or columns that is
+ * not the key figure structure. A query carries at most two structures.
+ */
+export function findCharacteristicStructure(doc: string): StructureHit | null {
+  const keyFigures = findKeyFigureStructure(doc);
+  const region = locateMainComponentRegion(doc, 'characteristic structure lookup');
+  const sub = doc.slice(region.start, region.end);
+  const re = /<Qry:(rows|columns)\b[^>]*?(\/>|>[\s\S]*?<\/Qry:\1>)/g;
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(sub)) !== null) {
+    const full = m[0];
+    const openTag = full.match(/^<Qry:(?:rows|columns)\b[^>]*?(?:\/?>)/)?.[0] ?? full;
+    if (!openTag.includes('xsi:type="Qry:CustomDimension"')) continue;
+    const start = region.start + m.index;
+    if (keyFigures && keyFigures.start === start) continue;
+    return { container: m[1], id: openTag.match(/\bid="([^"]+)"/)?.[1], element: full, start, end: start + full.length };
+  }
+  return null;
+}
+
+export function findStructure(doc: string, kind: StructureKind): StructureHit | null {
+  return kind === 'characteristics' ? findCharacteristicStructure(doc) : findKeyFigureStructure(doc);
 }
 
 /**
@@ -1136,7 +1166,11 @@ export async function bwUpdateQueryFilter(
 
 export interface KeyFigureRestriction {
   infoobject: string;
-  values: FilterValue[];
+  values?: FilterValue[];
+  /** Hierarchy the values are nodes of; also the hierarchy of node_variable. */
+  hierarchy?: string;
+  /** Hierarchy node variable restricting the characteristic (requires hierarchy). */
+  node_variable?: string;
 }
 
 export interface ExceptionAggregation {
@@ -1272,7 +1306,22 @@ function calculationEl(memberXml: string, calc: MemberCalculation | false): stri
 export type FormulaNode = Record<string, unknown>;
 
 export interface KeyFigureOperation {
-  action: 'add_key_figure' | 'add_ckf' | 'add_rkf' | 'add_formula' | 'remove_member' | 'set_member_properties';
+  action:
+    | 'add_key_figure'
+    | 'add_ckf'
+    | 'add_rkf'
+    | 'add_formula'
+    | 'add_selection'
+    | 'remove_member'
+    | 'set_member_properties'
+    | 'set_member_restrictions'
+    | 'switch_hierarchy';
+  /** Hierarchy whose node restrictions are moved (switch_hierarchy). */
+  from_hierarchy?: string;
+  /** Hierarchy the node restrictions are moved to (switch_hierarchy). */
+  to_hierarchy?: string;
+  /** Node renames applied while switching, old node name to new node name (switch_hierarchy). */
+  node_map?: Record<string, string>;
   /** Basic key figure InfoObject name (add_key_figure). */
   infoobject?: string;
   /** Reusable CKF/RKF technical name (add_ckf / add_rkf; also a matcher for remove_member / set_member_properties). */
@@ -1316,27 +1365,295 @@ export interface InverseFormula {
 export interface UpdateQueryKeyFiguresArgs {
   query_name: string;
   structure_target?: 'rows' | 'columns';
+  /** Which structure the member operations address. Defaults to the key figure structure. */
+  structure?: StructureKind;
   operations: KeyFigureOperation[];
   transport?: string;
 }
 
+/**
+ * Build a token restricting a structure member to a hierarchy node. Version and key
+ * date stay blank: the hierarchy is read in the version and on the date the query
+ * runs with. The node is a text node, which is what 0HIER_NODE names.
+ */
+export function buildNodeToken(v: FilterValue, hierarchy: string): string {
+  if (v.high !== undefined && v.high !== '') {
+    throw new Error(`Hierarchy node '${v.value}' cannot carry a high value: a node restriction is never an interval.`);
+  }
+  if (v.exclude) {
+    throw new Error(`Hierarchy node '${v.value}': excluding a node is not supported.`);
+  }
+  const fromDescAttr = v.description !== undefined ? ` fromValueDesc="${escapeXml(v.description)}"` : '';
+  return `<Qry:tokens xsi:type="Qry:SelectionRange" usageType="asFilter" selectionType="nodes"${fromDescAttr} hierarchyDateTo="00000000" hierarchyDateToFlag="Blank" hierarchyName="${escapeXml(hierarchy)}" hierarchyNameFlag="Value" hierarchyVersion="" hierarchyVersionFlag="Blank" operator="Equal">
+      <Qry:fromValue internalValue="${escapeXml(v.internal_value ?? v.value)}">
+        <Qry:type>Value</Qry:type>
+        <Qry:value>${escapeXml(v.value)}</Qry:value>
+      </Qry:fromValue>
+      <Qry:toValue>
+        <Qry:type>InfoObject</Qry:type>
+        <Qry:value>0HIER_NODE</Qry:value>
+      </Qry:toValue>
+    </Qry:tokens>`;
+}
+
+/** Build a token restricting a structure member by a hierarchy node variable. */
+export function buildNodeVariableToken(componentId: string, hierarchy: string): string {
+  const h = escapeXml(hierarchy);
+  return `<Qry:tokens xsi:type="Qry:SelectionVariable" usageType="asFilter" selectionType="nodes" hierarchyName="${h}" variable="${componentId}">
+      <Qry:hierarchyReference>
+        <Qry:name>
+          <Qry:type>Value</Qry:type>
+          <Qry:value>${h}</Qry:value>
+        </Qry:name>
+        <Qry:version>
+          <Qry:type>Blank</Qry:type>
+        </Qry:version>
+        <Qry:dateTo>
+          <Qry:type>Blank</Qry:type>
+          <Qry:value>00000000</Qry:value>
+        </Qry:dateTo>
+        <Qry:expandToLevel/>
+        <Qry:positionOfChildNodes/>
+        <Qry:valuesOfPostableNodes/>
+        <Qry:suppressNodes/>
+        <Qry:sorting/>
+      </Qry:hierarchyReference>
+    </Qry:tokens>`;
+}
+
+/** Check a restriction's shape; returns true when it removes the group (nothing to restrict to). */
+function checkRestriction(r: KeyFigureRestriction, allowEmpty: boolean): boolean {
+  if (!r.infoobject) throw new Error('Each restriction requires an infoobject.');
+  if (r.infoobject.toUpperCase() === '1KYFNM') {
+    throw new Error('A restriction cannot target 1KYFNM: the key figure of a member is not a characteristic restriction.');
+  }
+  const hasValues = Array.isArray(r.values) && r.values.length > 0;
+  if (r.node_variable && !r.hierarchy) {
+    throw new Error(`Restriction on '${r.infoobject}': node_variable requires the hierarchy it selects nodes of.`);
+  }
+  if (!hasValues && !r.node_variable) {
+    if (allowEmpty) return true;
+    throw new Error(`Restriction on '${r.infoobject}' requires a non-empty values array or a node_variable.`);
+  }
+  return false;
+}
+
+/**
+ * Build the restriction group for one characteristic. nodeVariables maps a node
+ * variable name (upper case) to the component id it is embedded under.
+ */
+function buildRestrictionGroup(r: KeyFigureRestriction, nodeVariables: Map<string, string>): string {
+  const iobj = r.infoobject.toUpperCase();
+  const tokens = (r.values ?? []).map((v) => (r.hierarchy ? buildNodeToken(v, r.hierarchy) : buildFilterToken(v)));
+  if (r.node_variable) {
+    const componentId = nodeVariables.get(r.node_variable.toUpperCase());
+    if (!componentId) throw new Error(`Node variable '${r.node_variable.toUpperCase()}' was not resolved.`);
+    tokens.push(buildNodeVariableToken(componentId, r.hierarchy!));
+  }
+  return `<Qry:groups infoObject="${iobj}">
+    ${tokens.join('\n    ')}
+  </Qry:groups>`;
+}
+
 /** Build the additional restriction groups (one per characteristic) for a member. */
-export function buildRestrictionGroups(restrictions: KeyFigureRestriction[] | undefined): string {
+export function buildRestrictionGroups(
+  restrictions: KeyFigureRestriction[] | undefined,
+  nodeVariables: Map<string, string> = new Map()
+): string {
   if (!restrictions || restrictions.length === 0) return '';
   return restrictions
     .map((r) => {
-      if (!r.infoobject) throw new Error('Each restriction requires an infoobject.');
-      if (!Array.isArray(r.values) || r.values.length === 0) {
-        throw new Error(`Restriction on '${r.infoobject}' requires a non-empty values array.`);
-      }
-      const iobj = r.infoobject.toUpperCase();
-      const tokens = r.values.map(buildFilterToken).join('\n    ');
-      return `  <Qry:groups infoObject="${iobj}">
-    ${tokens}
-  </Qry:groups>
-`;
+      checkRestriction(r, false);
+      return `  ${buildRestrictionGroup(r, nodeVariables)}\n`;
     })
     .join('');
+}
+
+const GROUPS_RE = /<Qry:groups\b[^>]*?(\/>|>[\s\S]*?<\/Qry:groups>)/g;
+
+/**
+ * Replace the restriction group of one characteristic in a member, or add it after
+ * the member's last group. groupXml empty removes the group. Scoped to the member's
+ * own content, so a child member's restriction on the same characteristic stays.
+ */
+export function setMemberRestrictionGroup(memberXml: string, iobj: string, groupXml: string): string {
+  const ownEnd = memberOwnContentEnd(memberXml);
+  let own = memberXml.slice(0, ownEnd);
+  const rest = memberXml.slice(ownEnd);
+  own = own.replace(GROUPS_RE, (full) => {
+    const openTag = full.match(/^<Qry:groups\b[^>]*?\/?>/)?.[0] ?? full;
+    return openTag.includes(`infoObject="${iobj}"`) ? '' : full;
+  });
+  // Drop the blank line a removed group leaves behind.
+  own = own.replace(/\n[ \t]*\n/g, '\n');
+  if (!groupXml) return own + rest;
+  let lastGroupEnd = -1;
+  for (const m of own.matchAll(GROUPS_RE)) lastGroupEnd = m.index! + m[0].length;
+  const at = lastGroupEnd >= 0 ? lastGroupEnd : own.length;
+  return own.slice(0, at) + '\n  ' + groupXml + own.slice(at) + rest;
+}
+
+/** Characteristics a structure's members are restricted on, 1KYFNM aside. */
+function restrictedCharacteristics(structureXml: string): Set<string> {
+  const out = new Set<string>();
+  for (const m of structureXml.matchAll(/<Qry:groups\b[^>]*?\binfoObject="([^"]+)"/g)) {
+    if (m[1] !== '1KYFNM') out.add(m[1]);
+  }
+  return out;
+}
+
+/**
+ * Move node restrictions from one hierarchy to another in a piece of a structure:
+ * fixed nodes and node variables alike. A node listed in nodeMap is renamed; its
+ * stored text is dropped then, since it describes the old node. Returns the
+ * rewritten XML and the number of tokens changed.
+ */
+export function switchHierarchyInXml(
+  xml: string,
+  fromHierarchy: string,
+  toHierarchy: string,
+  nodeMap: Record<string, string> = {}
+): { xml: string; count: number } {
+  const fromEsc = escapeXml(fromHierarchy);
+  const toEsc = escapeXml(toHierarchy);
+  let count = 0;
+  const out = xml.replace(/<Qry:tokens\b[^>]*?(\/>|>[\s\S]*?<\/Qry:tokens>)/g, (full) => {
+    const openTag = full.match(/^<Qry:tokens\b[^>]*?\/?>/)?.[0] ?? full;
+    if (!openTag.includes('selectionType="nodes"') || !openTag.includes(`hierarchyName="${fromEsc}"`)) return full;
+    count++;
+    let newOpen = openTag.replace(`hierarchyName="${fromEsc}"`, `hierarchyName="${toEsc}"`);
+    let body = full.slice(openTag.length);
+    // The modeling tools write type before value, the server returns value first.
+    body = body.replace(/<Qry:name>[\s\S]*?<\/Qry:name>/, (name) =>
+      name.replace(/<Qry:value>[^<]*<\/Qry:value>/, `<Qry:value>${toEsc}</Qry:value>`)
+    );
+    const fromValue = body.match(/<Qry:fromValue\b[^>]*>[\s\S]*?<\/Qry:fromValue>/)?.[0];
+    const node = unescapeXml(fromValue?.match(/<Qry:value>([^<]*)<\/Qry:value>/)?.[1] ?? '');
+    const renamed = node ? nodeMap[node] : undefined;
+    if (fromValue && renamed !== undefined && renamed !== node) {
+      const newEsc = escapeXml(renamed);
+      const newFromValue = fromValue
+        .replace(/\binternalValue="[^"]*"/, `internalValue="${newEsc}"`)
+        .replace(/<Qry:value>[^<]*<\/Qry:value>/, `<Qry:value>${newEsc}</Qry:value>`);
+      body = body.replace(fromValue, newFromValue);
+      newOpen = newOpen.replace(/\s*fromValueDesc="[^"]*"/, '');
+    }
+    return newOpen + body;
+  });
+  return { xml: out, count };
+}
+
+/**
+ * Check hierarchies and nodes before the save. The backend stores an unknown node
+ * without a word and saves an unknown hierarchy as an inconsistent query, so both
+ * are refused here. A node given without a description takes the node's text, as
+ * the modeling tools do. When the hierarchy cannot be read at all, the check is
+ * skipped and the backend's own check is left.
+ */
+async function checkHierarchyNodes(
+  client: BwClient,
+  queryName: string,
+  kind: StructureKind,
+  ops: KeyFigureOperation[]
+): Promise<void> {
+  const cache = new Map<string, Map<string, HierarchyNodeRow> | null>();
+  const nodesOf = async (cha: string, hierarchy: string): Promise<Map<string, HierarchyNodeRow> | null> => {
+    const key = `${cha}|${hierarchy.toUpperCase()}`;
+    if (!cache.has(key)) {
+      let nodes: Map<string, HierarchyNodeRow> | undefined | null;
+      try {
+        nodes = await hierarchyNodesByName(client, cha, hierarchy);
+      } catch {
+        nodes = null;
+      }
+      if (nodes === undefined) throw new Error(`Characteristic ${cha} has no hierarchy named ${hierarchy.toUpperCase()}.`);
+      cache.set(key, nodes);
+    }
+    return cache.get(key)!;
+  };
+  const checkNode = (nodes: Map<string, HierarchyNodeRow>, cha: string, hierarchy: string, node: string) => {
+    const row = nodes.get(node);
+    if (!row) throw new Error(`Hierarchy ${hierarchy.toUpperCase()} of ${cha} has no node '${node}'.`);
+    if (row.IOBJNM !== TEXT_NODE) {
+      throw new Error(
+        `Node '${node}' of hierarchy ${hierarchy.toUpperCase()} is a value node; only text nodes can be ` +
+        `restricted to. Restrict to the value ${node} without hierarchy instead.`
+      );
+    }
+    return row;
+  };
+
+  for (const op of ops) {
+    for (const r of op.restrictions ?? []) {
+      if (!r.hierarchy) continue;
+      const cha = r.infoobject.toUpperCase();
+      const nodes = await nodesOf(cha, r.hierarchy);
+      if (!nodes) continue;
+      for (const v of r.values ?? []) {
+        const row = checkNode(nodes, cha, r.hierarchy, v.value);
+        if (v.description === undefined && row.NODEDESCRIPTION) v.description = row.NODEDESCRIPTION;
+      }
+    }
+  }
+
+  const switches = ops.filter((op) => op.action === 'switch_hierarchy');
+  if (switches.length === 0) return;
+  const { body } = await client.get(`/sap/bw/modeling/query/${bwSeg(queryName.toLowerCase())}/a`, queryAccept());
+  const doc = stripCheckMarkers(body);
+  for (const op of switches) {
+    let scope: string;
+    if (op.member_id || op.description || op.component_name) {
+      // A member added earlier in the same call is not in the stored query yet.
+      try {
+        scope = resolveOneMember(
+          doc,
+          { member_id: op.member_id, description: op.description, component_name: op.component_name },
+          'switch_hierarchy',
+          kind
+        ).member.full;
+      } catch {
+        continue;
+      }
+    } else {
+      scope = findStructure(doc, kind)?.element ?? '';
+    }
+    const from = escapeXml(op.from_hierarchy!.toUpperCase());
+    for (const g of scope.matchAll(GROUPS_RE)) {
+      const cha = g[0].match(/^<Qry:groups\b[^>]*?\binfoObject="([^"]+)"/)?.[1];
+      if (!cha || !g[0].includes(`hierarchyName="${from}"`)) continue;
+      const nodes = await nodesOf(cha, op.to_hierarchy!);
+      if (!nodes) continue;
+      for (const t of g[0].matchAll(/<Qry:tokens\b[^>]*?(\/>|>[\s\S]*?<\/Qry:tokens>)/g)) {
+        const openTag = t[0].match(/^<Qry:tokens\b[^>]*?\/?>/)?.[0] ?? '';
+        if (!openTag.includes(`hierarchyName="${from}"`) || !openTag.includes('xsi:type="Qry:SelectionRange"')) continue;
+        const node = unescapeXml(t[0].match(/<Qry:fromValue\b[^>]*>[\s\S]*?<Qry:value>([^<]*)<\/Qry:value>/)?.[1] ?? '');
+        if (node) checkNode(nodes, cha, op.to_hierarchy!, op.node_map?.[node] ?? node);
+      }
+    }
+  }
+}
+
+/** Build a selection member of a characteristic structure, the form the modeling tools write. */
+function buildSelectionMember(
+  vid: string,
+  descEsc: string,
+  restrictions: KeyFigureRestriction[],
+  nodeVariables: Map<string, string>
+): string {
+  const first = restrictions[0];
+  let hint: string;
+  if (first.values && first.values.length > 0) {
+    hint = `<Qry:type>Value</Qry:type>\n    <Qry:value>${escapeXml(first.values[0].value)}</Qry:value>`;
+  } else {
+    const name = first.node_variable!.toUpperCase();
+    hint = `<Qry:type>VariableCIN</Qry:type>\n    <Qry:value>${escapeXml(name)}</Qry:value>\n    <Qry:variable>${nodeVariables.get(name)}</Qry:variable>`;
+  }
+  return `<Qry:members xsi:type="Qry:MemberSelection" id="${vid}">
+  ${descriptionEl(descEsc, true)}
+  <Qry:defaultHint>
+    ${hint}
+  </Qry:defaultHint>
+${buildRestrictionGroups(restrictions, nodeVariables)}</Qry:members>`;
 }
 
 /** Build a basic key figure member (MemberSelection with a keyFigure SelectionRange). */
@@ -1763,11 +2080,16 @@ function findStructureMembers(
 function resolveOneMember(
   doc: string,
   matcher: { member_id?: string; description?: string; component_name?: string },
-  context: string
+  context: string,
+  kind: StructureKind = 'key_figures'
 ): { member: MatchedMember; cdStart: number } {
-  const cd = findKeyFigureStructure(doc);
+  const cd = findStructure(doc, kind);
   if (!cd) {
-    throw new Error(`${context}: query has no key figure structure (CustomDimension on 1KYFNM).`);
+    throw new Error(
+      kind === 'characteristics'
+        ? `${context}: query has no characteristic structure.`
+        : `${context}: query has no key figure structure (CustomDimension on 1KYFNM).`
+    );
   }
   let componentId: string | undefined;
   if (!matcher.member_id && matcher.component_name) {
@@ -2326,7 +2648,49 @@ export async function bwUpdateQueryKeyFigures(
   if (!['rows', 'columns'].includes(structureTarget)) {
     throw new Error(`Invalid structure_target '${structureTarget}' (expected rows or columns).`);
   }
+  const kind: StructureKind = args.structure ?? 'key_figures';
+  if (!['key_figures', 'characteristics'].includes(kind)) {
+    throw new Error(`Invalid structure '${kind}' (expected key_figures or characteristics).`);
+  }
   for (const op of ops) {
+    if (
+      kind === 'characteristics' &&
+      ['add_key_figure', 'add_ckf', 'add_rkf', 'add_formula'].includes(op.action)
+    ) {
+      throw new Error(
+        `${op.action} adds to the key figure structure; on the characteristic structure use add_selection.`
+      );
+    }
+    if (kind === 'characteristics' && (op.parent !== undefined || op.position !== undefined || op.inverse)) {
+      throw new Error(`${op.action}: parent, position and inverse apply to the key figure structure only.`);
+    }
+    for (const r of op.restrictions ?? []) checkRestriction(r, op.action === 'set_member_restrictions');
+    if (op.action === 'add_selection') {
+      if (kind !== 'characteristics') {
+        throw new Error('add_selection adds to the characteristic structure: set structure to "characteristics".');
+      }
+      if (!op.description) throw new Error('add_selection requires a description.');
+      if (!op.restrictions || op.restrictions.length === 0) throw new Error('add_selection requires restrictions.');
+      continue;
+    }
+    if (op.action === 'set_member_restrictions') {
+      if (!op.member_id && !op.description && !op.component_name) {
+        throw new Error('set_member_restrictions requires member_id, description, or component_name.');
+      }
+      if (!op.restrictions || op.restrictions.length === 0) {
+        throw new Error('set_member_restrictions requires restrictions.');
+      }
+      continue;
+    }
+    if (op.action === 'switch_hierarchy') {
+      if (!op.from_hierarchy || !op.to_hierarchy) {
+        throw new Error('switch_hierarchy requires from_hierarchy and to_hierarchy.');
+      }
+      if (op.node_map !== undefined && (typeof op.node_map !== 'object' || Array.isArray(op.node_map))) {
+        throw new Error('node_map must be an object mapping old node names to new ones.');
+      }
+      continue;
+    }
     if (
       (op.action === 'add_key_figure' || op.action === 'add_ckf' || op.action === 'add_rkf') &&
       (normalizeExceptionAggregation(op.exception_aggregation) ||
@@ -2360,8 +2724,8 @@ export async function bwUpdateQueryKeyFigures(
       }
     } else {
       throw new Error(
-        `Invalid action '${op.action}' (expected add_key_figure, add_ckf, add_rkf, add_formula, ` +
-        `remove_member, or set_member_properties).`
+        `Invalid action '${op.action}' (expected add_key_figure, add_ckf, add_rkf, add_formula, add_selection, ` +
+        `remove_member, set_member_properties, set_member_restrictions, or switch_hierarchy).`
       );
     }
   }
@@ -2393,10 +2757,36 @@ export async function bwUpdateQueryKeyFigures(
     formulaVariables.push(resolved);
   }
 
+  // A node variable in a member restriction is embedded as a subComponent too.
+  const nodeVariables = new Map<string, string>();
+  const nodeVariableDefs: ResolvedVariable[] = [];
+  for (const op of ops) {
+    for (const r of op.restrictions ?? []) {
+      if (!r.node_variable) continue;
+      const name = r.node_variable.toUpperCase();
+      if (nodeVariables.has(name)) continue;
+      const resolved = await resolveVariable(client, name);
+      if (!/<Qry:type>HierarchyNodes<\/Qry:type>/.test(resolved.subComponentXml)) {
+        throw new Error(`Variable '${name}' is not a hierarchy node variable; node_variable needs one.`);
+      }
+      if (resolved.characteristic !== r.infoobject.toUpperCase()) {
+        throw new Error(
+          `Variable '${name}' is defined on '${resolved.characteristic}', not on '${r.infoobject.toUpperCase()}'.`
+        );
+      }
+      nodeVariables.set(name, resolved.componentId);
+      nodeVariableDefs.push(resolved);
+    }
+  }
+  await checkHierarchyNodes(client, args.query_name, kind, ops);
+
+  const touchedCharacteristics = new Set<string>();
+  for (const op of ops) for (const r of op.restrictions ?? []) touchedCharacteristics.add(r.infoobject.toUpperCase());
+
   const summary: string[] = [];
   const mutate = (xml: string): string => {
     let doc = xml;
-    for (const v of formulaVariables) {
+    for (const v of [...formulaVariables, ...nodeVariableDefs]) {
       if (!hasSubComponentId(doc, v.componentId)) doc = insertSubComponent(doc, v.subComponentXml);
       for (const extra of v.extraSubComponents) {
         if (!hasSubComponentId(doc, extra.id)) doc = insertSubComponent(doc, extra.xml);
@@ -2406,7 +2796,7 @@ export async function bwUpdateQueryKeyFigures(
       if (op.action === 'add_key_figure') {
         const kyf = op.infoobject!.toUpperCase();
         const descEsc = escapeXml(op.description ?? kyf);
-        const restrictionGroups = buildRestrictionGroups(op.restrictions);
+        const restrictionGroups = buildRestrictionGroups(op.restrictions, nodeVariables);
         const vid = allocateVirtualId(doc);
         let memberXml = buildKeyFigureMember(vid, kyf, descEsc, op.description !== undefined, restrictionGroups);
         if (op.properties) memberXml = applyMemberProperties(memberXml, op.properties, doc);
@@ -2426,7 +2816,7 @@ export async function bwUpdateQueryKeyFigures(
           }
         }
         const descEsc = escapeXml(op.description ?? resolved.description);
-        const restrictionGroups = buildRestrictionGroups(op.restrictions);
+        const restrictionGroups = buildRestrictionGroups(op.restrictions, nodeVariables);
         // Warn (but still append — the server allows it) if the component is
         // already referenced by an existing member.
         const dupMemberId = findMemberReferencingComponent(doc, resolved.componentId);
@@ -2460,7 +2850,8 @@ export async function bwUpdateQueryKeyFigures(
         const { member, cdStart } = resolveOneMember(
           doc,
           { member_id: op.member_id, description: op.description, component_name: op.component_name },
-          'remove_member'
+          'remove_member',
+          kind
         );
         const removedMember = member.full;
         doc = doc.slice(0, cdStart + member.start) + doc.slice(cdStart + member.end);
@@ -2481,7 +2872,8 @@ export async function bwUpdateQueryKeyFigures(
         const { member, cdStart } = resolveOneMember(
           doc,
           { member_id: op.member_id, description: op.description, component_name: op.component_name },
-          'set_member_properties'
+          'set_member_properties',
+          kind
         );
         let updated = op.properties ? applyMemberProperties(member.full, op.properties, doc) : member.full;
         if (op.inverse) {
@@ -2515,6 +2907,83 @@ export async function bwUpdateQueryKeyFigures(
           doc = doc.slice(0, cdStart + member.start) + updated + doc.slice(cdStart + member.end);
           summary.push(`set properties on ${label}`);
         }
+      } else if (op.action === 'add_selection') {
+        const cd = findCharacteristicStructure(doc);
+        if (!cd) throw new Error('add_selection: query has no characteristic structure.');
+        const vid = allocateVirtualId(doc);
+        let memberXml = buildSelectionMember(vid, escapeXml(op.description!), op.restrictions!, nodeVariables);
+        if (op.properties) memberXml = applyMemberProperties(memberXml, op.properties, doc);
+        // After the last member, not before the close tag: the structure's own
+        // settings follow its members.
+        const offset = siblingInsertOffset(cd.element, 'members', undefined, cd.element.indexOf('>') + 1);
+        doc = doc.slice(0, cd.start + offset) + '\n' + memberXml + doc.slice(cd.start + offset);
+        summary.push(`add selection member '${op.description}'`);
+      } else if (op.action === 'set_member_restrictions') {
+        const { member, cdStart } = resolveOneMember(
+          doc,
+          { member_id: op.member_id, description: op.description, component_name: op.component_name },
+          'set_member_restrictions',
+          kind
+        );
+        if (!isSelectionMember(member.full)) {
+          throw new Error(`set_member_restrictions: member ${member.id} is a formula and carries no restrictions.`);
+        }
+        let updated = member.full;
+        const changes: string[] = [];
+        for (const r of op.restrictions!) {
+          const iobj = r.infoobject.toUpperCase();
+          const remove = checkRestriction(r, true);
+          updated = setMemberRestrictionGroup(updated, iobj, remove ? '' : buildRestrictionGroup(r, nodeVariables));
+          changes.push(remove ? `remove ${iobj}` : `${iobj}${r.hierarchy ? ` in hierarchy ${r.hierarchy.toUpperCase()}` : ''}`);
+        }
+        doc = doc.slice(0, cdStart + member.start) + updated + doc.slice(cdStart + member.end);
+        summary.push(
+          `set restrictions on member ${member.id}${member.description ? ` (${member.description})` : ''}: ${changes.join(', ')}`
+        );
+      } else if (op.action === 'switch_hierarchy') {
+        const from = op.from_hierarchy!.toUpperCase();
+        const to = op.to_hierarchy!.toUpperCase();
+        let start: number;
+        let end: number;
+        let scope: string;
+        if (op.member_id || op.description || op.component_name) {
+          const { member, cdStart } = resolveOneMember(
+            doc,
+            { member_id: op.member_id, description: op.description, component_name: op.component_name },
+            'switch_hierarchy',
+            kind
+          );
+          start = cdStart + member.start;
+          end = cdStart + member.end;
+          scope = `member ${member.id}${member.description ? ` (${member.description})` : ''}`;
+        } else {
+          const cd = findStructure(doc, kind);
+          if (!cd) throw new Error(`switch_hierarchy: query has no ${kind === 'characteristics' ? 'characteristic' : 'key figure'} structure.`);
+          start = cd.start;
+          end = cd.end;
+          scope = `the ${kind === 'characteristics' ? 'characteristic' : 'key figure'} structure`;
+        }
+        const switched = switchHierarchyInXml(doc.slice(start, end), from, to, op.node_map);
+        if (switched.count === 0) {
+          throw new Error(`switch_hierarchy: no node restriction on hierarchy '${from}' found in ${scope}.`);
+        }
+        doc = doc.slice(0, start) + switched.xml + doc.slice(end);
+        summary.push(`switch ${switched.count} node restriction(s) in ${scope} from ${from} to ${to}`);
+      }
+    }
+    // The modeling tools refuse a characteristic restricted in both structures.
+    const keyFigures = findKeyFigureStructure(doc);
+    const characteristics = findCharacteristicStructure(doc);
+    if (keyFigures && characteristics && touchedCharacteristics.size > 0) {
+      const inKeyFigures = restrictedCharacteristics(keyFigures.element);
+      const both = [...restrictedCharacteristics(characteristics.element)].filter(
+        (c) => inKeyFigures.has(c) && touchedCharacteristics.has(c)
+      );
+      if (both.length > 0) {
+        throw new Error(
+          `${both.join(', ')} would be restricted in both structures of the query. A characteristic can be ` +
+          `used in only one of the two structures.`
+        );
       }
     }
     return doc;

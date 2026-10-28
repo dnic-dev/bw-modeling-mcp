@@ -2746,11 +2746,13 @@ const TOOL_DEFINITIONS = [
     {
       name: 'bw_update_query_key_figures',
       description:
-        'Manage the key figure structure of an existing BW Query: add basic key figures, add references ' +
+        'Manage the key figure structure and the characteristic structure of an existing BW Query: add basic key figures, add references ' +
         'to reusable CKFs/RKFs (with optional local restrictions), add local formula members (recursive ' +
         'operator/operand tree), set member display and planning properties (decimals, scaling, hidden, ' +
         'sign inversion, input readiness, disaggregation, constant selection, local calculation) and ' +
-        'exception aggregation, nest members and place them at a position, and remove members. All operations are applied in a single save. ' +
+        'exception aggregation, nest members and place them at a position, and remove members. Restrict members ' +
+        'to hierarchy nodes or hierarchy node variables, replace a member\'s restrictions, and move all node ' +
+        'restrictions from one hierarchy to another. All operations are applied in a single save. ' +
         'Member operations also apply to a reusable key figure structure referenced via ' +
         'bw_update_query_layout add_structure. ' +
         'All names must be technical names (e.g. "IOBJ_NAME", "CKF_NAME", "QUERY_NAME").',
@@ -2772,6 +2774,15 @@ const TOOL_DEFINITIONS = [
               'Container for the key figure structure when it is created by the first add operation ' +
               '(default "columns"). Ignored once a structure already exists.',
           },
+          structure: {
+            type: 'string',
+            enum: ['key_figures', 'characteristics'],
+            description:
+              'Structure the operations address (default "key_figures"). "characteristics" is the second ' +
+              'structure of a query, the one without key figures: add_selection, remove_member, ' +
+              'set_member_properties (e.g. hidden), set_member_restrictions and switch_hierarchy work on it; ' +
+              'it must already exist.',
+          },
           operations: {
             type: 'array',
             description: 'Key figure changes to apply in one save cycle.',
@@ -2780,14 +2791,29 @@ const TOOL_DEFINITIONS = [
               properties: {
                 action: {
                   type: 'string',
-                  enum: ['add_key_figure', 'add_ckf', 'add_rkf', 'add_formula', 'remove_member', 'set_member_properties'],
+                  enum: [
+                    'add_key_figure',
+                    'add_ckf',
+                    'add_rkf',
+                    'add_formula',
+                    'add_selection',
+                    'remove_member',
+                    'set_member_properties',
+                    'set_member_restrictions',
+                    'switch_hierarchy',
+                  ],
                   description:
                     'add_key_figure: add a basic key figure (infoobject). add_ckf / add_rkf: add a reference ' +
                     'to a reusable calculated / restricted key figure (component_name). add_formula: add a local ' +
                     'formula member (description + formula). remove_member: remove a member matched by member_id, ' +
                     'description, and/or component_name. set_member_properties: change properties, exception ' +
                     'aggregation, the inverse formula, or the place in the structure (parent / position) of a ' +
-                    'matched member. Members are matched at any depth, so a nested child can be targeted too.',
+                    'matched member. add_selection: add a member to the characteristic structure (description + ' +
+                    'restrictions). set_member_restrictions: replace or remove the characteristic restrictions of ' +
+                    'a matched member, keeping its key figure. switch_hierarchy: move every node restriction ' +
+                    '(fixed nodes and node variables) from from_hierarchy to to_hierarchy, in the whole ' +
+                    'structure or, with a matcher, in one member. Members are matched at any depth, so a nested ' +
+                    'child can be targeted too.',
                 },
                 infoobject: {
                   type: 'string',
@@ -2956,8 +2982,12 @@ const TOOL_DEFINITIONS = [
                 restrictions: {
                   type: 'array',
                   description:
-                    'Optional local restrictions on the member. Each entry restricts one characteristic; the ' +
-                    'value schema matches bw_update_query_filter set_values.',
+                    'Local restrictions on the member. Each entry restricts one characteristic; the value ' +
+                    'schema matches bw_update_query_filter set_values. Optional on the add actions; required on ' +
+                    '"add_selection" and "set_member_restrictions". On "set_member_restrictions" an entry ' +
+                    'replaces the member\'s restriction on that characteristic, and an entry without values ' +
+                    'and node_variable removes it. A characteristic can be restricted in only one of the two ' +
+                    'structures of a query.',
                   items: {
                     type: 'object',
                     properties: {
@@ -2965,9 +2995,25 @@ const TOOL_DEFINITIONS = [
                         type: 'string',
                         description: 'Characteristic technical name to restrict (e.g. "IOBJ_NAME").',
                       },
+                      hierarchy: {
+                        type: 'string',
+                        description:
+                          'Hierarchy of the characteristic (e.g. "HIERARCHY_NAME"). When set, each value is a ' +
+                          'hierarchy node name, restricting to the node and everything below it; intervals and ' +
+                          'exclusions are not available for nodes. Version and key date stay blank. Also the ' +
+                          'hierarchy node_variable selects nodes of.',
+                      },
+                      node_variable: {
+                        type: 'string',
+                        description:
+                          'Hierarchy node variable (type HierarchyNodes) on this characteristic (e.g. "VAR_NAME"); ' +
+                          'requires hierarchy. It is embedded in the query on save.',
+                      },
                       values: {
                         type: 'array',
-                        description: 'Restriction values (single values, intervals via "high", exclusions via "exclude").',
+                        description:
+                          'Restriction values (single values, intervals via "high", exclusions via "exclude"), ' +
+                          'or node names when hierarchy is set.',
                         items: {
                           type: 'object',
                           properties: {
@@ -3004,8 +3050,23 @@ const TOOL_DEFINITIONS = [
                         },
                       },
                     },
-                    required: ['infoobject', 'values'],
+                    required: ['infoobject'],
                   },
+                },
+                from_hierarchy: {
+                  type: 'string',
+                  description: 'Hierarchy whose node restrictions are moved ("switch_hierarchy", e.g. "HIERARCHY_NAME").',
+                },
+                to_hierarchy: {
+                  type: 'string',
+                  description: 'Hierarchy the node restrictions are moved to ("switch_hierarchy", e.g. "HIERARCHY_NAME").',
+                },
+                node_map: {
+                  type: 'object',
+                  additionalProperties: { type: 'string' },
+                  description:
+                    'Node renames for "switch_hierarchy", old node name to new node name, for nodes named ' +
+                    'differently in the new hierarchy. Nodes not listed keep their name.',
                 },
               },
               required: ['action'],
@@ -6899,6 +6960,7 @@ async function handleToolCall(
         text = await bwUpdateQueryKeyFigures(client, {
           query_name: args?.query_name as string,
           structure_target: args?.structure_target as 'rows' | 'columns' | undefined,
+          structure: args?.structure as 'key_figures' | 'characteristics' | undefined,
           operations: args?.operations as KeyFigureOperation[],
           transport: args?.transport as string | undefined,
         });

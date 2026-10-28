@@ -218,7 +218,8 @@ function buildLocalMemberMap(members: unknown[]): Map<string, string> {
 function parseSelectionGroups(
   groups: unknown[],
   ckfMap: Map<string, { technicalName: string; description: string }>,
-  rkfMap: Map<string, { technicalName: string; description: string }>
+  rkfMap: Map<string, { technicalName: string; description: string }>,
+  variableMap?: Map<string, { technicalName: string }>
 ): Record<string, unknown>[] {
   return (groups as Record<string, unknown>[]).map((g) => {
     const tokens = ensureArray(g['Qry:tokens']) as Record<string, unknown>[];
@@ -236,6 +237,18 @@ function parseSelectionGroups(
           componentType: ckfEntry ? 'CKF' : 'RKF',
         };
       }
+      if (tType === 'Qry:SelectionVariable') {
+        const varId = (t['@_variable'] as string) ?? '';
+        const varTok: Record<string, unknown> = {
+          tokenType: 'SelectionVariable',
+          selectionType: (t['@_selectionType'] as string) ?? '',
+          exclude: t['@_exclude'] === 'true' || t['@_exclude'] === true,
+          variable: variableMap?.get(varId)?.technicalName ?? varId,
+        };
+        const hierarchy = t['@_hierarchyName'] as string | undefined;
+        if (hierarchy) varTok['hierarchy'] = hierarchy;
+        return varTok;
+      }
       const fromValue = t['Qry:fromValue'] as Record<string, unknown> | undefined;
       const tok: Record<string, unknown> = {
         tokenType: 'SelectionRange',
@@ -248,6 +261,8 @@ function parseSelectionGroups(
       if (internalValue) tok['internalValue'] = internalValue;
       const fromValueDesc = t['@_fromValueDesc'] as string | undefined;
       if (fromValueDesc) tok['valueDesc'] = fromValueDesc;
+      const hierarchy = t['@_hierarchyName'] as string | undefined;
+      if (hierarchy) tok['hierarchy'] = hierarchy;
       return tok;
     });
     return {
@@ -415,7 +430,7 @@ function parseMemberRecursive(
     const formulaToken = formulaDef?.['Qry:formulaToken'] as Record<string, unknown> | undefined;
     result['formula'] = formulaToken ? renderFormula(formulaToken, variableMap, ckfMap, rkfMap, localMemberMap) : '';
   } else {
-    result['selections'] = parseSelectionGroups(ensureArray(member['Qry:groups']), ckfMap, rkfMap);
+    result['selections'] = parseSelectionGroups(ensureArray(member['Qry:groups']), ckfMap, rkfMap, variableMap);
     const defaultHint = member['Qry:defaultHint'] as Record<string, unknown> | undefined;
     if ((defaultHint?.['Qry:type'] as string) === 'CINLink') {
       const hintValue = defaultHint?.['Qry:value'] as string | undefined;
@@ -577,13 +592,24 @@ export function formatMemberSelection(selections: Record<string, unknown>[]): st
         measures.push(`${t['componentType']} ${t['componentTechnicalName']}`);
         continue;
       }
+      const not = t['exclude'] ? 'NOT ' : '';
+      const inHierarchy = t['hierarchy'] ? ` in hierarchy ${t['hierarchy']}` : '';
+      if (t['tokenType'] === 'SelectionVariable') {
+        const kind = t['selectionType'] === 'nodes' ? 'node variable' : 'variable';
+        restrictions.push(`${not}${iobj}=${kind} ${t['variable']}${inHierarchy}`);
+        continue;
+      }
       const value = String(t['value'] ?? '');
       if (iobj === '1KYFNM' || t['selectionType'] === 'keyFigure') {
         measures.push(value);
         continue;
       }
+      if (t['selectionType'] === 'nodes') {
+        restrictions.push(`${not}${iobj}=node ${value}${inHierarchy}`);
+        continue;
+      }
       const op = t['operator'] === 'Equal' ? '=' : ` ${String(t['operator'] ?? '')} `;
-      restrictions.push(`${t['exclude'] ? 'NOT ' : ''}${iobj}${op}${value}`);
+      restrictions.push(`${not}${iobj}${op}${value}`);
     }
   }
   return [...measures, ...restrictions].join(', ');
@@ -1027,7 +1053,7 @@ export function parseQueryDocument(
     restrictedMeasures.push({
       technicalName: rkf.technicalName,
       description: rkf.description,
-      selections: parseSelectionGroups(ensureArray(rkf.member?.['Qry:groups']), ckfMap, rkfMap),
+      selections: parseSelectionGroups(ensureArray(rkf.member?.['Qry:groups']), ckfMap, rkfMap, variableMap),
     });
   }
 
@@ -1127,7 +1153,7 @@ export function parseQueryDocument(
       description: cellDescription(hc),
     };
     if (hcType === 'Qry:FormulaCell') cell['formula'] = cellFormula(hc);
-    else cell['selections'] = parseSelectionGroups(ensureArray(hc['Qry:groups']), ckfMap, rkfMap);
+    else cell['selections'] = parseSelectionGroups(ensureArray(hc['Qry:groups']), ckfMap, rkfMap, variableMap);
     return cell;
   });
 
@@ -1249,7 +1275,7 @@ export function collectVariableUsage(
     const desc = ownDescription(node);
     const tech = (node['@_technicalName'] as string) || (node['@_infoObjectName'] as string) || '';
     const io = (node['@_infoObject'] as string) || '';
-    const named = (kind: string) => `${kind} "${desc || tech || io}"`;
+    const named = (kind: string) => `${kind} "${desc || tech || io || (node['@_id'] as string) || ''}"`;
     switch (tag) {
       case 'Qry:keyDate': return 'key date';
       case 'Qry:filter': return 'filter';

@@ -111,6 +111,24 @@ async function findHierarchy(
   return matches.find((h) => h.objvers === 'A') ?? matches[0];
 }
 
+/**
+ * The nodes of a hierarchy by node name, or undefined when the characteristic has no
+ * hierarchy of that name. Reads the active version, the one a query evaluates.
+ */
+export async function hierarchyNodesByName(
+  client: BwClient,
+  characteristic: string,
+  name: string,
+): Promise<Map<string, HierarchyNodeRow> | undefined> {
+  const header = await findHierarchy(client, characteristic, name);
+  if (!header) return undefined;
+  const { data: rows } = await getJson<HierarchyNodeRow[]>(
+    client,
+    `/data/hierarchies/${encodeURIComponent(header.hieid)}/versions/${header.objvers}/content?depth=99`,
+  );
+  return new Map((rows ?? []).map((r) => [r.NODENAME, r]));
+}
+
 /** Children of each node in sibling order, from the parent/child/next links. */
 export function buildTree(rows: HierarchyNodeRow[]): { roots: HierarchyNodeRow[]; children: Map<string, HierarchyNodeRow[]> } {
   const byId = new Map(rows.map((r) => [Number(r.NODEID), r]));
