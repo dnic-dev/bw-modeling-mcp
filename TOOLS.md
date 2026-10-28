@@ -1,6 +1,6 @@
 # Tools Reference
 
-Every tool the server exposes — 123 in total — with what it does and the parameters that matter.
+Every tool the server exposes — 129 in total — with what it does and the parameters that matter.
 Tools marked _(Read only)_ change nothing in BW; everything else writes, activates, runs, or unlocks.
 A writing tool refuses a parameter it does not declare and names the ones it takes, so a misspelt
 parameter cannot be reported as applied.
@@ -13,7 +13,7 @@ For the architecture and the full endpoint list, see [ARCHITECTURE.md](ARCHITECT
 ## Contents
 
 - [Discovery & System](#discovery--system) — 6 tools
-- [aDSO](#adso) — 3 tools
+- [aDSO](#adso) — 5 tools
 - [InfoObject & Hierarchies](#infoobject--hierarchies) — 7 tools
 - [InfoArea, Packages & Transports](#infoarea-packages--transports) — 6 tools
 - [InfoSource](#infosource) — 3 tools
@@ -23,10 +23,10 @@ For the architecture and the full endpoint list, see [ARCHITECTURE.md](ARCHITECT
 - [CompositeProvider](#compositeprovider) — 3 tools
 - [Open Hub Destination](#open-hub-destination) — 1 tool
 - [BW Query — modeling](#bw-query--modeling) — 20 tools
-- [BW Query — data & roles](#bw-query--data--roles) — 7 tools
+- [BW Query — data & roles](#bw-query--data--roles) — 10 tools
 - [Integrated Planning](#integrated-planning) — 13 tools
 - [Conversion Types](#conversion-types) — 2 tools
-- [Process Chains — authoring](#process-chains--authoring) — 13 tools
+- [Process Chains — authoring](#process-chains--authoring) — 15 tools
 - [Process Chains — monitoring](#process-chains--monitoring) — 3 tools
 - [Requests, Runtime & Remodeling](#requests-runtime--remodeling) — 7 tools
 - [Push API](#push-api) — 2 tools
@@ -85,6 +85,12 @@ Modify an existing aDSO. Actions:
 
 
 Field groups: `dimension` takes the bare group name — `"__KEYFIGURES"`, `"DATA"`, whatever the aDSO declares — on `add_field` and `add_pure_field` to create the field in that group directly, and under `properties` on `update_field_properties` to move an existing one. Group names are defined per aDSO; an unknown name is rejected with the declared groups listed. The current assignment is the `DIM` column of `bw_get_adso`.
+
+### `bw_set_adso_planning_mode`
+Switch a planning-enabled aDSO between interactive planning and loading, as the toggle in the BW/4HANA Cockpit does. In planning mode the aDSO accepts no loads. The mode is read before and after the switch, the second time from a new session, because the session that switched keeps reporting the old mode; when BW accepted the switch but the mode did not change, the answer is an error. `bw_get_adso` shows the current mode. Not a modeling change: no lock, no transport, no activation. For a switch at load time inside a process chain use `bw_add_process_chain_plswitch`. BW/4HANA only.
+
+### `bw_delete_adso_data_selective`
+Delete the records of an aDSO that match conditions on its characteristics, as the selective deletion of the BW/4HANA Cockpit does, or only count them. Simulates by default; pass `simulate: false` to delete. The conditions are select-option rows per field: several rows on one field are combined with OR, rows on different fields with AND. When the aDSO has a key, only key fields are accepted, and an invalid field is answered with the fields that are allowed. A deletion without any condition is refused. BW decides from the aDSO type which tables are affected; the answer sums the records over them and lists BW's message for each one. Values must be in external format — BW accepts an internal value as well but it matches nothing, which is why the tool simulates first. BW/4HANA only.
 
 ---
 
@@ -297,7 +303,9 @@ Edit the query layout — add/remove rows, columns, structures, and free charact
 Edit the query filter — fixed value restrictions on characteristics. Accepts an optional `transport` request number.
 
 ### `bw_update_query_key_figures`
-Edit the query key figures — add basic key figures, references to global RKFs/CKFs, and local formula members; set exception aggregation on formula members, display properties (decimals, scaling, hidden, sign inversion), planning properties (input readiness, disaggregation, constant selection) and the local calculation (calculate results as, calculate single values as, use single values for the result, cumulation); nest members under others and insert them at a position; remove members. An unknown property or calculation literal is refused rather than dropped. Formula members accept a recursive operator/operand tree covering the full BW operator catalog (basic, percentage, data, mathematical, trigonometric, and boolean operators plus ternary `IF`); operator codes are case-insensitive and their operand counts are validated before saving. An operand can be a formula variable (`{ "type": "variable", "variable_name": "..." }`); it is embedded in the query on save, and a characteristic variable is refused. Exception aggregation is refused on a selection member — a basic key figure or a CKF/RKF reference — because the backend drops it there without an error on a classic release and on BW/4HANA alike; set it on the CKF itself instead. An aggregation type outside the sixteen literals of the aggregation domain is refused too, rather than being stored as standard aggregation. Accepts an optional `transport` request number.
+Edit the query key figures — add basic key figures, references to global RKFs/CKFs, and local formula members; set exception aggregation on formula members, display properties (decimals, scaling, hidden, sign inversion), planning properties (input readiness, disaggregation, constant selection) and the local calculation (calculate results as, calculate single values as, use single values for the result, cumulation); nest members under others and insert them at a position; remove members. An unknown property or calculation literal is refused rather than dropped. Formula members accept a recursive operator/operand tree covering the full BW operator catalog (basic, percentage, data, mathematical, trigonometric, and boolean operators plus ternary `IF`); operator codes are case-insensitive and their operand counts are validated before saving. An operand can be a formula variable (`{ "type": "variable", "variable_name": "..." }`); it is embedded in the query on save, and a characteristic variable is refused. Exception aggregation is refused on a selection member — a basic key figure or a CKF/RKF reference — because the backend drops it there without an error on a classic release and on BW/4HANA alike; set it on the CKF itself instead. An aggregation type outside the sixteen literals of the aggregation domain is refused too, rather than being stored as standard aggregation.
+
+A member restriction can name a `hierarchy`: its values are then nodes of that hierarchy, and `node_variable` restricts by a hierarchy node variable, which is embedded in the query on save. `set_member_restrictions` replaces or removes the restriction of an existing member on one characteristic and keeps its key figure. `switch_hierarchy` moves every node restriction of the structure — fixed nodes and node variables alike — from `from_hierarchy` to `to_hierarchy` in one save, with `node_map` for nodes named differently in the new hierarchy; given a member, only that member is switched. Hierarchies and nodes are checked before the save; a value node is refused. `structure: "characteristics"` addresses the second structure of a query, the one without key figures: `add_selection` adds a member there, and removing, hiding and restricting members work as in the key figure structure. Restricting one characteristic in both structures is refused, as in the modeling tools. Accepts an optional `transport` request number.
 
 ### `bw_update_query_settings`
 Edit query properties (settings). Accepts an optional `transport` request number.

@@ -61,7 +61,61 @@ A two-part blog series about this project (both available in German and English)
 
 ---
 
-## 🆕 What's New — v1.8.0 · Agentic Planning Modelling
+## 🆕 What's New — v1.9.0 · Analysis for Office Workbooks
+
+The workbooks your planners and controllers actually work in are now within reach of the
+agent: find them, see what they depend on, take one out of BW, change it, and put it back
+into the role menu where users open it.
+
+### On every release (BW/4HANA and BW 7.5)
+
+**📊 Analysis for Office workbooks stored in BW**
+
+- New `bw_list_afo_workbooks` — every workbook stored in BW with its where-used list: data
+  sources, planning functions and sequences, BPC models, role menus, last change.
+  `used_object` answers the question to ask before touching a query or planning function:
+  *which workbooks break if I change this?*
+- New `bw_get_afo_workbook` — fetches a workbook exactly as Analysis for Office opens it,
+  without taking the edit lock, so nobody working in it is disturbed. BW checks the
+  caller's authorization, so under principal propagation everyone gets only what they may open
+- New `bw_save_afo_workbook` — saves a workbook back the way Analysis for Office does and
+  adds it to a role menu; the where-used list is built from the file itself, so a planning
+  function added to the workbook is recorded in BW. Nothing is overwritten without
+  `overwrite: true`
+
+Together they close the loop: take a workbook out of BW, change it, and save it back to the
+role menu your users open it from.
+
+**🌳 Hierarchy nodes in query structures**
+
+- Structure members can be restricted to hierarchy nodes or a hierarchy node variable, in the
+  key figure structure and in the characteristic structure
+- `switch_hierarchy` moves every node restriction of a structure to another hierarchy in one
+  save, with renamed nodes mapped; unknown hierarchies and nodes are refused before BW stores
+  them silently (#50)
+
+### BW/4HANA
+
+**🧮 Agentic Planning, continued**
+
+- New `bw_set_adso_planning_mode` — switches a planning aDSO between planning and loading,
+  as the toggle in the BW/4HANA Cockpit does, and checks that the switch took effect
+- New `bw_add_process_chain_plswitch` — puts the switch to load mode and back around the
+  load of a planning aDSO in a process chain, in one call and without the chain editor
+- New `bw_delete_adso_data_selective` — selective deletion by conditions on characteristics;
+  simulates first and counts what would go
+
+**🛠️ Fixes and improvements**
+
+- SAP sessions are ended after every tool call instead of piling up in SM04 until users are
+  locked out (#48); connections to the backend are reused, so reads answer faster; an
+  InfoArea can be moved back to the top level
+
+Thanks to @alxy for #50, and to @army113 and @MWKAnalytics for the analysis behind #48.
+
+---
+
+## What's New — v1.8.0 · Agentic Planning Modelling
 
 An agent can now build a BW planning model end to end — aggregation level, planning
 functions, filters and the planning sequence that ties them together — and start the
@@ -145,7 +199,7 @@ Thanks to @MWKAnalytics and @oliverluette for the analyses behind #44, #45 and #
 
 ## What it can do
 
-An overview by area. Every tool in detail — parameters, behaviour, and the sequences it belongs in — is in the **[Tools Reference](TOOLS.md)** (123 tools).
+An overview by area. Every tool in detail — parameters, behaviour, and the sequences it belongs in — is in the **[Tools Reference](TOOLS.md)** (129 tools).
 
 <p align="center">
   <picture>

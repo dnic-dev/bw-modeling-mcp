@@ -35,6 +35,8 @@ The token is fetched once at startup and reused for all subsequent write operati
 
 **Every session ends with the tool call that opened it.** Each `BwClient` logs on with its own token fetch and runs stateful, and a tool call builds several of them (the call's client, fresh sessions against the model buffer, a session of its own for a classic InfoObject write). Each one left an ICF session with its user context in SM04 until the plug-in timeout, tens of MB each. `withSessionScope` (`src/bw-client.ts`) wraps every tool call, `tools/list` and the platform detection: every client that receives a response during it is collected through an `AsyncLocalStorage`, and when the call is over each one is ended in the background, so the answer does not wait for it. Ending takes two requests, sent with the client's cookies and without a new token fetch: a stateless `GET /sap/bw/modeling/repo/is/systeminfo` ends the stateful context (`sap-sessioncmd=close` does not on `/sap/bw/modeling`), and `GET /sap/public/bc/icf/logoff` ends the logon. The logoff goes out without `sap-contextid`: that cookie names the context the first request has just ended, and the ICM answers a request for an ended context with 400 before the logoff handler runs. Neither request carries the SSO ticket (`MYSAPSSO2`), since on a session that has already timed out the server would log on afresh with it and leave a new session behind. The jar is emptied before they go out, so a client used again afterwards logs on afresh. A client that holds a lock is skipped, because the lock registry routes the unlock through its session; `unlock()` ends that session once its last lock is released, when it belongs to an earlier call. On shutdown (stdin closed, or SIGINT/SIGTERM/SIGHUP/SIGBREAK) `closeAllSessions` ends every remaining session, lock holders included, which releases their enqueues; it is given 5 seconds. Cookie mode ends nothing, because the logon belongs to the browser. `BW_SESSION_CLOSE=off` switches it off for a proxy that injects a session of its own, which a stateless request would end.
 
+**Connections are shared, sessions are not.** The SAP session travels in the cookies, not in the TCP connection, so every `BwClient` draws on one keep-alive HTTPS agent (`src/bw-client.ts`); idle sockets are closed after 30 seconds, well below the ICM's own idle limit, so no request goes out on a socket the server is closing. Without it every request opened a TCP and TLS connection of its own, and on some hosts a share of new connections stalled for about 20 seconds. Behind the Cloud Connector proxy no connection is reused: the connectivity proxy ties a connection to the authentication of its first request and refuses a later request on it that carries `SAP-Connectivity-Authentication` when the first did not, and several principals would otherwise share a socket.
+
 **The first DataPreview statement on a client runs alone.** Several metadata readers send their table reads at once. On a classic release, reads that arrive together before a session exists each open their own, and all but one fail with HTTP 500 — and on the hosted transport every tool call starts on a fresh client, so this hit every such read there. `queryTable` (`src/tools/metadata_sql.ts`) therefore holds every statement on a client until the first one has returned, after which they run in parallel; if the first fails, the next caller opens the session in its place. A retry after HTTP 500 or "Session timed out" stays as the fallback.
 
 **Important:** Lock and write operations on the same object must use separate `BwClient` instances (separate `sap-contextid` session cookies). SAP's internal buffer caches object state per session — reusing the same session for both Lock and PUT causes null pointer crashes in the ABAP backend (`CL_RSTRAN_TRFN=>GET_PROGID`). This is not documented in the API — discovered via ABAP debugging.
@@ -195,6 +197,8 @@ src/
 └── tools/
     ├── activation.ts     # bw_activate, bw_unlock
     ├── adso.ts           # bw_get_adso, bw_create_adso, bw_update_adso
+    ├── adso_data.ts      # bw_set_adso_planning_mode, bw_delete_adso_data_selective — BW/4HANA
+    │                     # manage API for the runtime state and the data of an aDSO
     ├── afo_workbook_save.ts # bw_save_afo_workbook — RSAO_BICS_SAVE with the where-used list read from
     │                        # the AfO definition in the file, RSOBJS_ALTER_NODE_REFS for the role menu,
     │                        # RSAO_BICS_CLOSE to release the edit lock; all over SOAP RFC
@@ -273,10 +277,12 @@ src/
     ├── processchain_write.ts # bw_create_process_chain, bw_update_process_chain,
     │                         # bw_activate_process_chain, bw_append_process_chain_dtp,
     │                         # bw_swap_process_chain_dtp, bw_add_process_chain_error_links,
-    │                         # bw_add_process_chain_program, bw_create_decision_variant,
+    │                         # bw_add_process_chain_program, bw_add_process_chain_plswitch,
+    │                         # bw_create_decision_variant,
     │                         # bw_add_process_chain_edge, bw_remove_process_chain_edge,
     │                         # bw_remove_process_chain_step — BW4 Cockpit REST API
-    │                         # (create/update support ADSOACT and ADSOREM inline variants)
+    │                         # (create/update support ADSOACT and ADSOREM inline variants;
+    │                         # ABAP and PLSWITCHL/PLSWITCHP are added in place)
     ├── processvariant.ts # bw_get_process_variant — generic variant detail reader for all 93 process types
     ├── push.ts           # bw_push_data, bw_get_push_schema
     ├── query.ts          # bw_get_query — full query definition parser (variables, layout, CKFs, RKFs, exceptions);
@@ -422,6 +428,7 @@ system serves a lower resource version than the fallback.
 | Start a chain (asynchronous) | `POST /sap/bc/http/sap/bw4/v1/monitoring/processchains/{name}/start` |
 | Status of a run | `GET /sap/bc/http/sap/bw4/v1/monitoring/processchainlogs/{logid}/status` |
 | Transport pre-check | `POST /sap/bc/http/sap/bw4/v1/modeling/transports/validateobject` |
+| Planning-enabled aDSOs (value help of the planning mode switch step) | `GET /sap/bc/http/sap/bw4/v1/modeling/datastores?planningmode=true&searchterm={name}` (`Accept: */*`) |
 
 ### Process Chain Monitoring Endpoints (OData)
 
@@ -473,6 +480,9 @@ server's own to end, so the logoff is skipped there.
 | Request process steps | `GET /sap/bc/http/sap/bw4/v1/manage/processes?request={tsn}&storage={storage}` |
 | Request message log | `GET /sap/bc/http/sap/bw4/v1/manage/processes/{tsn}/logs` |
 | Activate loaded data (DSO request activation) | `POST /sap/bc/http/sap/bw4/v1/manage/requests/{tsn}/{storage}/activate` |
+| aDSO runtime state (planning mode) | `GET /sap/bc/http/sap/bw4/v1/manage/datastores/{adso}` |
+| Switch an aDSO between planning and loading | `POST /sap/bc/http/sap/bw4/v1/manage/datastores/{adso}/switchplanningmode` |
+| Selective deletion of aDSO data (simulate or delete) | `POST /sap/bc/http/sap/bw4/v1/manage/datastores/{adso}/deletedata` |
 | Status domain texts | `GET /sap/bc/http/sap/bw4/v1/system/domains/{domain}/texts` |
 
 ### Repository & Search Endpoints
