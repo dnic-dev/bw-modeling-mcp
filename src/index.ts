@@ -140,7 +140,7 @@ import { resolveLogonUser } from './tools/logon_user.js';
 import { bwCreatePlanningSequence, bwUpdatePlanningSequence, type CreatePlanningSequenceArgs, type UpdatePlanningSequenceArgs } from './tools/planning_sequence_write.js';
 import { bwCreatePlanningFilter, bwUpdatePlanningFilter, type CreatePlanningFilterArgs, type UpdatePlanningFilterArgs } from './tools/planning_filter_write.js';
 import { bwListProcessChainRuns, bwGetProcessChainRunDetail, bwListProcessChainLastStatus } from './tools/process_chain_monitor.js';
-import { bwCreateProcessChain, bwUpdateProcessChain, bwActivateProcessChain, bwAddProcessChainErrorLinks, bwSwapProcessChainDtp, bwAppendProcessChainDtp, bwAddProcessChainProgram, bwAddProcessChainEdge, bwRemoveProcessChainEdge, bwRemoveProcessChainStep, bwCreateDecisionVariant, CreateProcessChainParams, UpdateProcessChainParams, EdgeDef, EdgeStatus, TriggerEventConfig } from './tools/processchain_write.js';
+import { bwCreateProcessChain, bwUpdateProcessChain, bwActivateProcessChain, bwAddProcessChainErrorLinks, bwSwapProcessChainDtp, bwAppendProcessChainDtp, bwAddProcessChainProgram, bwAddProcessChainPlanningSwitch, bwAddProcessChainEdge, bwRemoveProcessChainEdge, bwRemoveProcessChainStep, bwCreateDecisionVariant, CreateProcessChainParams, UpdateProcessChainParams, EdgeDef, EdgeStatus, TriggerEventConfig } from './tools/processchain_write.js';
 import { bwStartProcessChain, MAX_WAIT_SECONDS } from './tools/process_chain_run.js';
 import { bwCreateTransportTask } from './tools/transport.js';
 
@@ -4602,7 +4602,7 @@ const TOOL_DEFINITIONS = [
       name: 'bw_save_afo_workbook',
       description:
         'Save an Analysis for Office workbook to BW, as Analysis for Office does, and optionally place it in a role menu. ' +
-        'Typical use: fetch a workbook with bw_get_afo_workbook, extend it with a workbook tool, save it back under a new name. ' +
+        'Typical use: fetch a workbook with bw_get_afo_workbook, change it, save it back under a new name. ' +
         'If a workbook of that name exists, nothing is saved unless overwrite is true — confirm with the user before passing it. ' +
         'The where-used list is built from the workbook itself (queries, planning functions and sequences, BPC model); a data ' +
         'source of another kind stops the save. With role (and folder) the workbook is added to that role menu, once. ' +
@@ -5606,7 +5606,7 @@ const TOOL_DEFINITIONS = [
         'A 412 on the PUT means the ETag was stale (chain modified between read and write); the error reports this explicitly. ' +
         'Use bw_create_process_chain to create a new chain; use this tool to update an existing one. ' +
         'This tool REPLACES the whole step model, so every step that should survive must be listed — a step left out is deleted. ' +
-        'For a small change to a big chain prefer the targeted tools (bw_append_process_chain_dtp, bw_add_process_chain_program, bw_add_process_chain_edge, bw_remove_process_chain_edge, bw_remove_process_chain_step), which edit the server\'s own model in place and cannot drop a step they do not model. ' +
+        'For a small change to a big chain prefer the targeted tools (bw_append_process_chain_dtp, bw_add_process_chain_program, bw_add_process_chain_plswitch, bw_add_process_chain_edge, bw_remove_process_chain_edge, bw_remove_process_chain_step), which edit the server\'s own model in place and cannot drop a step they do not model. ' +
         'Supported step types: DTP_LOAD (DTP load), ADSOACT (DSO data activation), ADSOREM (DSO request cleanup), ABAP (execute an ABAP program, optionally with an SE38 selection variant), CHAIN (start a local sub-chain, verified), DECISION (branch on a decision variant, requires the variant field), and collectors AND / OR / XOR; the start trigger is implicit. ' +
         'A generic referenced-step path (any process type string plus an object name, bIsReference=true) is available and verified for DTP_LOAD and CHAIN; for other types it may work but is untested. ' +
         'Other inline-configuration process types (for example OS command, attribute change run) are not supported in this version — a chain containing one cannot be rewritten with this tool without losing that step. ' +
@@ -5980,7 +5980,7 @@ const TOOL_DEFINITIONS = [
             description:
               'Used only when neither before nor after is given. Node to APPEND behind, or the literal "strand_end_auto" (default = terminal node closest to the trigger, ties → first). ' +
               'An append leaves the target\'s existing successors untouched, so the new block runs in parallel to them — pass before/after instead when it must run in sequence. ' +
-              'Node reference forms (same for before / after / predecessor): a DTP or process-variant name; an aDSO held by an ADSOACT/ADSOREM node; the program of an ABAP step, or "PROGRAM/VARIANT"; "TRIGGER" or a collector type ("AND"/"OR"); or "#<index>" using the step numbers printed by bw_get_process_chain. An ambiguous name is rejected with the candidates listed — use "#<index>" then.',
+              'Node reference forms (same for before / after / predecessor): a DTP or process-variant name; an aDSO held by an ADSOACT/ADSOREM node; the program of an ABAP step, or "PROGRAM/VARIANT"; a planning mode switch as "PLSWITCHL/ADSO_NAME" or "PLSWITCHP/ADSO_NAME"; "TRIGGER" or a collector type ("AND"/"OR"); or "#<index>" using the step numbers printed by bw_get_process_chain. An ambiguous name is rejected with the candidates listed — use "#<index>" then.',
           },
           edge_mode: {
             type: 'string',
@@ -6091,6 +6091,76 @@ const TOOL_DEFINITIONS = [
       },
     },
     {
+      name: 'bw_add_process_chain_plswitch',
+      description:
+        'Add planning mode switch steps for planning-enabled aDSOs to an existing Process Chain (RSPC), via the BW/4HANA Cockpit REST API: ' +
+        'PLSWITCHL switches the aDSOs to load mode, PLSWITCHP back to planning mode. A planning-enabled aDSO accepts no loads in planning mode, so a chain that loads it typically runs ' +
+        'switch to load mode → (deletion) → DTP → switch to planning mode. ' +
+        'In-place edit: reads the current model, inserts the node(s) with their INLINE process variant, and PUTs it back. ' +
+        'mode "load" or "plan" adds one step and needs exactly one of before, after or predecessor — there is no automatic append point, because a switch beside the chain start would switch at the wrong moment. ' +
+        'mode "bracket" encloses an existing step ("around", usually the DTP): switch to load mode ahead of it, switch to planning mode behind it, in one save. ' +
+        'Only aDSOs offered by the cockpit value help for this step are accepted (active and planning-enabled); others are refused before anything is written. ' +
+        'edge_mode "both" (default) adds an on-success and an on-error edge per new link, so the switch back to planning mode also runs when the load fails; "success_only" adds only the on-success edge. ' +
+        'Idempotent: a step of the same type for the same set of aDSOs is not added again. ' +
+        'Existing switch steps can be referenced elsewhere as "PLSWITCHL/ADSO_NAME" or "PLSWITCHP/ADSO_NAME".',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          name: {
+            type: 'string',
+            description: 'Process chain technical name (e.g. "CHAIN_NAME"). Case-insensitive.',
+          },
+          mode: {
+            type: 'string',
+            enum: ['load', 'plan', 'bracket'],
+            description: '"load": add a switch to load mode (PLSWITCHL). "plan": add a switch to planning mode (PLSWITCHP). "bracket": add both around the step named in "around".',
+          },
+          datastores: {
+            type: 'array',
+            items: { type: 'string' },
+            description: 'Planning-enabled aDSOs the step switches (e.g. ["ADSO_NAME"]). One step can switch several.',
+          },
+          description: {
+            type: 'string',
+            description: 'Optional step description (cosmetic, max. 60 characters). Defaults to the mode and the aDSO names.',
+          },
+          before: {
+            type: 'string',
+            description: 'mode "load"/"plan": insert the step BEFORE this node (a DTP/variant name, an aDSO held by an ADSOACT node, or "#<index>"). The target\'s incoming edges are rerouted through the new step.',
+          },
+          after: {
+            type: 'string',
+            description: 'mode "load"/"plan": insert the step AFTER this node — it runs between the target and its former successors.',
+          },
+          predecessor: {
+            type: 'string',
+            description: 'mode "load"/"plan": append the step behind this node without rerouting the node\'s other successors.',
+          },
+          around: {
+            type: 'string',
+            description: 'mode "bracket" only: the step to enclose (usually the DTP that loads the aDSO).',
+          },
+          edge_mode: {
+            type: 'string',
+            enum: ['both', 'success_only'],
+            description: '"both" (default): add an on-success and an on-error edge per new link. "success_only": add only the on-success edge.',
+          },
+          activate: {
+            type: 'boolean',
+            description: 'If true, activate the chain immediately after the edit. Default false.',
+          },
+          transport_request: {
+            type: 'string',
+            description:
+              'Optional transport request to record the change into. Only relevant when the chain is in a transportable package (not $TMP). ' +
+              'If the chain is transportable and exactly one request is available, it is chosen automatically; pass this to disambiguate when several are available. ' +
+              'Ignored for $TMP (local) chains.',
+          },
+        },
+        required: ['name', 'mode', 'datastores'],
+      },
+    },
+    {
       name: 'bw_add_process_chain_edge',
       description:
         'Add one dependency (edge) between two existing steps of a Process Chain (RSPC), via the BW/4HANA Cockpit REST API. ' +
@@ -6109,7 +6179,7 @@ const TOOL_DEFINITIONS = [
           from: {
             type: 'string',
             description:
-              'Source step. Node reference forms: a DTP or process-variant name; an aDSO held by an ADSOACT/ADSOREM node; the program of an ABAP step, or "PROGRAM/VARIANT"; ' +
+              'Source step. Node reference forms: a DTP or process-variant name; an aDSO held by an ADSOACT/ADSOREM node; the program of an ABAP step, or "PROGRAM/VARIANT"; a planning mode switch as "PLSWITCHL/ADSO_NAME" or "PLSWITCHP/ADSO_NAME"; ' +
               '"TRIGGER" or a collector type ("AND"/"OR"); or "#<index>" using the step numbers printed by bw_get_process_chain. An ambiguous name is rejected with the candidates listed.',
           },
           to: {
@@ -6164,7 +6234,7 @@ const TOOL_DEFINITIONS = [
           from: {
             type: 'string',
             description:
-              'Source step. Node reference forms: a DTP or process-variant name; an aDSO held by an ADSOACT/ADSOREM node; the program of an ABAP step, or "PROGRAM/VARIANT"; ' +
+              'Source step. Node reference forms: a DTP or process-variant name; an aDSO held by an ADSOACT/ADSOREM node; the program of an ABAP step, or "PROGRAM/VARIANT"; a planning mode switch as "PLSWITCHL/ADSO_NAME" or "PLSWITCHP/ADSO_NAME"; ' +
               '"TRIGGER" or a collector type ("AND"/"OR"); or "#<index>" using the step numbers printed by bw_get_process_chain.',
           },
           to: {
@@ -6214,7 +6284,7 @@ const TOOL_DEFINITIONS = [
           step: {
             type: 'string',
             description:
-              'Step to remove. Node reference forms: a DTP or process-variant name; an aDSO held by an ADSOACT/ADSOREM node; the program of an ABAP step, or "PROGRAM/VARIANT"; ' +
+              'Step to remove. Node reference forms: a DTP or process-variant name; an aDSO held by an ADSOACT/ADSOREM node; the program of an ABAP step, or "PROGRAM/VARIANT"; a planning mode switch as "PLSWITCHL/ADSO_NAME" or "PLSWITCHP/ADSO_NAME"; ' +
               'a collector type ("AND"/"OR"); or "#<index>" using the step numbers printed by bw_get_process_chain. An ambiguous name is rejected with the candidates listed — use "#<index>" then.',
           },
           reconnect: {
@@ -7637,6 +7707,22 @@ async function handleToolCall(
           variantDescription: args?.variant_description as string | undefined,
           synchronous: args?.synchronous as boolean | undefined,
           local: args?.local as boolean | undefined,
+          activate: (args?.activate as boolean) ?? false,
+          transportRequest: args?.transport_request as string | undefined,
+        });
+        break;
+
+      case 'bw_add_process_chain_plswitch':
+        text = await bwAddProcessChainPlanningSwitch(client, {
+          name: args?.name as string,
+          mode: args?.mode as 'load' | 'plan' | 'bracket',
+          datastores: (args?.datastores as string[]) ?? [],
+          description: args?.description as string | undefined,
+          before: args?.before as string | undefined,
+          after: args?.after as string | undefined,
+          predecessor: args?.predecessor as string | undefined,
+          around: args?.around as string | undefined,
+          edgeMode: args?.edge_mode as 'both' | 'success_only' | undefined,
           activate: (args?.activate as boolean) ?? false,
           transportRequest: args?.transport_request as string | undefined,
         });

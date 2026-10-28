@@ -14,6 +14,16 @@ const COLLECTOR_TYPES = new Set(['AND', 'OR', 'EXOR', 'XOR']);
 // aInlineVariant) rather than referenced as a separate variant object.
 const INLINE_STEP_TYPES = new Set(['ADSOACT', 'ADSOREM', 'ABAP']);
 
+// Planning mode switch steps of planning-enabled aDSOs: PLSWITCHL to load mode, PLSWITCHP
+// back to planning mode. Inline variants like ADSOACT, with the aDSOs in oDetail.ADSO.
+const PLANNING_SWITCH_TYPES = new Set(['PLSWITCHL', 'PLSWITCHP']);
+
+function planningSwitchDatastores(detail: any): string[] {
+  return (detail?.ADSO ?? [])
+    .map((a: any) => String(a?.key ?? a?.row?.name ?? '').toUpperCase())
+    .filter(Boolean);
+}
+
 const TRIGGER_SCHEDULE_DETAIL = {
   startdttyp: 'I',
   sdlstrttimestamp: '',
@@ -329,6 +339,26 @@ export interface AddProcessChainProgramParams {
   predecessor?: string;
   // "both" (default): add a positive and a negative edge per new link ("always continue");
   // "success_only": add only the positive edge.
+  edgeMode?: 'both' | 'success_only';
+  activate?: boolean;
+  transportRequest?: string;
+}
+
+export interface AddProcessChainPlanningSwitchParams {
+  name: string;
+  // "load" adds a PLSWITCHL step (switch to load mode), "plan" a PLSWITCHP step (switch back
+  // to planning mode), "bracket" both around the step named in `around`.
+  mode: 'load' | 'plan' | 'bracket';
+  // Planning-enabled aDSOs the step switches. One step can switch several.
+  datastores: string[];
+  description?: string;
+  // Placement for "load" / "plan": exactly one of these is required. There is no automatic
+  // append point, because a switch step left running beside the chain start does nothing useful.
+  before?: string;
+  after?: string;
+  predecessor?: string;
+  // "bracket" only: the load step to enclose, PLSWITCHL ahead of it and PLSWITCHP behind it.
+  around?: string;
   edgeMode?: 'both' | 'success_only';
   activate?: boolean;
   transportRequest?: string;
@@ -707,6 +737,9 @@ export function chainNodeLabel(model: any, index: number): string {
     const ds = (detail?.DATASTORES ?? []).map((d: any) => d.DATASTORE).filter(Boolean).join(',');
     return `#${index} ${type}${ds ? ` ${ds}` : ''}`;
   }
+  if (PLANNING_SWITCH_TYPES.has(type)) {
+    return `#${index} ${type} ${planningSwitchDatastores(detail).join(',')}`.trimEnd();
+  }
   if (type === 'TRIGGER' || COLLECTOR_TYPES.has(type)) return `#${index} ${type}`;
   return `#${index} ${type} ${node.sProcessVariant ?? ''}`.trimEnd();
 }
@@ -726,6 +759,11 @@ function chainNodeAliases(model: any, index: number): string[] {
     for (const d of detail?.DATASTORES ?? []) {
       if (d.DATASTORE) aliases.push(String(d.DATASTORE).toUpperCase());
     }
+  }
+  if (PLANNING_SWITCH_TYPES.has(type)) {
+    // Not the bare aDSO name: that already points at the ADSOACT step of the same aDSO.
+    aliases.push(type);
+    for (const ds of planningSwitchDatastores(detail)) aliases.push(`${type}/${ds}`);
   }
   if (type === 'ABAP') {
     const prog = detail?.PROGRAM?.[0]?.key;
@@ -748,6 +786,7 @@ function chainNodeAliases(model: any, index: number): string[] {
 //   "ADSO_NAME"             → an aDSO held by an ADSOACT / ADSOREM node
 //   "REPORT_NAME"           → the program of an ABAP step
 //   "REPORT_NAME/VARIANT"   → that program with a specific SE38 variant
+//   "PLSWITCHL/ADSO_NAME"   → the planning mode switch for that aDSO (PLSWITCHP alike)
 // Throws with the full node list when nothing matches, and names the candidates when the
 // reference is ambiguous — an ambiguous reference must never silently pick one node.
 export function resolveChainNodeRef(model: any, ref: string, role = 'node'): number {
@@ -2080,6 +2119,179 @@ export async function bwAddProcessChainProgram(
           placement,
         },
       };
+    },
+    { activate, transportRequest }
+  );
+
+  return JSON.stringify(result, null, 2);
+}
+
+// ── bw_add_process_chain_plswitch ──────────────────────────────────────────────
+//
+// Add planning mode switch steps (PLSWITCHL / PLSWITCHP) in place. Like the ABAP step they
+// are inline process variants with no separate variant object; the server rewrites the
+// INLINE_ placeholder to an ILV_ key on save. Traced from the BW/4HANA Cockpit, see
+// payloads/process_chain_plswitch.md. The oDetail rows are copied from the cockpit's value
+// help, which only offers planning-enabled aDSOs, so an aDSO missing there is refused.
+
+const PLANNING_DATASTORES_VH =
+  '/sap/bc/http/sap/bw4/v1/modeling/datastores?planningmode=true&top=100&searchterm=';
+
+async function lookupPlanningDatastores(client: BwClient, names: string[]): Promise<Map<string, any>> {
+  const rows = new Map<string, any>();
+  for (const name of names) {
+    // The value help answers 415 to Accept: application/json.
+    const res = await client.rawGet(`${PLANNING_DATASTORES_VH}${encodeURIComponent(name)}`, { Accept: '*/*' });
+    const list = JSON.parse(res.body || '[]');
+    const row = (Array.isArray(list) ? list : []).find((r: any) => String(r?.name ?? '').toUpperCase() === name);
+    if (!row) {
+      throw new Error(
+        `aDSO '${name}' is not offered for a planning mode switch: it does not exist, is not active, ` +
+        `or is not planning-enabled.`
+      );
+    }
+    rows.set(name, row);
+  }
+  return rows;
+}
+
+function buildPlanningSwitchStep(
+  type: 'PLSWITCHL' | 'PLSWITCHP',
+  key: string,
+  datastores: string[],
+  rows: Map<string, any>,
+  description: string
+): { node: object; inlineVariant: object } {
+  const node = {
+    sProcessType: type,
+    bIsReference: false,
+    bSkipped: false,
+    iAutoRepeatCount: 0,
+    iAutoRepeatWaitDuration: 0,
+    iDebugWaitDuration: 0,
+    sNotificationFailure: '',
+    sNotificationSuccess: '',
+    sProcessVariant: key,
+    sVariantDescription: description,
+  };
+  const inlineVariant = {
+    sProcessVariant: key,
+    sVariantDescription: description,
+    oDetail: {
+      ADSO: datastores.map((ds) => {
+        const row = rows.get(ds);
+        const text = row.description || row.txtlg || '';
+        return { key: ds, text: text ? `${text} (${ds})` : ds, row };
+      }),
+      IOBJ: [],
+      sId: '',
+    },
+    aSocket: [],
+  };
+  return { node, inlineVariant };
+}
+
+export async function bwAddProcessChainPlanningSwitch(
+  client: BwClient,
+  params: AddProcessChainPlanningSwitchParams
+): Promise<string> {
+  const { name, mode, before, after, predecessor, around, edgeMode = 'both', activate = false, transportRequest } = params;
+
+  if (!['load', 'plan', 'bracket'].includes(mode)) {
+    throw new Error(`mode must be "load", "plan" or "bracket", got '${mode}'.`);
+  }
+  const datastores = [
+    ...new Set((params.datastores ?? []).map((d) => String(d).trim().toUpperCase()).filter(Boolean)),
+  ];
+  if (datastores.length === 0) throw new Error('datastores must name at least one planning-enabled aDSO.');
+  if (mode === 'bracket') {
+    if (!around) throw new Error('mode "bracket" needs "around": the step to enclose between the two switches.');
+    if (before || after || predecessor) {
+      throw new Error('mode "bracket" places both steps itself; do not pass before, after or predecessor.');
+    }
+  } else {
+    if (around) throw new Error('"around" belongs to mode "bracket"; use before, after or predecessor here.');
+    if ([before, after, predecessor].filter(Boolean).length !== 1) {
+      throw new Error(
+        'Pass exactly one of before, after or predecessor. A switch step without a place in the chain ' +
+        'would run alongside the chain start and switch the aDSO at the wrong moment.'
+      );
+    }
+    if (predecessor === 'strand_end_auto') {
+      throw new Error('predecessor must name a step; "strand_end_auto" is not accepted for a switch step.');
+    }
+  }
+
+  const rows = await lookupPlanningDatastores(client, datastores);
+  const wanted = [...datastores].sort().join(',');
+  const listText = datastores.join(', ');
+  const descriptionFor = (type: string) =>
+    (params.description ?? `${type === 'PLSWITCHL' ? 'Load mode' : 'Planning mode'}: ${listText}`).slice(0, 60);
+
+  const { result } = await editChainModel(
+    client,
+    name,
+    (model) => {
+      const nodes: any[] = model.aNode;
+      const edges: any[] = model.aEdge;
+
+      const existing = (type: string) =>
+        nodes.findIndex((n) => {
+          if (String(n.sProcessType ?? '').toUpperCase() !== type) return false;
+          const iv = model.aInlineVariant.find((v: any) => v.sProcessVariant === n.sProcessVariant);
+          return [...planningSwitchDatastores(iv?.oDetail)].sort().join(',') === wanted;
+        });
+
+      const link = (from: number, to: number) => {
+        edges.push({ iNodeIndexFrom: from, iNodeIndexTo: to, sStatus: 'positive', sSubStatus: '00' });
+        if (edgeMode !== 'success_only') {
+          edges.push({ iNodeIndexFrom: from, iNodeIndexTo: to, sStatus: 'negative', sSubStatus: '00' });
+        }
+      };
+
+      const addNode = (type: 'PLSWITCHL' | 'PLSWITCHP'): number => {
+        const idx = nodes.length;
+        const { node, inlineVariant } = buildPlanningSwitchStep(
+          type, `INLINE_PLSWITCH_${idx}`, datastores, rows, descriptionFor(type)
+        );
+        nodes.push(node);
+        model.aInlineVariant.push(inlineVariant);
+        return idx;
+      };
+
+      if (mode !== 'bracket') {
+        const type = mode === 'load' ? 'PLSWITCHL' : 'PLSWITCHP';
+        const present = existing(type);
+        if (present >= 0) {
+          return { report: {}, skipReason: `${chainNodeLabel(model, present)} already switches these aDSOs` };
+        }
+        const idx = addNode(type);
+        const placement = placeBlock(model, [idx], { before, after, predecessor }, link);
+        return { report: { added: `${type} ${listText}`, placement } };
+      }
+
+      const targetIdx = resolveChainNodeRef(model, around!, "'around' target");
+      const targetLabel = chainNodeLabel(model, targetIdx);
+      const added: string[] = [];
+      const kept: string[] = [];
+      const presentL = existing('PLSWITCHL');
+      const presentP = existing('PLSWITCHP');
+      if (presentL >= 0) kept.push(chainNodeLabel(model, presentL));
+      else {
+        spliceBlockInSeries(model, [addNode('PLSWITCHL')], 'before', targetIdx, link);
+        added.push(`PLSWITCHL ${listText} before ${targetLabel}`);
+      }
+      if (presentP >= 0) kept.push(chainNodeLabel(model, presentP));
+      else {
+        spliceBlockInSeries(model, [addNode('PLSWITCHP')], 'after', targetIdx, link);
+        added.push(`PLSWITCHP ${listText} after ${targetLabel}`);
+      }
+      if (added.length === 0) {
+        return { report: { existing: kept }, skipReason: 'both switch steps for these aDSOs are already present' };
+      }
+      const report: Record<string, unknown> = { added };
+      if (kept.length) report.already_present = kept;
+      return { report };
     },
     { activate, transportRequest }
   );

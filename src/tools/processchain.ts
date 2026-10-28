@@ -58,6 +58,7 @@ interface VariantDetail {
   X_SYNCHRON?: string;
   X_LOCAL?: string;
   DATASTORES?: DatastoreEntry[];
+  ADSO?: { key?: string }[];
   eventid?: EventIdEntry[];
   eventparm?: string;
   startdttyp?: string;
@@ -210,9 +211,13 @@ function renderText(pc: ProcessChain, variantDetailMap: Record<string, string> =
       lines.push(`      Sub-Chain: ${node.sProcessVariant ?? ''}  (referenced)`);
     }
 
+    // The server repeats some entries (a planning mode switch lists its aDSO twice).
+    const seenDetail = new Set<string>();
     for (const d of node.aDetail ?? []) {
-      if (d.sValue && d.sValue.length > 0) {
-        lines.push(`      ${d.sName ?? ''}: ${d.sValue}`);
+      const line = `${d.sName ?? ''}: ${d.sValue}`;
+      if (d.sValue && d.sValue.length > 0 && !seenDetail.has(line)) {
+        seenDetail.add(line);
+        lines.push(`      ${line}`);
       }
     }
 
@@ -291,6 +296,9 @@ function renderText(pc: ProcessChain, variantDetailMap: Record<string, string> =
           .map((d) => `${d.DATASTORE ?? ''}${d.ACTION ? ` (action ${d.ACTION})` : ''}`)
           .join(', ');
         lines.push(`      DataStores: ${ds}`);
+      }
+      if (detail.ADSO && detail.ADSO.length >= 1) {
+        lines.push(`      Planning Mode Switch: ${detail.ADSO.map((a) => a.key ?? '').join(', ')}`);
       }
       if (detail.eventid && detail.eventid.length >= 1) {
         lines.push(`      Trigger Event: ${detail.eventid[0].key ?? ''}  Param: ${detail.eventparm ?? ''}`);
