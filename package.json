@@ -34,10 +34,10 @@
     "dev": "tsc && node dist/stdio.js",
     "start:http": "node dist/http.js",
     "typecheck": "tsc --noEmit",
-    "test": "node --test tests/*.test.mjs"
+    "test": "npm run build && node --test tests/*.test.mjs"
   },
   "dependencies": {
-    "@arc-mcp/xsuaa-auth": "^1.0.0",
+    "@arc-mcp/xsuaa-auth": "^1.2.0",
     "@modelcontextprotocol/sdk": "^1.29.0",
     "axios": "^1.7.0",
     "express": "^5.2.1",

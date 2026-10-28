@@ -1,5 +1,7 @@
 # bw-modeling-mcp
 
+> Upgrading an XSUAA deployment? Read the [OAuth upgrade guide](docs/XSUAA-AUTH-UPGRADE.md) before redeploying.
+
 A Model Context Protocol (MCP) server that enables AI assistants like Claude to work directly inside SAP BW/4HANA or SAP BW 7.5 on HANA systems — reading, creating and modifying BW modeling objects via the same internal SAP APIs that Eclipse BWMT and the BW/4HANA Cockpit use: the **BW Modeling REST API** (`/sap/bw/modeling/`) for objects, queries and live data, the **ADT API** (`/sap/bc/adt/`) for the ABAP and AMDP routines BW generates, the **BW/4HANA manage API** for the request monitor and runtime, and the **Push API** (`/sap/bw4/`) for data loads.
 
 **This is not a simulation.** Every tool call connects to a live BW system — write operations produce real changes.
@@ -224,7 +226,7 @@ The ADT MCP server covers ABAP as a subject in its own right: your own reports, 
 ## Requirements
 
 - SAP BW/4HANA system with the internal SAP APIs enabled (SAP BW 7.5 works for modeling reads and most modelling writes once the enhancement in [bw75/BW75-SUPPORT.md](bw75/BW75-SUPPORT.md) is in place)
-- Node.js 18 or later
+- Node.js 22 or later
 - An MCP-compatible AI client (Claude Desktop, Claude Code, etc.)
 
 ---
