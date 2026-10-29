@@ -293,6 +293,7 @@ src/
     │                     # access properties of the rows/columns/free areas
     ├── query_cells.ts    # bw_update_query_cells — reference, formula and help cells of a query
     │                     # with two structures (Qry:gridCells / Qry:helpCells)
+    ├── query_exceptions.ts # bw_update_query_exceptions — exceptions (Qry:exceptions) of a query
     ├── reporting.ts      # bw_query_data, bw_get_filter_values — BICS reporting endpoint (/sap/bw/modeling/comp/reporting)
     ├── query_statistics.ts # bw_query_statistics and bw_query_data with_statistics — RSDDSTAT* through
     │                     # ADT DataPreview; every statement fixed, escaped and within 255 characters

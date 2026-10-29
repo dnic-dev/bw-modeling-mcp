@@ -61,7 +61,7 @@ export interface UpdateQueryCellsArgs {
   transport?: string;
 }
 
-interface Structure {
+export interface Structure {
   id: string;
   description: string;
   /** 1 for the structure coordinateMember1 refers to, 2 for the other. */
@@ -114,6 +114,18 @@ export function findCells(doc: string): CellElement[] {
  * order takes its place.
  */
 export function findStructures(doc: string): Structure[] {
+  const found = listStructures(doc);
+  if (found.length < 2) {
+    throw new Error(
+      `Cell definitions need two structures, one on each axis; the query has ${found.length}. ` +
+      'Add the second structure first (bw_update_query_layout add_structure or bw_update_query_key_figures).'
+    );
+  }
+  return found;
+}
+
+/** The structures of the query (none, one or two), ordered as findStructures orders them. */
+export function listStructures(doc: string): Structure[] {
   const region = locateMainComponentRegion(doc, 'structure lookup');
   const sub = doc.slice(region.start, region.end);
   const mainOpen = sub.slice(0, sub.indexOf('>') + 1);
@@ -135,19 +147,14 @@ export function findStructures(doc: string): Structure[] {
       members,
     });
   }
-  if (found.length < 2) {
-    throw new Error(
-      `Cell definitions need two structures, one on each axis; the query has ${found.length}. ` +
-      'Add the second structure first (bw_update_query_layout add_structure or bw_update_query_key_figures).'
-    );
-  }
+  if (found.length === 0) return [];
   const firstIdx = Math.max(0, found.findIndex((s) => s.id === firstId));
   const first = found[firstIdx];
-  const second = found.find((_, i) => i !== firstIdx)!;
-  return [{ ...first, ordinal: 1 }, { ...second, ordinal: 2 }];
+  const second = found.find((_, i) => i !== firstIdx);
+  return second ? [{ ...first, ordinal: 1 }, { ...second, ordinal: 2 }] : [{ ...first, ordinal: 1 }];
 }
 
-function resolveStructureMember(
+export function resolveStructureMember(
   structures: Structure[],
   ref: string,
   context: string

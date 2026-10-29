@@ -307,12 +307,15 @@ function mainComponentHasFirstCustomDimension(doc: string): boolean {
 }
 
 /**
- * True when a structure element holds key figures: its members either select on
- * 1KYFNM or are local formulas. This is what identifies the key figure structure
- * when the open tag does not say so — see findKeyFigureStructure.
+ * How strongly a structure element looks like the key figure structure when its open
+ * tag does not say so — see findKeyFigureStructure. A member selecting on 1KYFNM is
+ * decisive (2). Formulas alone count less (1), and only without any selection: a
+ * characteristic structure holds formulas too, next to its selections.
  */
-function structureHoldsKeyFigures(element: string): boolean {
-  return /<Qry:groups\b[^>]*\binfoObject="1KYFNM"/.test(element) || element.includes('xsi:type="Qry:MemberFormula"');
+function keyFigureEvidence(element: string): number {
+  if (/<Qry:groups\b[^>]*\binfoObject="1KYFNM"/.test(element)) return 2;
+  if (element.includes('xsi:type="Qry:MemberFormula"') && !/<Qry:groups\b/.test(element)) return 1;
+  return 0;
 }
 
 /**
@@ -328,7 +331,7 @@ function structureHoldsKeyFigures(element: string): boolean {
  * structure". A structure whose members hold key figures therefore counts too,
  * with the explicitly marked one taking precedence: a query may carry both a
  * characteristic structure and a key figure structure, and only the members
- * decide which is which.
+ * decide which is which (see keyFigureEvidence).
  */
 export function findKeyFigureStructure(
   doc: string
@@ -338,6 +341,7 @@ export function findKeyFigureStructure(
   const re = /<Qry:(rows|columns)\b[^>]*?(\/>|>[\s\S]*?<\/Qry:\1>)/g;
   let m: RegExpExecArray | null;
   let fallback: { container: string; id: string | undefined; element: string; start: number; end: number } | null = null;
+  let fallbackEvidence = 0;
   while ((m = re.exec(sub)) !== null) {
     const full = m[0];
     const openTag = full.match(/^<Qry:(?:rows|columns)\b[^>]*?(?:\/?>)/)?.[0] ?? full;
@@ -350,7 +354,11 @@ export function findKeyFigureStructure(
       end: region.start + m.index + full.length,
     };
     if (openTag.includes('infoObjectName="1KYFNM"')) return hit;
-    if (!fallback && structureHoldsKeyFigures(full)) fallback = hit;
+    const evidence = keyFigureEvidence(full);
+    if (evidence > fallbackEvidence) {
+      fallback = hit;
+      fallbackEvidence = evidence;
+    }
   }
   return fallback;
 }
@@ -1312,6 +1320,7 @@ export interface KeyFigureOperation {
     | 'add_rkf'
     | 'add_formula'
     | 'add_selection'
+    | 'add_structure'
     | 'remove_member'
     | 'set_member_properties'
     | 'set_member_restrictions'
@@ -1344,7 +1353,10 @@ export interface KeyFigureOperation {
    * member is moved there. Empty string moves a member back to the top level.
    */
   parent?: string;
-  /** Position among the siblings (0-based). Appends when omitted. */
+  /**
+   * Position among the siblings (0-based). Appends when omitted. On add_structure the
+   * position among the characteristics and structures of the target container.
+   */
   position?: number;
   /** Inverse formula, on add_formula and set_member_properties. */
   inverse?: InverseFormula;
@@ -2179,13 +2191,26 @@ export type FormulaOperandHook = (node: FormulaNode, tag: string) => string | un
  * Render a formula node tree. The root element is Qry:formulaToken; nested operands
  * are Qry:childToken. Operator codes +,-,*,/ map to FormulaInfixOperator, any other
  * code to FormulaPrefixOperator. Member / component operands resolve against the
- * current document (mainComponent region).
+ * current document (mainComponent region), member operands within the structure
+ * the formula belongs to.
  */
-export function renderFormulaNode(node: FormulaNode, doc: string, tag: string, operand?: FormulaOperandHook): string {
+export function renderFormulaNode(
+  node: FormulaNode,
+  doc: string,
+  tag: string,
+  operand?: FormulaOperandHook,
+  kind: StructureKind = 'key_figures'
+): string {
   if (!node || typeof node !== 'object') throw new Error('Invalid formula node.');
   const custom = operand?.(node, tag);
   if (custom !== undefined) return custom;
   const type = node['type'];
+  if (kind === 'characteristics' && (type === 'component' || type === 'key_figure')) {
+    throw new Error(
+      `Formula ${type} operand: a formula in the characteristic structure computes with members of that ` +
+        'structure, constants and formula variables only; key figures come from the key figure structure.'
+    );
+  }
   if (type === 'operator') {
     const rawCode = String(node['code'] ?? '');
     if (!rawCode) throw new Error('Formula operator node requires a code.');
@@ -2214,14 +2239,15 @@ export function renderFormulaNode(node: FormulaNode, doc: string, tag: string, o
       throw new Error(`Formula operator '${code}' requires at least one operand.`);
     }
     const xsiType = ['+', '-', '*', '/'].includes(code) ? 'Qry:FormulaInfixOperator' : 'Qry:FormulaPrefixOperator';
-    const children = operands.map((o) => renderFormulaNode(o, doc, 'Qry:childToken', operand)).join('');
+    const children = operands.map((o) => renderFormulaNode(o, doc, 'Qry:childToken', operand, kind)).join('');
     return `<${tag} xsi:type="${xsiType}" code="${escapeXml(code)}">${children}</${tag}>`;
   }
   if (type === 'member') {
     const { member } = resolveOneMember(
       doc,
       { member_id: node['member_id'] as string | undefined, description: node['description'] as string | undefined },
-      'formula member operand'
+      'formula member operand',
+      kind
     );
     return `<${tag} xsi:type="Qry:FormulaMemberOperand" member="${member.id}" operandType="Member"/>`;
   }
@@ -2495,6 +2521,78 @@ export function insertKeyFigureMember(
   return doc.slice(0, insertAt) + '\n' + childXml + doc.slice(insertAt);
 }
 
+/**
+ * Insert a top-level member into the characteristic structure at a position among
+ * its members, appending when none is given. A structure without members yet takes
+ * the member before its close tag, after its description.
+ */
+export function insertCharacteristicMember(doc: string, memberXml: string, position: number | undefined, context: string): string {
+  checkPosition(position);
+  const cd = findCharacteristicStructure(doc);
+  if (!cd) throw new Error(`${context}: query has no characteristic structure — create it with add_structure.`);
+  const closeTag = `</Qry:${cd.container}>`;
+  const fallback = cd.element.endsWith('/>') ? -1 : cd.element.length - closeTag.length;
+  if (fallback < 0) {
+    const expanded = `${cd.element.slice(0, -2)}>\n${memberXml}\n${closeTag}`;
+    return doc.slice(0, cd.start) + expanded + doc.slice(cd.end);
+  }
+  const offset = siblingInsertOffset(cd.element, 'members', position, fallback);
+  return doc.slice(0, cd.start + offset) + '\n' + memberXml + doc.slice(cd.start + offset);
+}
+
+/** The rows or columns elements of the mainComponent in document order — characteristics and structures alike. */
+function layoutElements(doc: string, container: string): { start: number; end: number }[] {
+  const region = locateMainComponentRegion(doc, 'layout lookup');
+  const sub = doc.slice(region.start, region.end);
+  const re = new RegExp(`<Qry:${container}\\b[^>]*?(\\/>|>[\\s\\S]*?<\\/Qry:${container}>)`, 'g');
+  return [...sub.matchAll(re)].map((m) => ({ start: region.start + m.index!, end: region.start + m.index! + m[0].length }));
+}
+
+/** Number of structures (CustomDimension) in rows and columns. */
+function structureCount(doc: string): number {
+  return ['rows', 'columns']
+    .flatMap((c) => layoutElements(doc, c).map((e) => doc.slice(e.start, e.end)))
+    .filter((e) => /^<Qry:(?:rows|columns)\b[^>]*xsi:type="Qry:CustomDimension"/.test(e)).length;
+}
+
+/**
+ * Create the characteristic structure: an empty CustomDimension on 1STRUC in rows or
+ * columns, as the modeling tools write it, plus its asStartValue bookkeeping entry in
+ * the filter. The structure numbers itself in its defaultHint. Order within the
+ * container is document order, so position counts the characteristics and the key
+ * figure structure already there; without it the structure goes last.
+ */
+export function addCharacteristicStructure(
+  doc: string,
+  container: string,
+  position: number | undefined,
+  description: string | undefined
+): { doc: string; id: string } {
+  checkPosition(position);
+  if (findCharacteristicStructure(doc)) throw new Error('add_structure: the query already has a characteristic structure.');
+  if (structureCount(doc) >= 2) throw new Error('add_structure: a query holds at most two structures.');
+  const vid = allocateVirtualId(doc);
+  const descEsc = escapeXml(description ?? 'Structure');
+  const structure =
+    `<Qry:${container} xsi:type="Qry:CustomDimension" id="${vid}" infoObjectName="1STRUC">\n` +
+    `  <Qry:description ${description !== undefined ? 'default="false" ' : ''}value="${descEsc}"/>\n` +
+    `  <Qry:defaultHint>\n    <Qry:value>${structureCount(doc) + 1}</Qry:value>\n  </Qry:defaultHint>\n` +
+    `</Qry:${container}>`;
+
+  const siblings = layoutElements(doc, container);
+  let out: string;
+  if (siblings.length === 0) {
+    out = spliceBefore(doc, '<Qry:runtimeProperties', structure + '\n', 'characteristic structure insertion');
+  } else {
+    const at = position !== undefined && position < siblings.length ? siblings[position].start : siblings[siblings.length - 1].end;
+    out = doc.slice(0, at) + (at === siblings[siblings.length - 1].end ? '\n' + structure : structure + '\n') + doc.slice(at);
+  }
+  const selFragment =
+    `<Qry:selections xsi:type="Qry:StandardFilterSelection" dimension="${vid}" infoObject="1STRUC" usageType="asStartValue"/>`;
+  out = insertIntoFilter(out, selFragment, 'characteristic structure: bookkeeping entry');
+  return { doc: out, id: vid };
+}
+
 interface ResolvedComponent {
   componentId: string;
   description: string;
@@ -2653,18 +2751,32 @@ export async function bwUpdateQueryKeyFigures(
     throw new Error(`Invalid structure '${kind}' (expected key_figures or characteristics).`);
   }
   for (const op of ops) {
-    if (
-      kind === 'characteristics' &&
-      ['add_key_figure', 'add_ckf', 'add_rkf', 'add_formula'].includes(op.action)
-    ) {
+    if (kind === 'characteristics' && ['add_key_figure', 'add_ckf', 'add_rkf'].includes(op.action)) {
       throw new Error(
         `${op.action} adds to the key figure structure; on the characteristic structure use add_selection.`
       );
     }
-    if (kind === 'characteristics' && (op.parent !== undefined || op.position !== undefined || op.inverse)) {
-      throw new Error(`${op.action}: parent, position and inverse apply to the key figure structure only.`);
+    if (kind === 'characteristics' && (op.parent !== undefined || op.inverse)) {
+      throw new Error(`${op.action}: parent and inverse apply to the key figure structure only.`);
     }
     for (const r of op.restrictions ?? []) checkRestriction(r, op.action === 'set_member_restrictions');
+    if (op.action === 'add_structure') {
+      if (kind !== 'characteristics') {
+        throw new Error(
+          'add_structure creates the characteristic structure: set structure to "characteristics". ' +
+            'The key figure structure is created by its first add operation.'
+        );
+      }
+      checkPosition(op.position);
+      // The server refuses an empty structure but saves the query anyway, inconsistent.
+      if (!ops.slice(ops.indexOf(op) + 1).some((o) => o.action === 'add_selection')) {
+        throw new Error(
+          'add_structure: a structure cannot be saved empty — follow add_structure with at least one ' +
+            'add_selection in the same call.'
+        );
+      }
+      continue;
+    }
     if (op.action === 'add_selection') {
       if (kind !== 'characteristics') {
         throw new Error('add_selection adds to the characteristic structure: set structure to "characteristics".');
@@ -2725,7 +2837,7 @@ export async function bwUpdateQueryKeyFigures(
     } else {
       throw new Error(
         `Invalid action '${op.action}' (expected add_key_figure, add_ckf, add_rkf, add_formula, add_selection, ` +
-        `remove_member, set_member_properties, set_member_restrictions, or switch_hierarchy).`
+        `add_structure, remove_member, set_member_properties, set_member_restrictions, or switch_hierarchy).`
       );
     }
   }
@@ -2832,7 +2944,7 @@ export async function bwUpdateQueryKeyFigures(
       } else if (op.action === 'add_formula') {
         // Operands resolve against the current document, so members referenced by
         // the formula must already exist (added earlier in this batch or before).
-        const formulaXml = renderFormulaNode(op.formula!, doc, 'Qry:formulaToken');
+        const formulaXml = renderFormulaNode(op.formula!, doc, 'Qry:formulaToken', undefined, kind);
         const descEsc = escapeXml(op.description!);
         const vid = allocateVirtualId(doc);
         let memberXml = buildFormulaMember(vid, descEsc, formulaXml);
@@ -2843,7 +2955,10 @@ export async function bwUpdateQueryKeyFigures(
         if (op.inverse) {
           memberXml = withInverseFormula(memberXml, ...inverseFor(doc, op.inverse, vid));
         }
-        doc = insertKeyFigureMember(doc, memberXml, structureTarget, { parent: op.parent, position: op.position });
+        doc =
+          kind === 'characteristics'
+            ? insertCharacteristicMember(doc, memberXml, op.position, 'add_formula')
+            : insertKeyFigureMember(doc, memberXml, structureTarget, { parent: op.parent, position: op.position });
         summary.push(`add formula member '${op.description}'`);
       } else if (op.action === 'remove_member') {
         // resolveOneMember matches both MemberSelection and MemberFormula members.
@@ -2898,25 +3013,33 @@ export async function bwUpdateQueryKeyFigures(
             );
           }
           doc = doc.slice(0, cdStart + member.start) + doc.slice(cdStart + member.end);
-          doc = insertKeyFigureMember(doc, asTopLevelMember(updated), structureTarget, {
-            parent: targetParent,
-            position: op.position,
-          });
-          summary.push(`move ${label}${targetParent ? ` under ${targetParent}` : ' to the top level'}`);
+          doc =
+            kind === 'characteristics'
+              ? insertCharacteristicMember(doc, asTopLevelMember(updated), op.position, 'set_member_properties')
+              : insertKeyFigureMember(doc, asTopLevelMember(updated), structureTarget, {
+                  parent: targetParent,
+                  position: op.position,
+                });
+          summary.push(
+            kind === 'characteristics'
+              ? `move ${label} to position ${op.position}`
+              : `move ${label}${targetParent ? ` under ${targetParent}` : ' to the top level'}`
+          );
         } else {
           doc = doc.slice(0, cdStart + member.start) + updated + doc.slice(cdStart + member.end);
           summary.push(`set properties on ${label}`);
         }
+      } else if (op.action === 'add_structure') {
+        const created = addCharacteristicStructure(doc, structureTarget, op.position, op.description);
+        doc = created.doc;
+        summary.push(
+          `add characteristic structure in ${structureTarget}${op.position !== undefined ? ` at position ${op.position}` : ''}`
+        );
       } else if (op.action === 'add_selection') {
-        const cd = findCharacteristicStructure(doc);
-        if (!cd) throw new Error('add_selection: query has no characteristic structure.');
         const vid = allocateVirtualId(doc);
         let memberXml = buildSelectionMember(vid, escapeXml(op.description!), op.restrictions!, nodeVariables);
         if (op.properties) memberXml = applyMemberProperties(memberXml, op.properties, doc);
-        // After the last member, not before the close tag: the structure's own
-        // settings follow its members.
-        const offset = siblingInsertOffset(cd.element, 'members', undefined, cd.element.indexOf('>') + 1);
-        doc = doc.slice(0, cd.start + offset) + '\n' + memberXml + doc.slice(cd.start + offset);
+        doc = insertCharacteristicMember(doc, memberXml, op.position, 'add_selection');
         summary.push(`add selection member '${op.description}'`);
       } else if (op.action === 'set_member_restrictions') {
         const { member, cdStart } = resolveOneMember(

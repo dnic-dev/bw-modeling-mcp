@@ -48,6 +48,7 @@ import { bwCreateVariable, CreateVariableArgs, type FormulaDimension } from './t
 import { bwUpdateQueryLayout, bwUpdateQueryFilter, bwUpdateQueryKeyFigures, bwUpdateQuerySettings, EXCEPTION_AGGREGATION_TYPES, LayoutOperation, FilterOperation, KeyFigureOperation, UpdateQuerySettingsArgs } from './tools/query_update.js';
 import { bwUpdateQueryCharacteristic, UpdateQueryCharacteristicArgs } from './tools/query_characteristic.js';
 import { bwUpdateQueryCells, UpdateQueryCellsArgs } from './tools/query_cells.js';
+import { bwUpdateQueryExceptions, UpdateQueryExceptionsArgs } from './tools/query_exceptions.js';
 import {
   bwGetCompositeProvider,
   bwCreateCompositeProvider,
@@ -2773,16 +2774,18 @@ const TOOL_DEFINITIONS = [
             enum: ['rows', 'columns'],
             description:
               'Container for the key figure structure when it is created by the first add operation ' +
-              '(default "columns"). Ignored once a structure already exists.',
+              '(default "columns"), and for the characteristic structure that add_structure creates. ' +
+              'Ignored once the structure already exists.',
           },
           structure: {
             type: 'string',
             enum: ['key_figures', 'characteristics'],
             description:
               'Structure the operations address (default "key_figures"). "characteristics" is the second ' +
-              'structure of a query, the one without key figures: add_selection, remove_member, ' +
-              'set_member_properties (e.g. hidden), set_member_restrictions and switch_hierarchy work on it; ' +
-              'it must already exist.',
+              'structure of a query, the one without key figures: add_structure creates it; add_selection, ' +
+              'add_formula, remove_member, set_member_properties (e.g. hidden or position), ' +
+              'set_member_restrictions and switch_hierarchy work on it. A formula there computes with members ' +
+              'of that structure, constants and formula variables.',
           },
           operations: {
             type: 'array',
@@ -2798,6 +2801,7 @@ const TOOL_DEFINITIONS = [
                     'add_rkf',
                     'add_formula',
                     'add_selection',
+                    'add_structure',
                     'remove_member',
                     'set_member_properties',
                     'set_member_restrictions',
@@ -2810,7 +2814,9 @@ const TOOL_DEFINITIONS = [
                     'description, and/or component_name. set_member_properties: change properties, exception ' +
                     'aggregation, the inverse formula, or the place in the structure (parent / position) of a ' +
                     'matched member. add_selection: add a member to the characteristic structure (description + ' +
-                    'restrictions). set_member_restrictions: replace or remove the characteristic restrictions of ' +
+                    'restrictions). add_structure: create the characteristic structure in structure_target, at ' +
+                    'position among the elements already there, with an optional description; follow it with ' +
+                    'add_selection / add_formula in the same call. set_member_restrictions: replace or remove the characteristic restrictions of ' +
                     'a matched member, keeping its key figure. switch_hierarchy: move every node restriction ' +
                     '(fixed nodes and node variables) from from_hierarchy to to_hierarchy, in the whole ' +
                     'structure or, with a matcher, in one member. Members are matched at any depth, so a nested ' +
@@ -2830,7 +2836,8 @@ const TOOL_DEFINITIONS = [
                   type: 'string',
                   description:
                     'Member description. Defaults to the key figure / component name on add; required for ' +
-                    '"add_formula"; matches the member description on "remove_member" / "set_member_properties".',
+                    '"add_formula"; matches the member description on "remove_member" / "set_member_properties". ' +
+                    'On "add_structure" the description of the new structure (the server numbers it when omitted).',
                 },
                 member_id: {
                   type: 'string',
@@ -2952,7 +2959,9 @@ const TOOL_DEFINITIONS = [
                   minimum: 0,
                   description:
                     'Position among the siblings (0 inserts before the first). Appends when omitted. ' +
-                    'On "set_member_properties" without "parent" the member stays on its current level.',
+                    'On "set_member_properties" without "parent" the member stays on its current level. ' +
+                    'On "add_structure" the position among the characteristics and the key figure structure ' +
+                    'already in the target container (0 places the new structure first).',
                 },
                 inverse: {
                   type: 'object',
@@ -3240,6 +3249,107 @@ const TOOL_DEFINITIONS = [
                 },
                 scaling: {
                   description: 'Scaling factor as a power of ten 0-9 for the cell, or false to return to the default.',
+                },
+              },
+              required: ['action'],
+            },
+          },
+        },
+        required: ['query_name', 'operations'],
+      },
+    },
+    {
+      name: 'bw_update_query_exceptions',
+      description:
+        'Manage the exceptions (alert levels that colour data cells) of an existing BW Query: add exceptions ' +
+        'with thresholds per alert level, change them, and remove them. An exception is evaluated on the data ' +
+        'cells of one member per structure or on all elements of a structure, and can colour the evaluated ' +
+        'cell or other cells. Members and exceptions are addressed by description or id; bw_get_query lists ' +
+        'the existing exceptions. for_each_member creates the same exception once per listed member. ' +
+        'All operations are applied in a single save.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          query_name: {
+            type: 'string',
+            description: 'Technical name of the query to modify (e.g. "QUERY_NAME").',
+          },
+          transport: {
+            type: 'string',
+            description: 'Transport request number (e.g. DEVK900123). Only needed when the query lives on a transportable package; omit for $TMP queries.',
+          },
+          operations: {
+            type: 'array',
+            description: 'Exception changes, applied in order in one save cycle.',
+            items: {
+              type: 'object',
+              properties: {
+                action: {
+                  type: 'string',
+                  enum: ['add_exception', 'update_exception', 'remove_exception'],
+                  description:
+                    'add_exception: a new exception (description and thresholds required). ' +
+                    'update_exception: change the exception given by exception; only the fields passed change, ' +
+                    'thresholds replace the whole list. remove_exception: remove that exception.',
+                },
+                exception: {
+                  type: 'string',
+                  description: 'Existing exception by description or id (update_exception, remove_exception).',
+                },
+                description: { type: 'string', description: 'Text of the exception.' },
+                thresholds: {
+                  type: 'array',
+                  description: 'One entry per threshold, e.g. GreaterThan 0 → Good1 and LessThan 0 → Bad1.',
+                  items: {
+                    type: 'object',
+                    properties: {
+                      alert_level: {
+                        type: 'string',
+                        enum: ['Good1', 'Good2', 'Good3', 'Critical1', 'Critical2', 'Critical3', 'Bad1', 'Bad2', 'Bad3'],
+                      },
+                      operator: {
+                        type: 'string',
+                        enum: ['Equal', 'NotEqualTo', 'LessThan', 'LessEqual', 'GreaterThan', 'GreaterEqual', 'Between', 'NotBetween'],
+                      },
+                      value: { type: ['number', 'string'], description: 'Threshold value; the low bound with Between / NotBetween.' },
+                      to_value: { type: ['number', 'string'], description: 'High bound with Between / NotBetween.' },
+                      variable: { type: 'string', description: 'Formula variable instead of value (technical name).' },
+                      to_variable: { type: 'string', description: 'Formula variable instead of to_value.' },
+                    },
+                    required: ['alert_level', 'operator'],
+                  },
+                },
+                defined_on: {
+                  type: 'array',
+                  items: { type: 'string' },
+                  description:
+                    'Members the exception is evaluated on, by description or id, at most one per structure. ' +
+                    'A structure without a member here: all its elements. Default: all elements of both structures.',
+                },
+                display_on: {
+                  type: 'array',
+                  items: { type: 'string' },
+                  description:
+                    'Members whose cells show the alert, at most one per structure. A structure without a member ' +
+                    'here shows it on the evaluated element (or on all elements with display_all_elements).',
+                },
+                display_all_elements: {
+                  type: 'boolean',
+                  description: 'Structures without a display_on member show the alert on all their elements.',
+                },
+                active: { type: 'boolean', description: 'Exception active (default true).' },
+                evaluate_before_calculations: {
+                  type: 'boolean',
+                  description: 'Evaluate before list calculations such as result calculations (default true).',
+                },
+                affects_data_cells: { type: 'boolean', description: 'Show the alert in data cells (default true).' },
+                for_each_member: {
+                  type: 'array',
+                  items: { type: 'string' },
+                  description:
+                    'add_exception only: create one exception per listed member, each evaluated on that member ' +
+                    '(and on the defined_on member of the other structure); the member description is appended ' +
+                    'to the exception text.',
                 },
               },
               required: ['action'],
@@ -7059,6 +7169,10 @@ async function handleToolCall(
 
       case 'bw_update_query_cells':
         text = await bwUpdateQueryCells(client, args as unknown as UpdateQueryCellsArgs);
+        break;
+
+      case 'bw_update_query_exceptions':
+        text = await bwUpdateQueryExceptions(client, args as unknown as UpdateQueryExceptionsArgs);
         break;
 
       case 'bw_update_query_characteristic':

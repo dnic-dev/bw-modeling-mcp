@@ -804,11 +804,30 @@ function renderQueryText(q: Record<string, unknown>): string {
     lines.push('');
     lines.push(`── Exceptions (${exceptions.length}) ──`);
     for (const e of exceptions as Record<string, unknown>[]) {
-      lines.push(`  ${s(e['description'])}  evaluated=${bool(e['evaluated'])}`);
+      lines.push(
+        `  ${s(e['description'])}  active=${bool(e['active'])}  beforeCalculations=${bool(e['evaluateBeforeListCalc'])}` +
+        `  dataCells=${bool(e['affectsDataCells'])}`
+      );
       const thresholds = e['thresholds'] as unknown[] ?? [];
       for (const t of thresholds as Record<string, unknown>[]) {
-        lines.push(`    Level ${s(t['alertLevel'])}: ${s(t['operator'])} ${s(t['value'])}`);
+        const val = (v: unknown, isVar: unknown) => (isVar ? `variable ${s(v)}` : s(v));
+        const to = t['toValue'] !== undefined ? ` and ${val(t['toValue'], t['toValueIsVariable'])}` : '';
+        lines.push(`    Level ${s(t['alertLevel'])}: ${s(t['operator'])} ${val(t['value'], t['valueIsVariable'])}${to}`);
       }
+      const cell = (key: string, fallback: string) => {
+        const c = e[key] as { mode?: string; member?: string; memberDescription?: string } | undefined;
+        if (!c) return fallback;
+        return c.mode === 'GivenElement' ? `'${c.memberDescription || c.member}'` : c.mode === 'AllElements' ? 'all' : 'evaluated element';
+      };
+      const first = (e['firstStructure'] as string) || 'structure 1';
+      const second = (e['secondStructure'] as string) || 'structure 2';
+      lines.push(
+        `    Evaluated on: ${first} ${cell('definedOnFirstStructure', 'all')}, ${second} ${cell('definedOnSecondStructure', 'all')}`
+      );
+      lines.push(
+        `    Shown on: ${first} ${cell('shownOnFirstStructure', 'evaluated element')}, ` +
+        `${second} ${cell('shownOnSecondStructure', 'evaluated element')}`
+      );
     }
   }
 
@@ -1067,27 +1086,39 @@ export function parseQueryDocument(
       const threshold: Record<string, unknown> = {
         alertLevel: (t['@_alertLevel'] as string) ?? '',
         operator: (t['@_operator'] as string) ?? '',
-        value: (fromValue?.['Qry:value'] as string) ?? '',
+        value: String(fromValue?.['Qry:value'] ?? ''),
       };
-      const toVal = toValueNode?.['Qry:value'] as string | undefined;
-      if (toVal !== undefined) threshold['toValue'] = toVal;
+      if (fromValue?.['Qry:type'] === 'VariableCIN') threshold['valueIsVariable'] = true;
+      const toVal = toValueNode?.['Qry:value'];
+      if (toVal !== undefined) threshold['toValue'] = String(toVal);
+      if (toValueNode?.['Qry:type'] === 'VariableCIN') threshold['toValueIsVariable'] = true;
       return threshold;
     });
+    const cellMode = (tag: string) => {
+      const node = ex[tag] as Record<string, unknown> | undefined;
+      if (!node) return undefined;
+      const member = node['Qry:member'] as string | undefined;
+      return { mode: (node['Qry:dataCellMode'] as string) ?? '', ...(member ? { member } : {}) };
+    };
     const exception: Record<string, unknown> = {
       id: (ex['@_id'] as string) ?? '',
-      active: ex['@_active'] === 'true' || ex['@_active'] === true,
-      evaluateBeforeListCalc: ex['@_evaluateBeforeListCalc'] === 'true' || ex['@_evaluateBeforeListCalc'] === true,
+      active: ex['@_active'] !== 'false' && ex['@_active'] !== false,
+      evaluateBeforeListCalc: ex['@_evaluateBeforeListCalc'] !== 'false' && ex['@_evaluateBeforeListCalc'] !== false,
       affectsChasNotListed: (ex['@_affectsChasNotListed'] as string) ?? '',
-      affectsDataCells: ex['@_affectsDataCells'] === 'true' || ex['@_affectsDataCells'] === true,
+      affectsDataCells: ex['@_affectsDataCells'] !== 'false' && ex['@_affectsDataCells'] !== false,
       description: ((ex['Qry:description'] as Record<string, unknown> | undefined)?.['@_value'] as string) ?? '',
       thresholds,
     };
-    const firstStruc = ex['Qry:definedCellFirstStruc'] as Record<string, unknown> | undefined;
-    const firstMember = firstStruc?.['Qry:member'] as string | undefined;
-    if (firstMember) exception['firstStructureMember'] = firstMember;
-    const secondStruc = ex['Qry:definedCellSecondStruc'] as Record<string, unknown> | undefined;
-    const secondMember = secondStruc?.['Qry:member'] as string | undefined;
-    if (secondMember) exception['secondStructureMember'] = secondMember;
+    const scope: [string, string][] = [
+      ['definedOnFirstStructure', 'Qry:definedCellFirstStruc'],
+      ['definedOnSecondStructure', 'Qry:definedCellSecondStruc'],
+      ['shownOnFirstStructure', 'Qry:dataCellFirstStruc'],
+      ['shownOnSecondStructure', 'Qry:dataCellSecondStruc'],
+    ];
+    for (const [key, tag] of scope) {
+      const cell = cellMode(tag);
+      if (cell) exception[key] = cell;
+    }
     return exception;
   });
 
@@ -1107,9 +1138,24 @@ export function parseQueryDocument(
       collectMembers(ensureArray(n['Qry:childMembers']) as Record<string, unknown>[]);
     }
   };
-  if (hasCellDefinitions) {
+  if (hasCellDefinitions || exceptions.length > 0) {
     for (const axis of [...ensureArray(mainComp['Qry:rows']), ...ensureArray(mainComp['Qry:columns'])] as Record<string, unknown>[]) {
       if (axis['@_xsi:type'] === 'Qry:CustomDimension') collectMembers(ensureArray(axis['Qry:members']) as Record<string, unknown>[]);
+    }
+  }
+  const structureAxes = ([...ensureArray(mainComp['Qry:rows']), ...ensureArray(mainComp['Qry:columns'])] as Record<string, unknown>[])
+    .filter((a) => a['@_xsi:type'] === 'Qry:CustomDimension');
+  const firstStructureIdx = Math.max(0, structureAxes.findIndex((a) => a['@_id'] === mainComp['@_firstCustomDimension']));
+  const structureName = (a: Record<string, unknown> | undefined) =>
+    ((a?.['Qry:description'] as Record<string, unknown> | undefined)?.['@_value'] as string) ?? '';
+  const firstStructureName = structureName(structureAxes[firstStructureIdx]);
+  const secondStructureName = structureName(structureAxes.find((_, i) => i !== firstStructureIdx));
+  for (const ex of exceptions) {
+    ex['firstStructure'] = firstStructureName;
+    if (secondStructureName) ex['secondStructure'] = secondStructureName;
+    for (const key of ['definedOnFirstStructure', 'definedOnSecondStructure', 'shownOnFirstStructure', 'shownOnSecondStructure']) {
+      const cell = ex[key] as { member?: string; memberDescription?: string } | undefined;
+      if (cell?.member) cell.memberDescription = structureMemberNames.get(cell.member) ?? '';
     }
   }
   const cellDescription = (c: Record<string, unknown>) =>

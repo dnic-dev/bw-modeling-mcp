@@ -5,6 +5,8 @@
 ### Added
 
 - **Navigation attributes on a CompositeProvider** — `bw_update_composite_provider` action `update_navigation_attributes` switches navigation attributes of one InfoObject-bound field on or off, as the modeling tools do. Only navigation attributes of the field's InfoObject are accepted; an unknown name is refused with the offered ones listed. In a union every part provider that supplies the field must deliver the attribute as well, so the result names the parts that cannot, before activation refuses them. `bw_get_composite_provider` lists the navigation attributes switched on per field.
+- **The characteristic structure of a query can be created, and holds formulas** — `bw_update_query_key_figures` with `structure: "characteristics"` takes `add_structure`, which creates the second structure of a query in the rows or columns, at a position next to the characteristics and the key figure structure there. `add_formula` now works in that structure too, so a comparison of two selections gets its delta and percentage columns, and `add_selection` and `add_formula` take a `position` there.
+- **Exceptions of a query can be created, changed and removed** — `bw_update_query_exceptions` writes the exceptions that colour data cells: thresholds per alert level with a fixed value or a formula variable, the members of each structure the exception is evaluated on (or all elements), the cells that show the alert, and whether it is active and evaluated before calculations. `for_each_member` creates one exception per key figure in one call. `bw_get_query` now shows per exception whether it is active, its thresholds including variables, and the members it is evaluated and shown on by name.
 
 ### Fixed
 
