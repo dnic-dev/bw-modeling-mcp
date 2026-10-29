@@ -476,11 +476,11 @@ export interface UpdateInfoObjectArgs {
  * Flow:
  * 1. Lock (update — no activity_context)
  * 2. GET /iobj/{name}/m → current XML + timestamp
- * 3. For each attribute: GET /iobj/{attr}/a → description, shortDescription, dataType, length
+ * 3. Keep unchanged attributes; for new or retyped ones GET /iobj/{attr}/a → description,
+ *    shortDescription, dataType, length
  * 4. Remove all existing <attributeN .../> elements
- * 5. Remove existing <hanaAttributeMapping type="02"> block
- * 6. Insert new <attributeN> elements before <externalSAPHANAView>
- * 7. If attributes present: insert <hanaAttributeMapping type="02"> before type="03"
+ * 5. Remove the <hanaAttributeMapping type="02"> blocks of dropped attributes
+ * 6. Insert the <attributeN> elements before <runtimeProperties>
  * 8. PUT full XML with timestamp
  * 9. Activate + Unlock (unlock in finally)
  */
@@ -545,13 +545,28 @@ export async function bwUpdateInfoObject(
       });
     }
 
-    // Step 3: Fetch referenced InfoObject properties for each attribute
+    // Step 3: Build the attribute elements. An attribute that stays with the same type is kept
+    // as the server serves it (BWMT does the same); a new one, or one whose type changes, is
+    // written in the form BWMT uses for a new attribute — for NAV too, the server derives the
+    // navigation properties itself on activation.
+    const existingAttributes = new Map(
+      [...xml.matchAll(/<attributeN\b[^>]*\/>/g)].map((m) => [m[0].match(/\bname="([^"]+)"/)?.[1] ?? '', m[0]])
+    );
     const attrXmlParts: string[] = [];
-    const sourceFieldParts: string[] = [];
 
     for (const attr of attributes) {
       const attrUpper = attr.name.toUpperCase();
       const attrLower = attr.name.toLowerCase();
+
+      const existing = existingAttributes.get(attrUpper);
+      const overridden =
+        attr.displayInQuery !== undefined ||
+        attr.useTextOfOriginalCharacteristic !== undefined ||
+        attr.timeDependent !== undefined;
+      if (existing && existing.match(/\btype="([^"]+)"/)?.[1] === attr.type && !overridden) {
+        attrXmlParts.push(existing.replace(/\bref="[^"]*"/, `ref="${attrUpper}.iobj#//"`));
+        continue;
+      }
 
       const attrGet = await freshClient.get(`/sap/bw/modeling/iobj/${bwSeg(attrLower)}/a`, MEDIA_TYPES['iobj']);
       const attrXml = attrGet.body;
@@ -562,49 +577,24 @@ export async function bwUpdateInfoObject(
 
       const displayInQuery = attr.displayInQuery ?? true;
       const useTextOfOrig = attr.useTextOfOriginalCharacteristic ?? true;
-      const ref = `../../${attrLower}/a/model.iobj#//`;
-
-      if (attr.type === 'NAV') {
-        const timeDependent = attr.timeDependent ?? false;
-        attrXmlParts.push(
-          `<attributeN` +
-          ` description="${description}"` +
-          ` infoObjectType="CHA"` +
-          ` name="${attrUpper}"` +
-          ` ref="${ref}"` +
-          ` shortDescription="${shortDescription}"` +
-          ` calculationScenarioNavigationAttribute="true"` +
-          ` dataType="${props.dataType}"` +
-          ` displayInQuery="${displayInQuery}"` +
-          ` f4HelpOrder="0"` +
-          ` length="${props.length}"` +
-          (timeDependent ? ` timeDependent="true"` : '') +
-          ` type="NAV"` +
-          ` useTextOfOriginalCharacteristic="${useTextOfOrig}"/>`
-        );
-      } else {
-        attrXmlParts.push(
-          `<attributeN` +
-          ` description="${description}"` +
-          ` infoObjectType="CHA"` +
-          ` name="${attrUpper}"` +
-          ` ref="${ref}"` +
-          ` shortDescription="${shortDescription}"` +
-          ` dataType="${props.dataType}"` +
-          ` displayInQuery="${displayInQuery}"` +
-          ` f4HelpOrder="0"` +
-          ` hasAttributes="false"` +
-          ` length="${props.length}"` +
-          ` partOfIndex="false"` +
-          ` sidKeyFigure="false"` +
-          ` type="DIS"` +
-          ` useTextOfOriginalCharacteristic="${useTextOfOrig}"/>`
-        );
-      }
-
-      sourceFieldParts.push(
-        `<sourceField description="${description}" infoObjectType="CHA"` +
-        ` name="${attrUpper}" shortDescription="${shortDescription}"/>`
+      const timeDependent = attr.type === 'NAV' && (attr.timeDependent ?? false);
+      attrXmlParts.push(
+        `<attributeN` +
+        ` description="${description}"` +
+        ` infoObjectType="CHA"` +
+        ` name="${attrUpper}"` +
+        ` ref="../../${attrLower}/a/model.iobj#//"` +
+        ` shortDescription="${shortDescription}"` +
+        ` dataType="${props.dataType}"` +
+        ` displayInQuery="${displayInQuery}"` +
+        ` f4HelpOrder="0"` +
+        ` hasAttributes="false"` +
+        ` length="${props.length}"` +
+        ` partOfIndex="false"` +
+        ` sidKeyFigure="false"` +
+        (timeDependent ? ` timeDependent="true"` : '') +
+        ` type="${attr.type}"` +
+        ` useTextOfOriginalCharacteristic="${useTextOfOrig}"/>`
       );
     }
 
@@ -612,26 +602,20 @@ export async function bwUpdateInfoObject(
       // Step 4: Remove all existing <attributeN .../> self-closing elements
       xml = xml.replace(/\s*<attributeN\b[^>]*\/>/g, '');
 
-      // Step 5: Remove existing hanaAttributeMapping type="02" block — only when rebuilding
-      // with new attributes. When removing all attributes (empty list), SAP cleans up
-      // hanaAttributeMapping type="02" automatically on activation.
-      if (attrXmlParts.length > 0) {
-        xml = xml.replace(/\s*<hanaAttributeMapping type="02">[\s\S]*?<\/hanaAttributeMapping>/g, '');
-      }
+      // Step 5: The server keeps one hanaAttributeMapping type="02" block per attribute and
+      // adds the blocks of new attributes itself on activation, as BWMT relies on. A single
+      // block listing several attributes, as this tool used to write, fails the save; only
+      // the blocks of dropped attributes are removed here.
+      const kept = new Set(attributes.map((a) => a.name.toUpperCase()));
+      xml = xml.replace(/\s*<hanaAttributeMapping type="02">([\s\S]*?)<\/hanaAttributeMapping>/g, (block, body: string) => {
+        const name = body.match(/<sourceField\b[^>]*\bname="([^"]+)"/)?.[1];
+        return name && kept.has(name) ? block : '';
+      });
 
       // Step 6: Insert new attributeN elements before <runtimeProperties
       if (attrXmlParts.length > 0) {
         const attrBlock = attrXmlParts.join('\n') + '\n';
         xml = xml.replace(/(<runtimeProperties)/, attrBlock + '$1');
-      }
-
-      // Step 7: Insert hanaAttributeMapping type="02" before type="03" if attributes present
-      if (sourceFieldParts.length > 0) {
-        const hanaMappingBlock =
-          `<hanaAttributeMapping type="02">\n` +
-          sourceFieldParts.join('\n') + '\n' +
-          `</hanaAttributeMapping>\n`;
-        xml = xml.replace('<hanaAttributeMapping type="03">', hanaMappingBlock + '<hanaAttributeMapping type="03">');
       }
     }
 

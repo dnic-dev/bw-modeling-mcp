@@ -1,5 +1,17 @@
 # Changelog
 
+## [Unreleased]
+
+### Added
+
+- **Navigation attributes on a CompositeProvider** — `bw_update_composite_provider` action `update_navigation_attributes` switches navigation attributes of one InfoObject-bound field on or off, as the modeling tools do. Only navigation attributes of the field's InfoObject are accepted; an unknown name is refused with the offered ones listed. In a union every part provider that supplies the field must deliver the attribute as well, so the result names the parts that cannot, before activation refuses them. `bw_get_composite_provider` lists the navigation attributes switched on per field.
+
+### Fixed
+
+- **A characteristic with more than one attribute could not be saved** — `bw_update_infoobject` failed with "resource could not be saved" as soon as the attribute list held two or more entries. Attributes that stay as they are are now kept unchanged, new ones are written in the form the modeling tools use, and the HANA attribute mapping is left to the server.
+- **Source providers with field groups** — `add_input` and `update_mapping` did not find the InfoObject-based fields of a source with field groups (an aDSO with field groups, an aggregation level on it) and reported only the technical fields as available.
+- **Auto-mapping took over reserved fields** — mapping every field of an aggregation level or a CompositeProvider one to one also mapped the request fields, the InfoProvider characteristic and navigation attributes of the source, and activation refused them. They are now left out like the other technical fields.
+
 ## [1.9.0] — 2026-10-28
 
 ### Added

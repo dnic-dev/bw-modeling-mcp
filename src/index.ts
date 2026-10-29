@@ -58,6 +58,7 @@ import {
   bwUpdateCompositeProviderSettings,
   bwUpdateCompositeProviderFields,
   bwUpdateCompositeProviderGroup,
+  bwUpdateCompositeProviderNavigationAttributes,
   NameUsage,
 } from './tools/composite_provider.js';
 import { bwUpdateCompositeProvider, CompositeProviderFieldAction } from './tools/composite_provider_update.js';
@@ -3391,7 +3392,8 @@ const TOOL_DEFINITIONS = [
       description:
         'Read a CompositeProvider (HCPR) structure — general info, view node type (Union/Join), ' +
         'source providers (inputs) with mapping counts, fields with their field group (dimension) and, for InfoObject-bound fields, ' +
-        'their name usage ("direct" or "unique_name" — a query finds a "unique_name" field only under "<prefix>-<FIELD>"), ' +
+        'their name usage ("direct" or "unique_name" — a query finds a "unique_name" field only under "<prefix>-<FIELD>") ' +
+        'and the navigation attributes switched on ("<FIELD_IOBJ>__<ATTR_NAME>"), ' +
         'the declared field groups, join condition, and temporal join details. Returns the inactive version.',
       inputSchema: {
         type: 'object',
@@ -3414,6 +3416,7 @@ const TOOL_DEFINITIONS = [
         'Mappings: "update_mapping" replaces the complete mapping list of one input; pass no mappings to map every field of its source one to one. This is also how an input attached at creation time gets its mappings. ' +
         'Joins: "update_join" sets the condition between one pair of inputs — call it once per pair to build an N-way join — and "remove_join" drops one pair. Note that both sides of a join key must be mapped onto the SAME target field, otherwise activation fails with "join fields need at least one common target field"; auto-mapping does not do this, so map the second side\'s key fields explicitly. ' +
         'Field groups and name usage: every field the tool creates goes into a field group (CHARACTERISTICS or KEYFIGURES unless dimension names another) and, when it is named after its InfoObject, uses that InfoObject directly by name — the form a query needs to find it. "update_fields" moves existing fields into a group and/or switches their name usage; "update_group" creates a group, changes its label or renames it. ' +
+        'Navigation attributes: "update_navigation_attributes" switches navigation attributes of one InfoObject-bound field on or off. In a union every part provider that supplies the field must deliver the attribute too: an aDSO does, an aggregation level or another CompositeProvider only when it lists the attribute as a field; the result warns about parts that cannot. ' +
         'Settings: "update_settings" edits label, stackable, default node and aggregation behaviour.',
       inputSchema: {
         type: 'object',
@@ -3426,13 +3429,27 @@ const TOOL_DEFINITIONS = [
             type: 'string',
             enum: [
               'add_field', 'remove_field', 'add_input', 'remove_input',
-              'update_mapping', 'update_join', 'remove_join', 'update_fields', 'update_group', 'update_settings',
+              'update_mapping', 'update_join', 'remove_join', 'update_fields', 'update_group',
+              'update_navigation_attributes', 'update_settings',
             ],
             description: 'Defaults to "add_field".',
           },
           info_object_name: {
             type: 'string',
-            description: 'add_field / remove_field / update_fields: field name or comma-separated list (e.g. "IOBJ_NAME" or "IOBJ_A,IOBJ_B").',
+            description:
+              'add_field / remove_field / update_fields: field name or comma-separated list (e.g. "IOBJ_NAME" or "IOBJ_A,IOBJ_B"). ' +
+              'update_navigation_attributes: the one field whose navigation attributes change.',
+          },
+          navigation_attributes: {
+            type: 'array',
+            items: { type: 'string' },
+            description:
+              'update_navigation_attributes: attributes to switch, by attribute name ("ATTR_NAME") or as "<FIELD_IOBJ>__<ATTR_NAME>". ' +
+              'Only navigation attributes of the InfoObject behind the field qualify; an unknown name is refused with the offered ones listed.',
+          },
+          enabled: {
+            type: 'boolean',
+            description: 'update_navigation_attributes: true (default) switches the attributes on, false switches them off.',
           },
           name_usage: {
             type: 'string',
@@ -7185,6 +7202,15 @@ async function handleToolCall(
               newName: args?.new_dimension_name as string | undefined,
               transport: cpTransport,
             });
+            break;
+          case 'update_navigation_attributes':
+            text = await bwUpdateCompositeProviderNavigationAttributes(
+              client,
+              cpName,
+              args?.info_object_name as string,
+              (args?.navigation_attributes as string[] | undefined) ?? [],
+              { enabled: args?.enabled as boolean | undefined, transport: cpTransport },
+            );
             break;
           case 'add_input':
             text = await bwUpdateCompositeProviderInput(client, cpName, 'add_input', {

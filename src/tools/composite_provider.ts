@@ -1,5 +1,6 @@
 import {
   BwClient,
+  MEDIA_TYPES,
   decodeXmlEntities,
   freshRead,
   bwSeg,
@@ -196,12 +197,14 @@ export async function bwGetCompositeProvider(
       /<localProperties\b[^>]*LocalKeyfigureProperties/.test(elemBody) ||
       dimName.includes('__KEYFIGURES');
     const globalName = attr(compositeInlineType(elemBody), 'globalElementName');
+    const navigationAttributes = elementNavigationAttributes(elemBody);
     fields.push({
       name,
       ...(infoObjectName ? { info_object_name: infoObjectName } : {}),
       ...(infoObjectName ? { name_usage: globalName ? 'direct' : 'unique_name' } : {}),
       dimension: dimName,
       is_key_figure: isKeyFigure,
+      ...(navigationAttributes.length ? { navigation_attributes: navigationAttributes } : {}),
     });
   }
 
@@ -216,6 +219,10 @@ export async function bwGetCompositeProvider(
   }));
   const ungroupedCount = fields.filter((f) => !f['dimension']).length;
   const uniqueNameCount = fields.filter((f) => f['name_usage'] === 'unique_name').length;
+  const navigationAttributeCount = fields.reduce(
+    (n, f) => n + ((f['navigation_attributes'] as string[] | undefined)?.length ?? 0),
+    0
+  );
 
   // Inputs (source providers)
   const inputs: Array<Record<string, unknown>> = [];
@@ -272,6 +279,7 @@ export async function bwGetCompositeProvider(
       ...(ungroupedCount ? { ungrouped_count: ungroupedCount } : {}),
       // A query addresses such a field by "<prefix>-<ELEMENT>", not by its InfoObject name.
       ...(uniqueNameCount ? { unique_name_count: uniqueNameCount } : {}),
+      ...(navigationAttributeCount ? { navigation_attribute_count: navigationAttributeCount } : {}),
       list: fields,
     },
     groups,
@@ -582,7 +590,7 @@ export interface SourceFieldMeta {
   /** Set when the source models this field through an InfoObject rather than a plain field. */
   infoObjectName?: string;
   conversionType?: string;
-  /** A technical element BW maintains itself (marked metaObject on the source). */
+  /** A technical element BW maintains itself (metaObject or a request field on the source). */
   isMetaObject: boolean;
 }
 
@@ -595,10 +603,17 @@ const AUTO_IOBJ_FOR_TYPE: Record<string, string> = { CUKY: '0CURRENCY', UNIT: '0
  * attributes of the generated column view — the record count, the currency/unit dimension —
  * and mapping one as an ordinary element makes activation fail on that view ("… is missing
  * in node …"). BWMT does not offer them either. The source marks them metaObject; the row
- * count is listed by name as well for sources that do not. An explicit mapping still passes
- * through, so the caller can override this.
+ * count is listed by name as well for sources that do not. The request fields an aggregation
+ * level exposes (object type DPA) count as technical too, and so does the InfoProvider
+ * characteristic of a CompositeProvider below: activation refuses both as reserved names.
+ * An explicit mapping still passes through, so the caller can override this.
  */
-const AUTO_MAP_EXCLUDED = new Set(['1ROWCOUNT']);
+const AUTO_MAP_EXCLUDED = new Set(['1ROWCOUNT', '0INFOPROV']);
+
+export function isTechnicalSourceElement(elementBody: string): boolean {
+  const props = elementBody.match(/<consumptionViewProperties\b[^>]*/)?.[0] ?? '';
+  return attr(props, 'metaObject') === 'true' || attr(props, 'objectType') === 'DPA';
+}
 
 // <semantics> is derived from the field's data type and appears only on the CP-level element.
 const SEMANTICS_TAG: Record<string, string> = {
@@ -633,11 +648,14 @@ export async function fetchCompositeSourceFields(
       const sourceInfoObject = attr(elemAttrs, 'infoObjectName');
       // Two source shapes. A field-based provider names its fields "<prefix>-<FIELD>" and
       // marks them with a dimension; an InfoObject-based one names them after the
-      // InfoObject and carries no dimension. Everything else — navigation attributes, and
-      // fields whose name was too long and got hashed into "<prefix>-<hash>" — is not
-      // addressable as an input field.
+      // InfoObject. Those carry no dimension unless the provider has field groups (an aDSO
+      // with field groups, an aggregation level on it): then the group is the dimension.
+      // Everything else — navigation attributes, and fields whose name was too long and got
+      // hashed into "<prefix>-<hash>" — is not addressable as an input field.
       const fieldBased = Boolean(dimension) && name.startsWith(`${fieldNamePrefix}-`);
-      const infoObjectBased = !dimension && Boolean(sourceInfoObject) && name === sourceInfoObject;
+      // A navigation attribute is named "<BASE>__<ATTRIBUTE>" after its InfoObject as well.
+      const infoObjectBased =
+        !fieldBased && Boolean(sourceInfoObject) && name === sourceInfoObject && !name.includes('__');
       if (!name || (!fieldBased && !infoObjectBased)) continue;
 
       const inlineTypeXml = compositeInlineType(body);
@@ -662,7 +680,7 @@ export async function fetchCompositeSourceFields(
           ? unitCurrencyRaw.slice(refPrefix.length)
           : undefined,
         outputLength: outputLengthRaw ? parseInt(outputLengthRaw, 10) : 0,
-        isMetaObject: /<consumptionViewProperties\b[^>]*\bmetaObject="true"/.test(body),
+        isMetaObject: isTechnicalSourceElement(body),
       });
     }
   }
@@ -1355,6 +1373,195 @@ export async function bwUpdateCompositeProviderGroup(
     object_type: 'hcpr',
     group: finalName,
     ...(label ? { label } : {}),
+  });
+}
+
+// ── bw_update_composite_provider: navigation attributes ──────────────────────
+
+/** A navigation attribute the base characteristic offers, as the CompositeProvider names it. */
+export interface NavigationAttributeDef {
+  /** "<BASE>__<ATTRIBUTE>" */
+  name: string;
+  label: string;
+}
+
+/** Navigation attributes switched on for one CompositeProvider element, in model order. */
+export function elementNavigationAttributes(elementXml: string): string[] {
+  return [...elementXml.matchAll(/<navigationAttribute\b[^>]*\binfoObjectName="([^"]+)"/g)].map((m) => m[1]);
+}
+
+/**
+ * The navigation attributes a characteristic offers, keyed by the bare attribute name.
+ * Display attributes are left out: a CompositeProvider can only switch on NAV attributes.
+ */
+export function navigationAttributeCatalog(infoObjectXml: string, baseName: string): Map<string, NavigationAttributeDef> {
+  const catalog = new Map<string, NavigationAttributeDef>();
+  for (const m of infoObjectXml.matchAll(/<attributeN\b([^>]*?)\/?>/g)) {
+    const attrs = m[1];
+    if (attr(attrs, 'type') !== 'NAV') continue;
+    const attribute = attr(attrs, 'name');
+    if (!attribute) continue;
+    catalog.set(attribute, {
+      name: attr(attrs, 'navigationAttributeName') || `${baseName}__${attribute}`,
+      label: decodeXmlEntities(attr(attrs, 'navigationAttributeDescription') || attr(attrs, 'description')),
+    });
+  }
+  return catalog;
+}
+
+/**
+ * Switch navigation attributes on or off in one element block. A navigation attribute is a
+ * `<navigationAttribute>` child of the element, placed after its local properties; the part
+ * providers are not touched.
+ */
+export function withNavigationAttributes(
+  elementXml: string,
+  enable: NavigationAttributeDef[],
+  disable: string[]
+): string {
+  let xml = elementXml.replace(/^(<element\b[^>]*?)\s*\/>$/, '$1></element>');
+  for (const name of disable) {
+    xml = xml.replace(
+      new RegExp(`\\s*<navigationAttribute\\b[^>]*\\binfoObjectName="${escapeRegex(name)}"[^>]*?(?:\\/>|>[\\s\\S]*?<\\/navigationAttribute>)`),
+      ''
+    );
+  }
+  const present = new Set(elementNavigationAttributes(xml));
+  const blocks = enable
+    .filter((a) => !present.has(a.name))
+    .map(
+      (a) =>
+        `<navigationAttribute infoObjectName="${a.name}" infoObjectType="CHA">` +
+        `<descriptions label="${escapeXmlAttr(a.label)}"/></navigationAttribute>`
+    )
+    .join('');
+  if (!blocks) return xml;
+
+  const anchors = [
+    /^[\s\S]*<\/navigationAttribute>/,
+    /^[\s\S]*?(?:<localProperties\b[^>]*\/>|<\/localProperties>)/,
+    /^[\s\S]*?(?=<atom:link\b|<associationType>|<\/element>)/,
+  ];
+  for (const anchor of anchors) {
+    const m = xml.match(anchor);
+    if (m) return m[0] + blocks + xml.slice(m[0].length);
+  }
+  return xml;
+}
+
+/**
+ * Whether a part provider can deliver a navigation attribute. An InfoObject-based provider
+ * such as an aDSO derives every navigation attribute from its characteristics and says so
+ * with virtualNavigationAttributes; any other source must list the attribute as a field.
+ */
+export function sourceSupportsNavigationAttribute(sourceViewXml: string, navigationAttribute: string): boolean {
+  const root = sourceViewXml.match(/<Composite:infoprovider\b[^>]*/)?.[0] ?? '';
+  if (attr(root, 'virtualNavigationAttributes') === 'true') return true;
+  const escaped = escapeRegex(navigationAttribute);
+  return new RegExp(`<element\\b[^>]*\\b(?:name|infoObjectName)="(?:[^"]*-)?${escaped}"`).test(sourceViewXml);
+}
+
+/**
+ * bw_update_composite_provider action "update_navigation_attributes" — switch navigation
+ * attributes of one InfoObject-bound field on or off.
+ */
+export async function bwUpdateCompositeProviderNavigationAttributes(
+  client: BwClient,
+  compositeProviderName: string,
+  fieldName: string,
+  attributes: string[],
+  opts: { enabled?: boolean; transport?: string }
+): Promise<string> {
+  const cpUpper = compositeProviderName.toUpperCase();
+  const field = fieldName?.trim().toUpperCase();
+  const enabled = opts.enabled ?? true;
+  if (!field || field.includes(',')) {
+    throw new Error('update_navigation_attributes requires info_object_name: exactly one field of the CompositeProvider.');
+  }
+  if (attributes.length === 0) {
+    throw new Error('update_navigation_attributes requires navigation_attributes (one or more attribute names).');
+  }
+
+  const cpResult = await freshRead(HCPR_PATH(compositeProviderName), HCPR_ACCEPT);
+  const timestamp = cpResult.headers['timestamp'] ?? cpResult.headers['TIMESTAMP'];
+  let xml = cpResult.body;
+
+  const element = findViewElement(xml, field);
+  if (!element) throw new Error(`${field} is not a field of CompositeProvider ${cpUpper}.`);
+  const base = attr(element.match(/^<element\b[^>]*/)?.[0] ?? '', 'infoObjectName');
+  if (!base) throw new Error(`${field} is a plain field without an InfoObject, so it has no navigation attributes.`);
+
+  const iobjXml = (await freshRead(`/sap/bw/modeling/iobj/${bwSeg(base)}/a`, MEDIA_TYPES['iobj'])).body;
+  const catalog = navigationAttributeCatalog(iobjXml, base);
+  const byFullName = new Map([...catalog.values()].map((a) => [a.name, a]));
+
+  const requested: NavigationAttributeDef[] = [];
+  const unknown: string[] = [];
+  for (const raw of attributes) {
+    const name = raw.trim().toUpperCase();
+    const def = byFullName.get(name) ?? catalog.get(name.startsWith(`${base}__`) ? name.slice(base.length + 2) : name);
+    if (def) requested.push(def);
+    else unknown.push(name);
+  }
+  if (unknown.length) {
+    const offered = [...catalog.values()].map((a) => a.name);
+    throw new Error(
+      `${unknown.join(', ')} ${unknown.length === 1 ? 'is not a navigation attribute' : 'are not navigation attributes'} of ${base}. ` +
+      (offered.length ? `It offers: ${offered.join(', ')}.` : `${base} has no navigation attributes.`)
+    );
+  }
+
+  const before = new Set(elementNavigationAttributes(element));
+  const changed = requested.filter((a) => before.has(a.name) !== enabled).map((a) => a.name);
+  const unchanged = requested.filter((a) => before.has(a.name) === enabled).map((a) => a.name);
+  if (changed.length === 0) {
+    return JSON.stringify({
+      success: false,
+      message: `Nothing to change: ${unchanged.join(', ')} already ${enabled ? 'on' : 'off'} for ${field} in CompositeProvider ${cpUpper}.`,
+    });
+  }
+
+  // In a union every part that supplies the field must deliver the attribute as well,
+  // otherwise activation refuses it; say so before the round trip to activation does.
+  const unsupported: Array<{ input_alias: string; provider: string; navigation_attributes: string[] }> = [];
+  if (enabled) {
+    const viewNode = xml.match(/<viewNode\b[\s\S]*?<\/viewNode>/)?.[0] ?? '';
+    for (const im of viewNode.matchAll(/<input\b([^>]*)>([\s\S]*?)<\/input>/g)) {
+      const mapsField = new RegExp(`<mapping\\b[^>]*\\btargetName="${escapeRegex(field)}"`).test(im[2]);
+      const provider = extractProviderNameFromInput(im[2]);
+      if (!mapsField || !provider) continue;
+      const sourceXml = (await freshRead(`/sap/bw/modeling/infoprov/${bwSegUpper(provider)}/a?view=dt`, IPROV_ACCEPT)).body;
+      const missing = changed.filter((n) => !sourceSupportsNavigationAttribute(sourceXml, n));
+      if (missing.length) unsupported.push({ input_alias: attr(im[1], 'alias'), provider, navigation_attributes: missing });
+    }
+  }
+
+  const newElement = enabled
+    ? withNavigationAttributes(element, requested.filter((a) => changed.includes(a.name)), [])
+    : withNavigationAttributes(element, [], changed);
+  xml = xml.replace(element, () => newElement);
+  const lockHandle = await putModel(client, compositeProviderName, xml, timestamp, opts.transport);
+
+  return JSON.stringify({
+    success: true,
+    message:
+      `Navigation attribute(s) ${changed.join(', ')} switched ${enabled ? 'on' : 'off'} for ${field} in CompositeProvider ${cpUpper}. ` +
+      'Call bw_activate to activate.',
+    lock_handle: lockHandle,
+    composite_provider_name: cpUpper,
+    object_type: 'hcpr',
+    field,
+    navigation_attributes: elementNavigationAttributes(newElement),
+    ...(unchanged.length ? { unchanged } : {}),
+    ...(unsupported.length
+      ? {
+          warning:
+            'These part providers supply the field but cannot deliver the navigation attribute; activation will fail ' +
+            'until they can (for example through a CompositeProvider in between that has the attribute switched on) ' +
+            'or the field is no longer mapped from them.',
+          unsupported_parts: unsupported,
+        }
+      : {}),
   });
 }
 
