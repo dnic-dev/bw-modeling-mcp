@@ -141,6 +141,7 @@ payloads/
 playbooks/
 notes/
 docs/plans/
+xs-security.*.json
 tests/
 poc/
 .claude/

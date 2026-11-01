@@ -148,8 +148,16 @@ From the repository root, create the three BTP service instances the app binds t
 XSUAA instance is configured from the repo's `xs-security.json` (scopes and role
 collections).
 
+XSUAA redirects only to this server's own `/oauth/callback`, so its `redirect-uris` list
+holds exactly that one URL. The repository's file lists a local development callback.
+Copy it to a deployment-specific file (for example `xs-security.deploy.json`) and replace
+that entry with `https://<app-route>/oauth/callback`. Leave MCP client addresses and
+wildcard domains out; the server checks client return addresses itself. The app route is
+`<app-name>.cfapps.<region>.hana.ondemand.com` unless you map your own — reserve it
+before creating the service, or create the service now and update it after the first push.
+
 ```bash
-cf create-service xsuaa        application bwmcp-xsuaa       -c xs-security.json
+cf create-service xsuaa        application bwmcp-xsuaa       -c xs-security.deploy.json
 cf create-service destination  lite        bwmcp-destination
 cf create-service connectivity lite        bwmcp-connectivity   # on-premise BW only
 ```
@@ -162,8 +170,11 @@ The XSUAA instance keeps the scopes it was created with. When a newer version ch
 because the app advertises a scope the instance does not know:
 
 ```bash
-cf update-service bwmcp-xsuaa -c xs-security.json
+cf update-service bwmcp-xsuaa -c xs-security.deploy.json
 ```
+
+Bring the changed scopes or role templates from `xs-security.json` into your deployment
+file first, and keep its exact callback.
 
 ---
 

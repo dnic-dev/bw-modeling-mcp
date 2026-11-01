@@ -61,7 +61,36 @@ A two-part blog series about this project (both available in German and English)
 
 ---
 
-## 🆕 What's New — v1.9.0 · Analysis for Office Workbooks
+## 🆕 What's New — v1.9.1 · Secure Sign-in on SAP BTP
+
+**🔒 Security fix for hosted servers.** On SAP BTP, a client that registered itself could
+complete the sign-in of a user who was already logged in through SSO without that user's
+approval ([GHSA-6935-r3wv-f646](https://github.com/arc-mcp/arc-1/security/advisories/GHSA-6935-r3wv-f646)).
+Every new sign-in now shows an approval page with the client's name and return address.
+Local use over stdio is not affected. **If you host the server, update the XSUAA instance
+as well as the app** — `xs-security.json` now holds only the server's exact callback; see
+[docs/CLOUD-FOUNDRY.md](docs/CLOUD-FOUNDRY.md). Thanks to @marianfoo (#49).
+
+### On every release (BW/4HANA and BW 7.5)
+
+**📐 Query design, continued**
+
+- New `bw_update_query_exceptions` — creates, changes and removes the exceptions that colour
+  data cells: thresholds per alert level, fixed or by formula variable, the members they are
+  evaluated on and the cells that show the alert; `for_each_member` creates one per key figure
+- The characteristic structure of a query can now be created, and holds formulas — a
+  comparison of two selections gets its delta and percentage columns in one call
+
+### Also in this release
+
+- `bw_update_composite_provider` switches navigation attributes of a field on or off, and
+  names the union parts that cannot deliver them before activation refuses them
+- Fixed: saving a characteristic with more than one attribute, source fields of providers
+  with field groups, and auto-mapping of reserved fields; dependency advisories cleared
+
+---
+
+## What's New — v1.9.0 · Analysis for Office Workbooks
 
 The workbooks your planners and controllers actually work in are now within reach of the
 agent: find them, see what they depend on, take one out of BW, change it, and put it back
@@ -199,7 +228,7 @@ Thanks to @MWKAnalytics and @oliverluette for the analyses behind #44, #45 and #
 
 ## What it can do
 
-An overview by area. Every tool in detail — parameters, behaviour, and the sequences it belongs in — is in the **[Tools Reference](TOOLS.md)** (129 tools).
+An overview by area. Every tool in detail — parameters, behaviour, and the sequences it belongs in — is in the **[Tools Reference](TOOLS.md)** (130 tools).
 
 <p align="center">
   <picture>
@@ -224,7 +253,7 @@ The ADT MCP server covers ABAP as a subject in its own right: your own reports, 
 ## Requirements
 
 - SAP BW/4HANA system with the internal SAP APIs enabled (SAP BW 7.5 works for modeling reads and most modelling writes once the enhancement in [bw75/BW75-SUPPORT.md](bw75/BW75-SUPPORT.md) is in place)
-- Node.js 18 or later
+- Node.js 22 or later
 - An MCP-compatible AI client (Claude Desktop, Claude Code, etc.)
 
 ---

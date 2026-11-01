@@ -1,6 +1,6 @@
 # Changelog
 
-## [Unreleased]
+## [1.9.1] — 2026-11-01
 
 ### Added
 
@@ -10,9 +10,15 @@
 
 ### Fixed
 
+- **Sign-in on a hosted server could be completed without the user's approval (security)** — over HTTP with XSUAA, a client that registered itself could take a user who was already signed in through SSO through the whole authorization without that user ever agreeing to it, and receive a token acting as that user ([GHSA-6935-r3wv-f646](https://github.com/arc-mcp/arc-1/security/advisories/GHSA-6935-r3wv-f646)). Every new authorization now shows an approval page with the client's name and return address before the XSUAA login, binds the callback to the browser that approved it, and binds the authorization code to the client and its return address. Token refresh and reconnect do not ask again. stdio is not affected. `@arc-mcp/xsuaa-auth` is now required at 1.2.0 or later, and Node.js 22 is the stated minimum, as `engines` already declared. Verified with a local sign-in regression (approve, deny, callback without the approving browser) that fails on the previous version, and on SAP BTP on a BW/4HANA instance with principal propagation and a BW 7.5 instance: the approval page, sign-in with an existing SSO session, reads, and a query sent as POST. Thanks to @marianfoo for the analysis in #49.
+- **Dependency advisories** — high-severity advisories in transitive dependencies of the HTTP and MCP stack (among them `body-parser`, `follow-redirects`, `node-forge` and `zod`) are cleared by updates within their version ranges.
 - **A characteristic with more than one attribute could not be saved** — `bw_update_infoobject` failed with "resource could not be saved" as soon as the attribute list held two or more entries. Attributes that stay as they are are now kept unchanged, new ones are written in the form the modeling tools use, and the HANA attribute mapping is left to the server.
 - **Source providers with field groups** — `add_input` and `update_mapping` did not find the InfoObject-based fields of a source with field groups (an aDSO with field groups, an aggregation level on it) and reported only the technical fields as available.
 - **Auto-mapping took over reserved fields** — mapping every field of an aggregation level or a CompositeProvider one to one also mapped the request fields, the InfoProvider characteristic and navigation attributes of the source, and activation refused them. They are now left out like the other technical fields.
+
+### Notes
+
+- **Hosted deployments: update the XSUAA instance, not only the app.** `xs-security.json` no longer lists wildcard domains or client addresses in `redirect-uris`, only a local development callback. Copy it to a deployment file, put in the exact `https://<app-route>/oauth/callback`, and run `cf update-service` with it; a push alone keeps the old list. Upgrade every instance, restart sign-ins that were in progress, and use one public URL for all clients. Tokens issued before the upgrade stay valid until they expire; if misuse is suspected, revoke them in XSUAA. See [docs/CLOUD-FOUNDRY.md](docs/CLOUD-FOUNDRY.md).
 
 ## [1.9.0] — 2026-10-28
 

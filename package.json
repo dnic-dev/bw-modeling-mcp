@@ -1,6 +1,6 @@
 {
   "name": "bw-modeling-mcp",
-  "version": "1.9.0",
+  "version": "1.9.1",
   "description": "MCP server for agentic AI-assisted development in SAP BW/4HANA",
   "type": "module",
   "main": "dist/index.js",
@@ -37,7 +37,7 @@
     "test": "node --test tests/*.test.mjs"
   },
   "dependencies": {
-    "@arc-mcp/xsuaa-auth": "^1.0.0",
+    "@arc-mcp/xsuaa-auth": "^1.2.0",
     "@modelcontextprotocol/sdk": "^1.29.0",
     "axios": "^1.7.0",
     "express": "^5.2.1",

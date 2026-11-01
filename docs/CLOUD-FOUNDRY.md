@@ -50,6 +50,13 @@ per-user control, which is worth weighing when handing out **BW MCP Developer**.
 
 ## 2. Deploy
 
+XSUAA only ever redirects to this server's own `/oauth/callback`, which then forwards to
+the client. Its `redirect-uris` list must therefore hold exactly that URL and nothing else:
+no wildcard domains and no MCP client addresses. The repository's `xs-security.json` lists
+a local development callback; copy it to a deployment-specific file and replace that entry
+with `https://<app-route>/oauth/callback` before creating or updating the service. Use that
+file wherever `xs-security.json` appears below.
+
 ```bash
 cf create-service xsuaa        application bwmcp-xsuaa -c xs-security.json
 cf create-service destination  lite        bwmcp-destination
@@ -70,6 +77,14 @@ a custom IAS tenant that is `sap.custom`, not `sap.default`. The wrong one fails
 Point an MCP client at `https://<app-route>/mcp`. OAuth is discoverable, so that URL is
 all a client needs: it finds the authorization server, registers itself, and sends the
 user through the normal browser login.
+
+Every new authorization first shows an approval page with the client's name and return
+address, also when the user is already signed in through SSO. The name is chosen by the
+client itself, so the return address is what to check; approve only a sign-in you started.
+A token refresh or reconnect does not ask again. Keep one public URL for all clients: the
+approval is bound to a cookie on that origin, and a proxy in front of the app must pass
+`Cookie`, `Set-Cookie` and `Origin` through unchanged. When the app runs on several
+instances, upgrade all of them together and restart any sign-in that was in progress.
 
 ## 3. Principal propagation
 
@@ -146,8 +161,10 @@ SNC is not involved — that is the RFC propagation path, not HTTPS.
 | `502 Could not connect to BW` | destination lookup or propagation failed | the message says which; check the destination name and binding |
 | 401 + basic-auth popup; ICM trace `intermediary is NOT trusted` | ICM stripped `SSL_CLIENT_CERT` | step 9 — missing, mistyped, lowercase keyword, wrong spacing, or both variants set |
 | `403 Access denied to resource … expose the resource correctly in your cloud connector` | path not exposed | step 7 — a Cloud Connector message, not an authorization failure |
-| `invalid_scope` at login, message `<xsappname>.<scope> is invalid` | the XSUAA instance predates a scope the app advertises — `xs-security.json` changed, the instance was not updated | `cf update-service bwmcp-xsuaa -c xs-security.json`, then log in again |
+| `invalid_scope` at login, message `<xsappname>.<scope> is invalid` | the XSUAA instance predates a scope the app advertises — `xs-security.json` changed, the instance was not updated | `cf update-service bwmcp-xsuaa -c <deployment file>` with the exact callback kept in it, then log in again |
 | `Malformed redirect URIs detected … [vscode://…, cursor://…]` on `create-service` / `update-service` | an older copy of `xs-security.json` lists IDE schemes, which XSUAA rejects as a whole | remove both entries and run the command again. They are not needed: XSUAA only ever redirects to this server's own `/oauth/callback`, which then forwards to the client |
+| XSUAA refuses the login with a redirect URI error | the instance's `redirect-uris` does not hold this server's exact `https://<app-route>/oauth/callback` — the repository's local example was applied as is, or the route changed | put the exact callback into the deployment file and run `cf update-service` again. Do not widen the list with wildcards or client addresses |
+| Approval page comes back, or the callback answers `400` after approving | the browser reached the app under a second route or custom domain, or a proxy dropped `Cookie`/`Origin` | use the one public URL everywhere; restart the sign-in from the client |
 | `invalid_scope` at login, no scope named | role collection assigned under the wrong identity provider | re-assign with the right `--of-idp` |
 | First call takes ~70 s | BW initializes each ICF handler on first use | expected; sub-second afterwards. `/health` does not touch BW |
 
