@@ -8,6 +8,11 @@
 
 - **Key figures with a variable unit or currency** — `bw_create_infoobject` and `bw_update_infoobject` take `unit_currency_infoobject`, the unit characteristic that supplies the currency of an amount or the unit of a quantity per record. Before, an amount or quantity key figure could only be given a fixed currency or unit, so one carrying several currencies could not be created at all: without either, activation fails. The parameter excludes `fixed_unit`/`fixed_currency`, and on update it replaces a fixed one. Verified on BW/4HANA by creating, activating and reading back amount and quantity key figures, and by loading them through a transformation.
 
+### Fixed
+
+- **A transformation with a combined quantity + unit rule could no longer be changed** — once `bw_update_transformation` had mapped a quantity together with its unit (`unit_source_field`) and the unit InfoObject had a conversion routine, every later save of that transformation failed with HTTP 500 (short dump `CONVT_OVERFLOW` in `SET_UNIT_STEP`), even one that only changed the aggregation of another rule (#51). BW serves the unit target of such a rule with `performConversionExit`, but cannot read the attribute back. It is now left out of every transformation the tools save; BW derives it again from the InfoObject. A transformation already in this state can be changed again with the tools. Verified on BW/4HANA: combined quantity + unit rule first, activation, then an aggregation change, a combined amount + currency rule and another activation.
+- **An aggregation BW does not allow was reported as set** — `bw_update_transformation` with `aggregation` reported `MIN` or `MAX` as saved for a key figure that sums up, while BW kept the previous value without a message. The aggregations BW offers are now checked first: overwrite, no aggregation and the key figure's own aggregation, and no overwrite into a data mart DataStore object. Any other value is refused with the possible ones and nothing is saved. Verified on BW/4HANA: `MAX` on a summing key figure is refused, `SUM` and `MOV` are saved and activated.
+
 ## [1.9.1] — 2026-11-01
 
 ### Added

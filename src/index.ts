@@ -1152,8 +1152,11 @@ const TOOL_DEFINITIONS = [
               'Aggregation type of the rule on a target key figure: "SUM" (summation), "MOV" (overwrite), "MIN", "MAX" ' +
               'or "NOP" (no aggregation). It decides what happens when several source records end up in one target ' +
               'record. Given alone (with transformation_name and target_infoobject only), it changes the aggregation ' +
-              'and leaves the rule as it is; given with a rule change, both are saved together. Refused for a target ' +
-              'field whose aggregation the target does not let a transformation override.',
+              'and leaves the rule as it is; given with a rule change, both are saved together. Possible are MOV, NOP ' +
+              'and the key figure\'s own aggregation (SUM for one without aggregation); MIN or MAX only for a key ' +
+              'figure that aggregates that way, and MOV not into a data mart DataStore object. Anything else is ' +
+              'refused with the possible values, as is a target field whose aggregation the target does not let a ' +
+              'transformation override.',
           },
           transport: {
             type: 'string',

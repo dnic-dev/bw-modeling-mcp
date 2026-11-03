@@ -31,6 +31,46 @@ async function freshReadInactive(
   return freshRead(`/sap/bw/modeling/trfn/${bwSeg(trfnLower)}/m`, trfnAccept());
 }
 
+/**
+ * Drop performConversionExit from the targets a MINOR step of a rule fills.
+ *
+ * BW serves the attribute on the unit target of a combined quantity + unit rule whenever the
+ * unit InfoObject has a conversion routine, but cannot read it back: SET_UNIT_STEP then never
+ * resolves the step that fills the unit and adds unit steps until the step id overflows
+ * (CONVT_OVERFLOW). The server derives the attribute again from the InfoObject, so nothing
+ * is lost by leaving it out.
+ */
+export function normalizeTransformationForPut(xml: string): string {
+  return xml.replace(/<rule\b[^>]*>[\s\S]*?<\/rule>/g, (rule) => {
+    const minorSteps = new Set(
+      [...rule.matchAll(/<step\b[^>]*>/g)]
+        .filter((m) => /\brank="MINOR"/.test(m[0]))
+        .map((m) => m[0].match(/\bid="(\d+)"/)?.[1])
+        .filter((id): id is string => id !== undefined),
+    );
+    if (minorSteps.size === 0) return rule;
+    return rule.replace(
+      /<target\b([^>]*)>(\s*<output>[^<]*\/step(\d+)\/output\d+<\/output>)/g,
+      (whole, attrs: string, output: string, stepId: string) =>
+        minorSteps.has(stepId) && /\bperformConversionExit="/.test(attrs)
+          ? `<target${attrs.replace(/\s+performConversionExit="[^"]*"/, '')}>${output}`
+          : whole,
+    );
+  });
+}
+
+/** PUT a transformation document, normalized so BW can read it back. */
+function putTransformation(
+  client: BwClient,
+  name: string,
+  lockHandle: string,
+  xml: string,
+  timestamp?: string,
+  transport?: string,
+): Promise<string> {
+  return client.put('trfn', name, lockHandle, normalizeTransformationForPut(xml), timestamp, transport);
+}
+
 // ── bwCreateTransformation ────────────────────────────────────────────────────
 
 export interface CreateTransformationArgs {
@@ -1422,6 +1462,22 @@ export async function bwUpdateTransformation(
   if ('error' in probe) {
     return JSON.stringify({ success: false, message: `${probe.error} The rule was not changed.` });
   }
+  if (aggr === 'MOV' && probe.previous !== aggr) {
+    const target = transformationTarget(current.body);
+    if (target?.type.toUpperCase() === 'ADSO') {
+      const root =
+        (await freshRead(`/sap/bw/modeling/adso/${bwSeg(target.name.toLowerCase())}/m`, MEDIA_TYPES['adso'])).body
+          .match(/<adso:dataStore\b[^>]*>/)?.[0] ?? '';
+      if (/\bcubeDeltaOnly="true"/.test(root)) {
+        return JSON.stringify({
+          success: false,
+          message:
+            `MOV is not possible for ${tgtUpper}: the target ${target.name} is a data mart DataStore object, ` +
+            `which only adds up records. The rule was not changed.`,
+        });
+      }
+    }
+  }
 
   const onlyAggregation =
     !ruleTypeGiven && !sourceField && !formula && !constantValue && !lookupObject && !unitSourceField &&
@@ -1439,7 +1495,7 @@ export async function bwUpdateTransformation(
     const timestamp = current.headers['timestamp'] ?? current.headers['TIMESTAMP'];
     const lockHandle = await client.lock('trfn', transformationName);
     try {
-      await client.put('trfn', transformationName, lockHandle, probe.xml, timestamp, transport);
+      await putTransformation(client, transformationName, lockHandle, probe.xml, timestamp, transport);
     } catch (err) {
       await client.unlock('trfn', transformationName).catch(() => {/* ignore */});
       throw err;
@@ -1499,6 +1555,27 @@ export function targetAggregations(xml: string): Map<string, string> {
 }
 
 /**
+ * The aggregations BW offers for a rule into a target key figure: overwrite, no aggregation,
+ * and the key figure's own aggregation, with "none" counting as summation. Any other value is
+ * reset by BW on save without a message. Undefined when the field carries no aggregation
+ * behavior to derive it from.
+ */
+export function allowedRuleAggregations(elementTag: string): string[] | undefined {
+  const behavior = elementTag.match(/\baggregationBehavior="([^"]*)"/)?.[1]?.toUpperCase();
+  if (behavior === undefined) return undefined;
+  const own = ['SUM', 'MIN', 'MAX'].includes(behavior) ? behavior : ['NONE', 'NOP', ''].includes(behavior) ? 'SUM' : undefined;
+  return own ? [own, 'MOV', 'NOP'] : ['MOV', 'NOP'];
+}
+
+/** The target object of a transformation as its root target element names it. */
+function transformationTarget(xml: string): { name: string; type: string } | undefined {
+  const tag = xml.match(/<target\b[^>]*\bid="0"[^>]*>/)?.[0];
+  const name = tag?.match(/\bname="([^"]*)"/)?.[1];
+  const type = tag?.match(/\btype="([^"]*)"/)?.[1];
+  return name && type ? { name, type } : undefined;
+}
+
+/**
  * Set the aggregation type of a rule into a target field.
  *
  * It is held by the target field in the transformation's target segment (aggregationType),
@@ -1519,6 +1596,14 @@ export function setTargetAggregation(
   }
   if (/\baggregationCanBeOverwritten="false"/.test(element.tag) && previous !== aggregation) {
     return { error: `The target fixes the aggregation of ${field} to ${previous}; a transformation cannot override it.` };
+  }
+  const allowed = allowedRuleAggregations(element.tag);
+  if (allowed && !allowed.includes(aggregation)) {
+    return {
+      error:
+        `${aggregation} is not possible for ${field}: a rule into this key figure aggregates with ` +
+        `${allowed.join(', ')}. BW would silently keep a different value.`,
+    };
   }
   const tag = element.tag.replace(/\baggregationType="[^"]*"/, `aggregationType="${aggregation}"`);
   return {
@@ -1622,7 +1707,7 @@ async function updateRule(
 
     const lockHandle = await client.lock('trfn', transformationName);
     try {
-      await client.put('trfn', transformationName, lockHandle, adjustXml(updatedXml), timestamp, transport);
+      await putTransformation(client, transformationName, lockHandle, adjustXml(updatedXml), timestamp, transport);
     } catch (err) {
       await client.unlock('trfn', transformationName).catch(() => {/* ignore */});
       throw err;
@@ -1720,7 +1805,7 @@ async function updateRule(
 
     const lockHandle = await client.lock('trfn', transformationName);
     try {
-      await client.put('trfn', transformationName, lockHandle, adjustXml(updatedXml), timestamp, transport);
+      await putTransformation(client, transformationName, lockHandle, adjustXml(updatedXml), timestamp, transport);
     } catch (err) {
       await client.unlock('trfn', transformationName).catch(() => {/* ignore */});
       throw err;
@@ -1785,7 +1870,7 @@ async function updateRule(
 
     const lockHandle = await client.lock('trfn', transformationName);
     try {
-      await client.put('trfn', transformationName, lockHandle, adjustXml(updatedXml), timestamp, transport);
+      await putTransformation(client, transformationName, lockHandle, adjustXml(updatedXml), timestamp, transport);
     } catch (err) {
       await client.unlock('trfn', transformationName).catch(() => {/* ignore */});
       throw err;
@@ -1847,7 +1932,7 @@ async function updateRule(
 
     const lockHandle = await client.lock('trfn', transformationName);
     try {
-      await client.put('trfn', transformationName, lockHandle, adjustXml(updatedXml), timestamp, transport);
+      await putTransformation(client, transformationName, lockHandle, adjustXml(updatedXml), timestamp, transport);
     } catch (err) {
       await client.unlock('trfn', transformationName).catch(() => {/* ignore */});
       throw err;
@@ -1894,7 +1979,7 @@ async function updateRule(
     }
     const lockHandle = await client.lock('trfn', transformationName);
     try {
-      await client.put('trfn', transformationName, lockHandle, adjustXml(updatedXml), timestamp, transport);
+      await putTransformation(client, transformationName, lockHandle, adjustXml(updatedXml), timestamp, transport);
     } catch (err) {
       await client.unlock('trfn', transformationName).catch(() => {/* ignore */});
       throw err;
@@ -1985,7 +2070,7 @@ async function updateRule(
 
     const lockHandle = await client.lock('trfn', transformationName);
     try {
-      await client.put('trfn', transformationName, lockHandle, adjustXml(updatedXml), timestamp, transport);
+      await putTransformation(client, transformationName, lockHandle, adjustXml(updatedXml), timestamp, transport);
     } catch (err) {
       await client.unlock('trfn', transformationName).catch(() => {/* ignore */});
       throw err;
@@ -2109,7 +2194,7 @@ async function updateRule(
 
     const lockHandle = await client.lock('trfn', transformationName);
     try {
-      await client.put('trfn', transformationName, lockHandle, adjustXml(updatedXml), timestamp, transport);
+      await putTransformation(client, transformationName, lockHandle, adjustXml(updatedXml), timestamp, transport);
     } catch (err) {
       await client.unlock('trfn', transformationName).catch(() => {/* ignore */});
       throw err;
@@ -2176,7 +2261,7 @@ async function updateRule(
 
   const lockHandle = await client.lock('trfn', transformationName);
   try {
-    await client.put('trfn', transformationName, lockHandle, adjustXml(updatedXml), timestamp, transport);
+    await putTransformation(client, transformationName, lockHandle, adjustXml(updatedXml), timestamp, transport);
   } catch (err) {
     await client.unlock('trfn', transformationName).catch(() => {/* ignore unlock error */});
     throw err;
@@ -2419,7 +2504,7 @@ export async function bwSetTransformationRoutine(
   const lockHandle = await client.lock('trfn', trfnLower);
   const putClient = createClientFromEnv();
   try {
-    await putClient.put('trfn', trfnLower, lockHandle, xmlWithGroup, timestamp1, transport);
+    await putTransformation(putClient, trfnLower, lockHandle, xmlWithGroup, timestamp1, transport);
   } catch (err) {
     await client.unlock('trfn', trfnLower).catch(() => {/* ignore */});
     throw err;
@@ -2622,7 +2707,7 @@ export async function bwSetTransformationExpertRoutine(
   const lockHandle = await client.lock('trfn', trfnLower);
   let activationXml: string;
   try {
-    await client.put('trfn', trfnLower, lockHandle, xml1, timestamp, transport);
+    await putTransformation(client, trfnLower, lockHandle, xml1, timestamp, transport);
 
     // Step 5: Priming GET (mirrors Eclipse), then TLOGO-activate with the same lockHandle.
     await client
@@ -2846,7 +2931,7 @@ export async function bwSetTransformationRoutineFields(
   const lockHandle = await client.lock('trfn', trfnLower);
   const putClient = createClientFromEnv();
   try {
-    await putClient.put('trfn', trfnLower, lockHandle, updatedXml, timestamp, transport);
+    await putTransformation(putClient, trfnLower, lockHandle, updatedXml, timestamp, transport);
   } catch (err) {
     await client.unlock('trfn', trfnLower).catch(() => {/* ignore */});
     throw err;
@@ -2951,7 +3036,7 @@ export async function bwDeleteTransformationRoutine(
   const lockHandle = await client.lock('trfn', trfnLower);
   const putClient = createClientFromEnv();
   try {
-    await putClient.put('trfn', trfnLower, lockHandle, updatedXml, timestamp);
+    await putTransformation(putClient, trfnLower, lockHandle, updatedXml, timestamp);
   } catch (err) {
     await client.unlock('trfn', trfnLower).catch(() => {/* ignore */});
     throw err;
@@ -3040,7 +3125,7 @@ async function attemptRuntimeSwitch(
       `HANARuntime="${targetValue}"`
     );
 
-    await client.put('trfn', trfnLower, lockHandle, updatedXml, timestamp, transport);
+    await putTransformation(client, trfnLower, lockHandle, updatedXml, timestamp, transport);
   } catch (err) {
     await client.unlock('trfn', trfnLower).catch(() => {/* ignore */});
     throw err;
