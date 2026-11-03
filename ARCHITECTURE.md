@@ -272,7 +272,9 @@ src/
     ├── process_chain_monitor.ts # bw_list_process_chain_runs, bw_get_process_chain_run_detail,
     │                            # bw_list_process_chain_last_status — OData-based monitoring
     ├── process_chain_run.ts # bw_start_process_chain — asynchronous start through the BW/4HANA
-    │                        # Cockpit monitoring API, then the run status by log ID
+    │                        # Cockpit monitoring API, then the run status by log ID;
+    │                        # bw_restart_process_chain_step — "Repeat" of a failed step
+    │                        # through the BW4_PCM_SRV function import ChainProcessRestart
     ├── processchain.ts   # bw_get_process_chain — reads RSPC via bw4 API; auto-fetches variant details per step
     ├── processchain_write.ts # bw_create_process_chain, bw_update_process_chain,
     │                         # bw_activate_process_chain, bw_append_process_chain_dtp,

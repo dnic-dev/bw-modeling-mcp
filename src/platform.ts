@@ -333,6 +333,7 @@ const BW4_ONLY: Record<string, string> = {
   bw_list_process_chain_runs: 'the process chain monitoring OData services (RV_C_PCM*)',
   bw_get_process_chain_run_detail: 'the process chain monitoring OData services (RV_C_PCM*)',
   bw_list_process_chain_last_status: 'the process chain monitoring OData services (RV_C_PCM*)',
+  bw_restart_process_chain_step: 'the process chain monitoring OData services (RV_C_PCM*)',
 
   // Remodeling monitor — the RV_C_RSCNVMONITOR_CDS OData service.
   bw_list_remodeling_requests: 'the remodeling monitor OData service (RV_C_RSCNVMONITOR_CDS)',

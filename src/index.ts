@@ -143,7 +143,7 @@ import { bwCreatePlanningSequence, bwUpdatePlanningSequence, type CreatePlanning
 import { bwCreatePlanningFilter, bwUpdatePlanningFilter, type CreatePlanningFilterArgs, type UpdatePlanningFilterArgs } from './tools/planning_filter_write.js';
 import { bwListProcessChainRuns, bwGetProcessChainRunDetail, bwListProcessChainLastStatus } from './tools/process_chain_monitor.js';
 import { bwCreateProcessChain, bwUpdateProcessChain, bwActivateProcessChain, bwAddProcessChainErrorLinks, bwSwapProcessChainDtp, bwAppendProcessChainDtp, bwAddProcessChainProgram, bwAddProcessChainPlanningSwitch, bwAddProcessChainEdge, bwRemoveProcessChainEdge, bwRemoveProcessChainStep, bwCreateDecisionVariant, CreateProcessChainParams, UpdateProcessChainParams, EdgeDef, EdgeStatus, TriggerEventConfig } from './tools/processchain_write.js';
-import { bwStartProcessChain, MAX_WAIT_SECONDS } from './tools/process_chain_run.js';
+import { bwStartProcessChain, bwRestartProcessChainStep, MAX_WAIT_SECONDS } from './tools/process_chain_run.js';
 import { bwCreateTransportTask } from './tools/transport.js';
 
 // Map the snake_case trigger_event tool argument to the TriggerEventConfig shape.
@@ -5943,6 +5943,34 @@ const TOOL_DEFINITIONS = [
       },
     },
     {
+      name: 'bw_restart_process_chain_step',
+      description:
+        'Repeat a failed or canceled step of a process chain run, as the process chain monitor does with "Repeat": ' +
+        'the step runs again as a new instance within the same run (step number n-2, n-3, …), and the chain continues ' +
+        'from there along its success links. Use it after the cause of the failure is removed (a lock released, data ' +
+        'corrected), instead of starting the whole chain again. Without process_id the single failed or canceled step ' +
+        'of the run is repeated; with several, name one. Steps that finished, are running or never ran are refused. ' +
+        'The result names the new instance; follow the run with bw_get_process_chain_run_detail.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          chain_id: {
+            type: 'string',
+            description: 'Process chain technical name (e.g. "CHAIN_NAME").',
+          },
+          log_id: {
+            type: 'string',
+            description: 'Log ID of the run, from bw_list_process_chain_runs or bw_list_process_chain_last_status.',
+          },
+          process_id: {
+            type: 'string',
+            description: 'Step number as bw_get_process_chain_run_detail shows it (e.g. "8-1"). Optional when the run has exactly one failed or canceled step.',
+          },
+        },
+        required: ['chain_id', 'log_id'],
+      },
+    },
+    {
       name: 'bw_create_decision_variant',
       description:
         'Create a DECISION process variant (a standalone TLOGO object) for use as a branch/decision step in a Process Chain, via the BW/4HANA Cockpit REST API. ' +
@@ -7812,6 +7840,15 @@ async function handleToolCall(
 
       case 'bw_start_process_chain':
         text = await bwStartProcessChain(client, args?.name as string, (args?.wait_seconds as number | undefined) ?? 0);
+        break;
+
+      case 'bw_restart_process_chain_step':
+        text = await bwRestartProcessChainStep(
+          client,
+          args?.chain_id as string,
+          args?.log_id as string,
+          args?.process_id as string | undefined,
+        );
         break;
 
       case 'bw_add_process_chain_error_links':

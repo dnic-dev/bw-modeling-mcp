@@ -488,6 +488,9 @@ Activate an existing Process Chain. Returns the top-level activation message, se
 ### `bw_start_process_chain`
 Start a process chain once, now, as the BW/4HANA Cockpit does with "Execute": asynchronously, in the background under the technical user of the chain, independent of its start condition and without changing its scheduling. Returns the log ID of the run, its status and the messages of the steps reached so far. `wait_seconds` (up to 600) waits for the run to end, checking every five seconds. Follow the run with `bw_get_process_chain_run_detail`. The synchronous start is not offered: it runs inside the HTTP request, where an abort message of a step cannot be shown. BW/4HANA only.
 
+### `bw_restart_process_chain_step`
+Repeat a failed or canceled step of a process chain run, as the process chain monitor does with "Repeat": the step runs again as a new instance within the same run (step number `n-2`, `n-3`, …) and the chain continues from there along its success links. Use it once the cause of the failure is removed, instead of starting the whole chain again, which would run every finished step a second time. Without `process_id` the single failed or canceled step is repeated; with several, name one. Finished, running and never-run steps are refused. The backend answers the call the same whether or not it started anything, so the tool reads the run again and reports the new instance — or says that none is visible. BW/4HANA only.
+
 ### `bw_append_process_chain_dtp`
 Add one DTP load step (optionally followed by its own DSO activation step) to an existing Process Chain. `before` / `after` place the whole block **in series** relative to an existing step — the target's incoming (or outgoing) edges are rerouted through the block, so the new steps really run ahead of (or behind) it. Without them the block is only appended behind the strand end and runs in parallel to the target's existing successors.
 

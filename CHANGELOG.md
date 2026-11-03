@@ -4,6 +4,8 @@
 
 ### Added
 
+- **Repeat a failed process chain step** — new `bw_restart_process_chain_step` repeats a failed or canceled step of a chain run, as "Repeat" in the process chain monitor does: the step runs again as a new instance of the same run and the chain carries on along its success links. Until now the only options were starting the whole chain again, which reruns every finished step, or running the DTP on its own, which leaves the rest of the chain unrun. Without a step number the single failed step is taken; several failed steps need one. The backend answers the call identically whether or not it started anything, so the tool reads the run again and names the new instance. Verified on BW/4HANA: a DTP step that had failed on a lock ran again as a new instance and the chain continued with its successors.
+
 - **Key figures with a variable unit or currency** — `bw_create_infoobject` and `bw_update_infoobject` take `unit_currency_infoobject`, the unit characteristic that supplies the currency of an amount or the unit of a quantity per record. Before, an amount or quantity key figure could only be given a fixed currency or unit, so one carrying several currencies could not be created at all: without either, activation fails. The parameter excludes `fixed_unit`/`fixed_currency`, and on update it replaces a fixed one. Verified on BW/4HANA by creating, activating and reading back amount and quantity key figures, and by loading them through a transformation.
 
 ## [1.9.1] — 2026-11-01
