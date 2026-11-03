@@ -730,11 +730,19 @@ const TOOL_DEFINITIONS = [
           },
           fixed_unit: {
             type: 'string',
-            description: 'Fixed unit of measure for QUAN key figures (e.g. "KWH", "M3"). Required when object_specific_data_type is QUAN.',
+            description:
+              'Fixed unit of measure for QUAN key figures (e.g. "KWH", "M3"). A QUAN key figure needs either this or unit_currency_infoobject.',
           },
           fixed_currency: {
             type: 'string',
-            description: 'Fixed currency for CURR key figures (e.g. "EUR"). Required when object_specific_data_type is CURR.',
+            description:
+              'Fixed currency for CURR key figures (e.g. "EUR"). A CURR key figure needs either this or unit_currency_infoobject.',
+          },
+          unit_currency_infoobject: {
+            type: 'string',
+            description:
+              'KYF only. Unit characteristic that supplies the unit or currency per record, instead of a fixed one ' +
+              '(e.g. "0CURRENCY" for a CURR key figure, "0UNIT" for a QUAN key figure). Excludes fixed_unit/fixed_currency.',
           },
           // common
           package: {
@@ -941,7 +949,7 @@ const TOOL_DEFINITIONS = [
       description:
         'Update a Characteristic InfoObject: change description, the lower case flag, and/or replace the attribute list. ' +
         'Supplying attributes replaces all existing ones (pass an empty array to remove all); omitting them leaves the list untouched. ' +
-        'Also supports Key Figure (KYF) updates: set fixed_unit or fixed_currency. ' +
+        'Also supports Key Figure (KYF) updates: set fixed_unit or fixed_currency, or unit_currency_infoobject to take the unit/currency from a unit characteristic. ' +
         'Sequence: lock → GET → PUT → activate → unlock — all in one call.',
       inputSchema: {
         type: 'object',
@@ -974,6 +982,12 @@ const TOOL_DEFINITIONS = [
           fixed_currency: {
             type: 'string',
             description: 'KYF only. Fixed currency (e.g. "EUR"). Sets fixedCurrency on a CURR key figure.',
+          },
+          unit_currency_infoobject: {
+            type: 'string',
+            description:
+              'KYF only. Unit characteristic that supplies the unit or currency per record (e.g. "0CURRENCY", "0UNIT"). ' +
+              'Replaces a fixed unit/currency; excludes fixed_unit/fixed_currency.',
           },
           attributes: {
             type: 'array',
@@ -6628,6 +6642,7 @@ async function handleToolCall(
           aggregation_type: args?.aggregation_type as string | undefined,
           fixed_unit: args?.fixed_unit as string | undefined,
           fixed_currency: args?.fixed_currency as string | undefined,
+          unit_currency_infoobject: args?.unit_currency_infoobject as string | undefined,
           package: args?.package as string | undefined,
           transport: args?.transport as string | undefined,
         });
@@ -6705,6 +6720,7 @@ async function handleToolCall(
           lower_case: args?.lower_case as boolean | undefined,
           fixed_unit: args?.fixed_unit as string | undefined,
           fixed_currency: args?.fixed_currency as string | undefined,
+          unit_currency_infoobject: args?.unit_currency_infoobject as string | undefined,
           transport: args?.transport as string | undefined,
         });
         break;

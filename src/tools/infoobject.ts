@@ -102,11 +102,45 @@ export interface CreateInfoObjectArgs {
   aggregation_type?: string;
   fixed_unit?: string;
   fixed_currency?: string;
+  unit_currency_infoobject?: string;
   // compound parent InfoObjects — CHA only; order matters (matches BW compound order)
   compound_infoobjects?: string[];
   // common
   package?: string;
   transport?: string;
+}
+
+function validateUnitCurrencyArgs(
+  args: { fixed_unit?: string; fixed_currency?: string; unit_currency_infoobject?: string },
+  isKyf: boolean
+): void {
+  if (!args.unit_currency_infoobject) return;
+  if (!isKyf) {
+    throw new Error('unit_currency_infoobject applies to Key Figures (KYF) only.');
+  }
+  if (args.fixed_unit || args.fixed_currency) {
+    throw new Error(
+      'unit_currency_infoobject and fixed_unit/fixed_currency exclude each other: a key figure has either ' +
+      'a fixed unit/currency or takes it from a unit characteristic.'
+    );
+  }
+}
+
+/**
+ * Point a key figure at the unit characteristic that supplies its unit or currency, the way
+ * BWMT writes it, and drop any fixed unit or currency — BW accepts only one of the two.
+ */
+export function setUnitCurrencyReference(xml: string, infoObject: string): string {
+  const ref = `<unitCurrencyInfoObjectRef name="${infoObject.toUpperCase()}" infoObjectType="UNI"/>`;
+  const out = xml
+    .replace(/<fixedUnit>[^<]*<\/fixedUnit>/, '')
+    .replace(/<fixedCurrency>[^<]*<\/fixedCurrency>/, '')
+    .replace(/<fixedUnit\s*\/>/, '')
+    .replace(/<fixedCurrency\s*\/>/, '');
+  const pattern = /<unitCurrencyInfoObjectRef\b[^>]*?(?:\/>|>[\s\S]*?<\/unitCurrencyInfoObjectRef>)/;
+  if (pattern.test(out)) return out.replace(pattern, ref);
+  if (out.includes('<displayProperties')) return out.replace('<displayProperties', `${ref}<displayProperties`);
+  throw new Error('Cannot place the unit/currency reference: the key figure XML has no <unitCurrencyInfoObjectRef> or <displayProperties> element.');
 }
 
 /**
@@ -140,6 +174,7 @@ export async function bwCreateInfoObject(
   if (isobjType === 'KYF' && args.lower_case !== undefined) {
     throw new Error('lower_case applies to Characteristics (CHA) only — remove it for a Key Figure.');
   }
+  validateUnitCurrencyArgs(args, isobjType === 'KYF');
   const responsible = await resolveLogonUser(client);
 
   // Step 1: Lock with CREA headers (stateful_enqueue session)
@@ -200,8 +235,8 @@ export async function bwCreateInfoObject(
       await client.create('iobj', nameLower, lockHandle, kyfXml, { 'Development-Class': pkg });
       await client.unlock('iobj', nameLower);
 
-      // fixedUnit / fixedCurrency: SAP only accepts these via PUT after creation
-      if (args.fixed_unit || args.fixed_currency) {
+      // fixedUnit / fixedCurrency / unit-currency reference: SAP only accepts these via PUT after creation
+      if (args.fixed_unit || args.fixed_currency || args.unit_currency_infoobject) {
         const freshClient = createClientFromEnv();
         const getResult = await freshClient.get(`/sap/bw/modeling/iobj/${bwSeg(nameLower)}/m`, MEDIA_TYPES['iobj']);
         const timestamp = getResult.headers['timestamp'] ?? getResult.headers['TIMESTAMP'];
@@ -216,6 +251,9 @@ export async function bwCreateInfoObject(
         if (args.fixed_currency) {
           const cur = args.fixed_currency.toUpperCase();
           xml = xml.replace('<unitCurrencyInfoObjectRef', `<fixedCurrency>${cur}</fixedCurrency><unitCurrencyInfoObjectRef`);
+        }
+        if (args.unit_currency_infoobject) {
+          xml = setUnitCurrencyReference(xml, args.unit_currency_infoobject);
         }
 
         await freshClient.put('iobj', nameLower, putLockHandle, xml, timestamp, args.transport);
@@ -237,6 +275,7 @@ export async function bwCreateInfoObject(
       };
       if (args.fixed_unit) kyfResult['fixedUnit'] = args.fixed_unit.toUpperCase();
       if (args.fixed_currency) kyfResult['fixedCurrency'] = args.fixed_currency.toUpperCase();
+      if (args.unit_currency_infoobject) kyfResult['unitCurrencyInfoObject'] = args.unit_currency_infoobject.toUpperCase();
       kyfResult['message'] = `InfoObject '${nameUpper}' created (inactive). Call bw_activate with lock_handle="" to activate.`;
 
       return JSON.stringify(kyfResult);
@@ -467,6 +506,7 @@ export interface UpdateInfoObjectArgs {
   lower_case?: boolean;
   fixed_unit?: string;
   fixed_currency?: string;
+  unit_currency_infoobject?: string;
   transport?: string;
 }
 
@@ -507,6 +547,7 @@ export async function bwUpdateInfoObject(
 
     // ── KYF fast path: only patch fixedUnit / fixedCurrency / description ─────
     const isKyf = /<infoObjectType>KYF<\/infoObjectType>/.test(xml);
+    validateUnitCurrencyArgs(args, isKyf);
     if (isKyf) {
       if (args.lower_case !== undefined) {
         throw new Error(`InfoObject '${nameUpper}' is a Key Figure — lower_case applies to Characteristics (CHA) only.`);
@@ -534,6 +575,9 @@ export async function bwUpdateInfoObject(
         } else {
           xml = xml.replace('<unitCurrencyInfoObjectRef', `<fixedCurrency>${cur}</fixedCurrency><unitCurrencyInfoObjectRef`);
         }
+      }
+      if (args.unit_currency_infoobject) {
+        xml = setUnitCurrencyReference(xml, args.unit_currency_infoobject);
       }
       await freshClient.put('iobj', nameLower, lockHandle, xml, timestamp, args.transport);
       const activationClient = createClientFromEnv();

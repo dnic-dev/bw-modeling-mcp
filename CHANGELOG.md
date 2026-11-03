@@ -1,5 +1,11 @@
 # Changelog
 
+## [Unreleased]
+
+### Added
+
+- **Key figures with a variable unit or currency** — `bw_create_infoobject` and `bw_update_infoobject` take `unit_currency_infoobject`, the unit characteristic that supplies the currency of an amount or the unit of a quantity per record. Before, an amount or quantity key figure could only be given a fixed currency or unit, so one carrying several currencies could not be created at all: without either, activation fails. The parameter excludes `fixed_unit`/`fixed_currency`, and on update it replaces a fixed one. Verified on BW/4HANA by creating, activating and reading back amount and quantity key figures, and by loading them through a transformation.
+
 ## [1.9.1] — 2026-11-01
 
 ### Added

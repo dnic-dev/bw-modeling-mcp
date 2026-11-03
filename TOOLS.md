@@ -106,6 +106,11 @@ Create a new InfoObject. Supports:
 
 Created as inactive — activate with `bw_activate`.
 
+An amount or quantity key figure gets its currency or unit either fixed (`fixed_currency`,
+`fixed_unit`) or per record from a unit characteristic (`unit_currency_infoobject`, e.g. the
+currency or unit-of-measure characteristic). One of the two is needed for activation; they exclude
+each other.
+
 `lower_case` switches off the permitted-character check (RSKC) for the characteristic, which is
 what makes values holding lower case letters or umlauts loadable at all. Without it such a value
 passes the load itself — a push even answers HTTP 204 — and is only rejected later, when the
@@ -113,7 +118,8 @@ request is activated.
 
 ### `bw_update_infoobject`
 Change the description, the lower case flag (`lower_case`), or the attribute list of an existing
-Characteristic; set `fixed_unit` / `fixed_currency` on a Key Figure. Supplying `attributes`
+Characteristic; set `fixed_unit` / `fixed_currency` on a Key Figure, or `unit_currency_infoobject`
+to take the unit or currency from a unit characteristic instead (a fixed one is removed). Supplying `attributes`
 replaces the whole list (`[]` removes all of them); omitting it leaves the attributes untouched.
 The lower case flag can be changed on a characteristic that is already used by a provider holding
 data — a request that failed activation on such a value can then be activated again.
