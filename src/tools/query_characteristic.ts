@@ -63,6 +63,8 @@ export interface CharacteristicSpec {
   infoobject: string;
   /** Restrict to one area; without it every area is considered. */
   axis?: 'rows' | 'columns' | 'free';
+  /** Query-specific description; "default" falls back to the InfoObject text. */
+  description?: string;
   result_rows?: ResultRows;
   display_as?: DisplayAs;
   text_type?: TextType;
@@ -87,6 +89,20 @@ function valuePresentationEl(displayAs: DisplayAs, textType: TextType | undefine
   if (displayAs === 'default') return '<Qry:valuePresentation default="true"/>';
   const style = textType ?? 'standard';
   return `<Qry:valuePresentation default="false" presentAs="${displayAs}" textPresentation="${style}"/>`;
+}
+
+/**
+ * Written in the form of the BWMT save: shortValue keeps the InfoObject short text,
+ * languageToText carries the override in the logon language.
+ */
+function descriptionEl(current: string | undefined, text: string): string {
+  if (text === 'default') return '<Qry:description default="true"/>';
+  if (text.length > 60) throw new Error(`description "${text}" is longer than 60 characters.`);
+  const shortValue = current?.match(/\bshortValue="([^"]*)"/)?.[1];
+  const lang = current?.match(/<Qry:languageToText\b[^>]*\bkey="([^"]*)"/)?.[1] ?? 'DE';
+  const shortAttr = shortValue !== undefined ? ` shortValue="${shortValue}"` : '';
+  const v = escapeXml(text);
+  return `<Qry:description default="false"${shortAttr} value="${v}"><Qry:languageToText key="${lang}" value="${v}"/></Qry:description>`;
 }
 
 function resultPresentationEl(cond: ResultRows): string {
@@ -208,6 +224,18 @@ function replaceDirectChild(element: string, tag: string, replacement: string, w
   throw new Error(`${what}: no <Qry:${tag}> element in the characteristic block.`);
 }
 
+/** The first direct child with this tag outside the hierarchy block, or undefined. */
+function findDirectChild(element: string, tag: string): string | undefined {
+  const hier = hierarchyRange(element);
+  const re = new RegExp(`<Qry:${escapeRegex(tag)}\\b[^>]*?(\\/>|>[\\s\\S]*?<\\/Qry:${escapeRegex(tag)}>)`, 'g');
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(element)) !== null) {
+    if (hier && m.index >= hier.start && m.index < hier.end) continue;
+    return m[0];
+  }
+  return undefined;
+}
+
 /** Replace a child of the hierarchy block, appending it when the block does not carry one yet. */
 function setHierarchyChild(hier: string, tag: string, replacement: string): string {
   const re = new RegExp(`<Qry:${escapeRegex(tag)}\\b[^>]*?(\\/>|>[\\s\\S]*?<\\/Qry:${escapeRegex(tag)}>)`);
@@ -310,6 +338,17 @@ function applyToDimension(block: DimensionBlock, spec: CharacteristicSpec, appli
   let element = block.element;
   const what = `characteristic ${block.infoobject}`;
 
+  if (spec.description !== undefined) {
+    const current = findDirectChild(element, 'description');
+    if (current) {
+      element = replaceDirectChild(element, 'description', descriptionEl(current, spec.description), what);
+    } else {
+      // Insert right after the opening tag of the Dimension block.
+      const openEnd = element.indexOf('>') + 1;
+      element = element.slice(0, openEnd) + descriptionEl(undefined, spec.description) + element.slice(openEnd);
+    }
+    applied.push('description');
+  }
   if (spec.display_as !== undefined) {
     element = replaceDirectChild(element, 'valuePresentation', valuePresentationEl(spec.display_as, spec.text_type), what);
     applied.push('display_as');

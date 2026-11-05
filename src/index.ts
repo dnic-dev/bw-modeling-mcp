@@ -3380,7 +3380,8 @@ const TOOL_DEFINITIONS = [
       name: 'bw_update_query_characteristic',
       description:
         'Set the display and access properties of the characteristics in an existing BW Query - the ' +
-        'per-characteristic settings of the rows, columns, and free-characteristics areas: display of result ' +
+        'per-characteristic settings of the rows, columns, and free-characteristics areas: the query-specific ' +
+        'description of the characteristic, display of result ' +
         'rows, display as key/text, access type for result values (read mode), sorting, cumulation, display ' +
         'level, and the hierarchy assignment with its display options. Pass "*" as infoobject to apply one ' +
         'set of properties to every characteristic in the layout. Every property also accepts "default", ' +
@@ -3412,6 +3413,10 @@ const TOOL_DEFINITIONS = [
                   type: 'string',
                   enum: ['rows', 'columns', 'free'],
                   description: 'Restrict the change to one area. Omit to hit the characteristic wherever it sits.',
+                },
+                description: {
+                  type: 'string',
+                  description: 'Query-specific description of the characteristic, shown instead of the InfoObject text in the query and in Analysis for Office (e.g. to avoid a truncated short text). "default" drops it and falls back to the InfoObject text.',
                 },
                 result_rows: {
                   type: 'string',
