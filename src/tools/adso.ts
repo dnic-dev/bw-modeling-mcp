@@ -175,15 +175,19 @@ export async function bwUpdateAdsoSettings(
     xml = setRootAttr(xml, 'pushMode', String(settings.writeInterface));
   }
 
-  // 4. Update label in <endUserTexts label="..."/>
+  // 4. Update label in the aDSO's own <endUserTexts label="..."/>: the one before
+  // <tlogoProperties>. The server serves the texts of the logon language; an aDSO without a text
+  // in that language has no such element, and the first <endUserTexts> of the document is then
+  // the one of the first field — replacing it, as this tool used to, never reached the aDSO.
   if (settings.label !== undefined) {
-    const endUserTextsTag = `<endUserTexts label="${settings.label}"/>`;
-    if (/<endUserTexts[^>]*\/>/.test(xml)) {
-      // Replace existing <endUserTexts .../> (with or without label attribute)
-      xml = xml.replace(/<endUserTexts[^>]*\/>/, endUserTextsTag);
-    } else {
-      // No <endUserTexts> present yet — insert before <tlogoProperties>
-      xml = xml.replace(/(<tlogoProperties)/, `${endUserTextsTag}\n  $1`);
+    const label = settings.label.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/"/g, '&quot;');
+    const endUserTextsTag = `<endUserTexts label="${label}"/>`;
+    const at = xml.indexOf('<tlogoProperties');
+    const head = at >= 0 ? xml.slice(0, at) : '';
+    if (at >= 0 && /<endUserTexts[^>]*\/>/.test(head)) {
+      xml = head.replace(/<endUserTexts[^>]*\/>/, endUserTextsTag) + xml.slice(at);
+    } else if (at >= 0) {
+      xml = head + endUserTextsTag + xml.slice(at);
     }
   }
 

@@ -524,6 +524,47 @@ export interface UpdateInfoObjectArgs {
  * 8. PUT full XML with timestamp
  * 9. Activate + Unlock (unlock in finally)
  */
+/**
+ * Set the description in the logon language only. The server serves one <texts> element per
+ * maintained language (D, E, …); writing into the first one, as this tool used to, overwrote the
+ * text of the original language whenever the logon language was another one (an English text
+ * landed in the German entry and the English one stayed empty). The entry of the logon language
+ * is changed, or added when the object has none yet; all other languages stay as they are.
+ * The logon language comes from the served document (adtcore:language), else BW_LANGUAGE.
+ */
+export function patchDescriptionInLogonLanguage(xml: string, description: string): string {
+  const esc = (s: string) => s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+  const desc = esc(description);
+  const shortText = esc(description.slice(0, 20));
+  const ISO_TO_SAP: Record<string, string> = {
+    DE: 'D', EN: 'E', FR: 'F', IT: 'I', ES: 'S', NL: 'N', PT: 'P',
+    RU: 'R', JA: 'J', KO: 'K', ZH: '1', PL: 'L', CS: 'C',
+  };
+  const iso = (xml.match(/\badtcore:language="([^"]+)"/)?.[1] ?? process.env.BW_LANGUAGE ?? 'DE').toUpperCase();
+  const lang = ISO_TO_SAP[iso] ?? iso;
+
+  // Top-level descriptions and adtcore:description reflect the logon language.
+  xml = xml.replace(/<longDescription>[^<]*<\/longDescription>/, `<longDescription>${desc}</longDescription>`);
+  xml = xml.replace(/<shortDescription>[^<]*<\/shortDescription>/, `<shortDescription>${shortText}</shortDescription>`);
+  xml = xml.replace(/\badtcore:description="[^"]*"/, `adtcore:description="${desc}"`);
+
+  const entry = new RegExp(`<texts\\b(?=[^>]*\\blanguage="${lang}")[^>]*/>`);
+  const newEntry = `<texts language="${lang}" shortText="${shortText}" longText="${desc}"/>`;
+  if (entry.test(xml)) {
+    xml = xml.replace(entry, newEntry);
+  } else {
+    const all = [...xml.matchAll(/<texts\b[^>]*\/>/g)];
+    if (all.length > 0) {
+      const last = all[all.length - 1];
+      const at = (last.index ?? 0) + last[0].length;
+      xml = xml.slice(0, at) + newEntry + xml.slice(at);
+    } else {
+      xml = xml.replace(/(<\/shortDescription>)/, `$1${newEntry}`);
+    }
+  }
+  return xml;
+}
+
 export async function bwUpdateInfoObject(
   client: BwClient,
   args: UpdateInfoObjectArgs
@@ -553,12 +594,7 @@ export async function bwUpdateInfoObject(
         throw new Error(`InfoObject '${nameUpper}' is a Key Figure — lower_case applies to Characteristics (CHA) only.`);
       }
       if (args.description) {
-        const desc = args.description;
-        xml = xml.replace(/<longDescription>[^<]*<\/longDescription>/, `<longDescription>${desc}</longDescription>`);
-        xml = xml.replace(/<shortDescription>[^<]*<\/shortDescription>/, `<shortDescription>${desc}</shortDescription>`);
-        xml = xml.replace(/(<texts\b[^/]*?)longText="[^"]*"/, `$1longText="${desc}"`);
-        xml = xml.replace(/(<texts\b[^/]*?)shortText="[^"]*"/, `$1shortText="${desc}"`);
-        xml = xml.replace(/\badtcore:description="[^"]*"/, `adtcore:description="${desc}"`);
+        xml = patchDescriptionInLogonLanguage(xml, args.description);
       }
       if (args.fixed_unit) {
         const unit = args.fixed_unit.toUpperCase();
@@ -669,12 +705,7 @@ export async function bwUpdateInfoObject(
 
     // Patch description if provided
     if (args.description) {
-      const desc = args.description;
-      xml = xml.replace(/<longDescription>[^<]*<\/longDescription>/, `<longDescription>${desc}</longDescription>`);
-      xml = xml.replace(/<shortDescription>[^<]*<\/shortDescription>/, `<shortDescription>${desc}</shortDescription>`);
-      xml = xml.replace(/(<texts\b[^/]*?)longText="[^"]*"/, `$1longText="${desc}"`);
-      xml = xml.replace(/(<texts\b[^/]*?)shortText="[^"]*"/, `$1shortText="${desc}"`);
-      xml = xml.replace(/\badtcore:description="[^"]*"/, `adtcore:description="${desc}"`);
+      xml = patchDescriptionInLogonLanguage(xml, args.description);
     }
 
     // Step 8: PUT full XML — same fresh session as GET
