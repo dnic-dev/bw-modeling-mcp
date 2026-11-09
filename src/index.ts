@@ -3026,9 +3026,10 @@ const TOOL_DEFINITIONS = [
                         type: 'string',
                         description:
                           'Hierarchy of the characteristic (e.g. "HIERARCHY_NAME"). When set, each value is a ' +
-                          'hierarchy node name, restricting to the node and everything below it; intervals and ' +
-                          'exclusions are not available for nodes. Version and key date stay blank. Also the ' +
-                          'hierarchy node_variable selects nodes of.',
+                          'node of that hierarchy, restricting to the node and everything below it: a text node ' +
+                          'by its name, or a characteristic value in the tree by its external or internal key. ' +
+                          'Intervals and exclusions are not available for nodes. Version and key date stay blank. ' +
+                          'Also the hierarchy node_variable selects nodes of.',
                       },
                       node_variable: {
                         type: 'string',

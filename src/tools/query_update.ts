@@ -1,6 +1,6 @@
 import { BwClient, createClientFromEnv, bwSeg, lockSessionHeader } from '../bw-client.js';
 import { QUERY_ACCEPT_LIST, queryAccept, queryWriteMediaType, variableAccept, ckfAccept, rkfAccept, structureAccept } from './query.js';
-import { hierarchyNodesByName, TEXT_NODE, type HierarchyNodeRow } from './hierarchy.js';
+import { TEXT_NODE } from './hierarchy.js';
 
 /**
  * Query update tools (bw_update_query_layout, bw_update_query_filter).
@@ -839,6 +839,8 @@ export interface FilterValue {
   high_description?: string;
   /** Emit exclude="true" on the token (exclusion / "not equal") restriction. */
   exclude?: boolean;
+  /** Set by the hierarchy check: the node is a characteristic value, not a text node. */
+  value_node?: boolean;
 }
 
 export interface FilterOperation {
@@ -1383,10 +1385,16 @@ export interface UpdateQueryKeyFiguresArgs {
   transport?: string;
 }
 
+const TEXT_NODE_TO_VALUE = `<Qry:toValue internalValue="${TEXT_NODE}">
+        <Qry:type>InfoObject</Qry:type>
+        <Qry:value>${TEXT_NODE}</Qry:value>
+      </Qry:toValue>`;
+
 /**
  * Build a token restricting a structure member to a hierarchy node. Version and key
  * date stay blank: the hierarchy is read in the version and on the date the query
- * runs with. The node is a text node, which is what 0HIER_NODE names.
+ * runs with. A text node names 0HIER_NODE in toValue; a value node (a characteristic
+ * value in the tree) has no toValue and carries the value's internal key.
  */
 export function buildNodeToken(v: FilterValue, hierarchy: string): string {
   if (v.high !== undefined && v.high !== '') {
@@ -1396,15 +1404,12 @@ export function buildNodeToken(v: FilterValue, hierarchy: string): string {
     throw new Error(`Hierarchy node '${v.value}': excluding a node is not supported.`);
   }
   const fromDescAttr = v.description !== undefined ? ` fromValueDesc="${escapeXml(v.description)}"` : '';
+  const toValue = v.value_node ? '' : `\n      ${TEXT_NODE_TO_VALUE}`;
   return `<Qry:tokens xsi:type="Qry:SelectionRange" usageType="asFilter" selectionType="nodes"${fromDescAttr} hierarchyDateTo="00000000" hierarchyDateToFlag="Blank" hierarchyName="${escapeXml(hierarchy)}" hierarchyNameFlag="Value" hierarchyVersion="" hierarchyVersionFlag="Blank" operator="Equal">
       <Qry:fromValue internalValue="${escapeXml(v.internal_value ?? v.value)}">
         <Qry:type>Value</Qry:type>
         <Qry:value>${escapeXml(v.value)}</Qry:value>
-      </Qry:fromValue>
-      <Qry:toValue>
-        <Qry:type>InfoObject</Qry:type>
-        <Qry:value>0HIER_NODE</Qry:value>
-      </Qry:toValue>
+      </Qry:fromValue>${toValue}
     </Qry:tokens>`;
 }
 
@@ -1514,22 +1519,84 @@ function restrictedCharacteristics(structureXml: string): Set<string> {
   return out;
 }
 
+/** One node of a hierarchy as the query editor reads it. */
+export interface QueryHierarchyNode {
+  /** External name: the node name of a text node, the external key of a value. */
+  name: string;
+  /** Internal key; equal to the name for a text node. */
+  internal: string;
+  text: string;
+  textNode: boolean;
+}
+
+/** Nodes by external name and by internal key; a text node wins over a value of the same name. */
+export type QueryHierarchyIndex = Map<string, QueryHierarchyNode>;
+
+/** Parse the answer of /sap/bw/modeling/comp/hierarchy; undefined when the hierarchy does not exist. */
+export function parseQueryHierarchy(xml: string): QueryHierarchyIndex | undefined {
+  if (!/<hierarchy\b[^>]*\bname="/.test(xml)) return undefined;
+  const values: QueryHierarchyNode[] = [];
+  const texts: QueryHierarchyNode[] = [];
+  for (const m of xml.matchAll(/<node\b([^>]*?)\/?>/g)) {
+    const attr = (n: string) => unescapeXml(m[1].match(new RegExp(`\\b${n}="([^"]*)"`))?.[1] ?? '');
+    const iobj = attr('iobj');
+    if (iobj.startsWith('1HIER_REST')) continue;
+    const node: QueryHierarchyNode = { name: attr('ext'), internal: attr('int'), text: attr('txt'), textNode: iobj === TEXT_NODE };
+    if (!node.name && !node.internal) continue;
+    (node.textNode ? texts : values).push(node);
+  }
+  const index: QueryHierarchyIndex = new Map();
+  for (const n of values) {
+    index.set(n.internal, n);
+    index.set(n.name, n);
+  }
+  for (const n of texts) index.set(n.name, n);
+  return index;
+}
+
+/** Read a hierarchy the way the query editor does: in the context of the query's provider. */
+async function readQueryHierarchy(
+  client: BwClient,
+  characteristic: string,
+  hierarchy: string,
+  provider: string
+): Promise<QueryHierarchyIndex | undefined> {
+  const { body } = await client.rawGet(
+    `/sap/bw/modeling/comp/hierarchy?characteristic=${encodeURIComponent(characteristic)}` +
+      `&hierarchy=${encodeURIComponent(hierarchy.toUpperCase())}&date=99991231` +
+      `&iprov=${encodeURIComponent(provider)}&restnodes=false&members=true&maxlevels=99`,
+    {}
+  );
+  return parseQueryHierarchy(body);
+}
+
+/** Target nodes of a hierarchy switch, per characteristic; null when the hierarchy could not be read. */
+export type SwitchTargetLookup = (characteristic: string) => QueryHierarchyIndex | null | undefined;
+
 /**
  * Move node restrictions from one hierarchy to another in a piece of a structure:
- * fixed nodes and node variables alike. A node listed in nodeMap is renamed; its
- * stored text is dropped then, since it describes the old node. Returns the
- * rewritten XML and the number of tokens changed.
+ * fixed nodes and node variables alike. A node listed in nodeMap is renamed. When
+ * the target hierarchy is known for the characteristic, each node takes its internal
+ * key, text and node kind from there — a node can be a text node in one hierarchy
+ * and a value in another. Otherwise a renamed node keeps no text, since the stored
+ * one describes the old node. Returns the rewritten XML and the number of tokens changed.
  */
 export function switchHierarchyInXml(
   xml: string,
   fromHierarchy: string,
   toHierarchy: string,
-  nodeMap: Record<string, string> = {}
+  nodeMap: Record<string, string> = {},
+  targets?: SwitchTargetLookup
 ): { xml: string; count: number } {
   const fromEsc = escapeXml(fromHierarchy);
   const toEsc = escapeXml(toHierarchy);
+  const groups = [...xml.matchAll(GROUPS_RE)].map((g) => ({
+    start: g.index!,
+    end: g.index! + g[0].length,
+    cha: g[0].match(/^<Qry:groups\b[^>]*?\binfoObject="([^"]+)"/)?.[1],
+  }));
   let count = 0;
-  const out = xml.replace(/<Qry:tokens\b[^>]*?(\/>|>[\s\S]*?<\/Qry:tokens>)/g, (full) => {
+  const out = xml.replace(/<Qry:tokens\b[^>]*?(\/>|>[\s\S]*?<\/Qry:tokens>)/g, (full, _end, offset: number) => {
     const openTag = full.match(/^<Qry:tokens\b[^>]*?\/?>/)?.[0] ?? full;
     if (!openTag.includes('selectionType="nodes"') || !openTag.includes(`hierarchyName="${fromEsc}"`)) return full;
     count++;
@@ -1540,9 +1607,24 @@ export function switchHierarchyInXml(
       name.replace(/<Qry:value>[^<]*<\/Qry:value>/, `<Qry:value>${toEsc}</Qry:value>`)
     );
     const fromValue = body.match(/<Qry:fromValue\b[^>]*>[\s\S]*?<\/Qry:fromValue>/)?.[0];
-    const node = unescapeXml(fromValue?.match(/<Qry:value>([^<]*)<\/Qry:value>/)?.[1] ?? '');
+    if (!fromValue) return newOpen + body;
+    const node = unescapeXml(fromValue.match(/<Qry:value>([^<]*)<\/Qry:value>/)?.[1] ?? '');
     const renamed = node ? nodeMap[node] : undefined;
-    if (fromValue && renamed !== undefined && renamed !== node) {
+    const targetName = renamed ?? node;
+    const cha = groups.find((g) => offset >= g.start && offset < g.end)?.cha;
+    const target = cha ? targets?.(cha)?.get(targetName) : undefined;
+    if (target) {
+      const newFromValue = fromValue
+        .replace(/\binternalValue="[^"]*"/, `internalValue="${escapeXml(target.internal)}"`)
+        .replace(/<Qry:value>[^<]*<\/Qry:value>/, `<Qry:value>${escapeXml(target.name)}</Qry:value>`);
+      body = body.replace(fromValue, newFromValue);
+      body = body.replace(/\s*<Qry:toValue\b[\s\S]*?<\/Qry:toValue>/, '');
+      if (target.textNode) body = body.replace(newFromValue, `${newFromValue}\n      ${TEXT_NODE_TO_VALUE}`);
+      if (renamed !== undefined && renamed !== node) {
+        newOpen = newOpen.replace(/\s*fromValueDesc="[^"]*"/, '');
+        if (target.text) newOpen = newOpen.replace(/ selectionType="nodes"/, `$& fromValueDesc="${escapeXml(target.text)}"`);
+      }
+    } else if (renamed !== undefined && renamed !== node) {
       const newEsc = escapeXml(renamed);
       const newFromValue = fromValue
         .replace(/\binternalValue="[^"]*"/, `internalValue="${newEsc}"`)
@@ -1558,40 +1640,46 @@ export function switchHierarchyInXml(
 /**
  * Check hierarchies and nodes before the save. The backend stores an unknown node
  * without a word and saves an unknown hierarchy as an inconsistent query, so both
- * are refused here. A node given without a description takes the node's text, as
- * the modeling tools do. When the hierarchy cannot be read at all, the check is
- * skipped and the backend's own check is left.
+ * are refused here. The hierarchy is read the way the query editor reads it, which
+ * also tells a text node from a value node and gives a value's internal key. A node
+ * given without a description takes the node's text, as the modeling tools do. When
+ * the hierarchy cannot be read at all, the check is skipped and the backend's own
+ * check is left. Returns the target nodes of the hierarchy switches.
  */
 async function checkHierarchyNodes(
   client: BwClient,
   queryName: string,
   kind: StructureKind,
   ops: KeyFigureOperation[]
-): Promise<void> {
-  const cache = new Map<string, Map<string, HierarchyNodeRow> | null>();
-  const nodesOf = async (cha: string, hierarchy: string): Promise<Map<string, HierarchyNodeRow> | null> => {
-    const key = `${cha}|${hierarchy.toUpperCase()}`;
-    if (!cache.has(key)) {
-      let nodes: Map<string, HierarchyNodeRow> | undefined | null;
+): Promise<Map<KeyFigureOperation, SwitchTargetLookup>> {
+  const switchTargets = new Map<KeyFigureOperation, SwitchTargetLookup>();
+  const switches = ops.filter((op) => op.action === 'switch_hierarchy');
+  const hasNodes = ops.some((op) => (op.restrictions ?? []).some((r) => r.hierarchy && (r.values ?? []).length > 0));
+  if (switches.length === 0 && !hasNodes) return switchTargets;
+
+  const { body } = await client.get(`/sap/bw/modeling/query/${bwSeg(queryName.toLowerCase())}/a`, queryAccept());
+  const doc = stripCheckMarkers(body);
+  const provider = doc.match(/<Qry:mainComponent\b[^>]*?\bproviderName="([^"]+)"/)?.[1] ?? '';
+
+  const cache = new Map<string, QueryHierarchyIndex | null>();
+  const key = (cha: string, hierarchy: string) => `${cha}|${hierarchy.toUpperCase()}`;
+  const nodesOf = async (cha: string, hierarchy: string): Promise<QueryHierarchyIndex | null> => {
+    const k = key(cha, hierarchy);
+    if (!cache.has(k)) {
+      let nodes: QueryHierarchyIndex | undefined | null;
       try {
-        nodes = await hierarchyNodesByName(client, cha, hierarchy);
+        nodes = provider ? await readQueryHierarchy(client, cha, hierarchy, provider) : null;
       } catch {
         nodes = null;
       }
       if (nodes === undefined) throw new Error(`Characteristic ${cha} has no hierarchy named ${hierarchy.toUpperCase()}.`);
-      cache.set(key, nodes);
+      cache.set(k, nodes);
     }
-    return cache.get(key)!;
+    return cache.get(k)!;
   };
-  const checkNode = (nodes: Map<string, HierarchyNodeRow>, cha: string, hierarchy: string, node: string) => {
+  const checkNode = (nodes: QueryHierarchyIndex, cha: string, hierarchy: string, node: string) => {
     const row = nodes.get(node);
     if (!row) throw new Error(`Hierarchy ${hierarchy.toUpperCase()} of ${cha} has no node '${node}'.`);
-    if (row.IOBJNM !== TEXT_NODE) {
-      throw new Error(
-        `Node '${node}' of hierarchy ${hierarchy.toUpperCase()} is a value node; only text nodes can be ` +
-        `restricted to. Restrict to the value ${node} without hierarchy instead.`
-      );
-    }
     return row;
   };
 
@@ -1603,16 +1691,17 @@ async function checkHierarchyNodes(
       if (!nodes) continue;
       for (const v of r.values ?? []) {
         const row = checkNode(nodes, cha, r.hierarchy, v.value);
-        if (v.description === undefined && row.NODEDESCRIPTION) v.description = row.NODEDESCRIPTION;
+        v.value = row.name;
+        v.internal_value = row.internal;
+        v.value_node = !row.textNode;
+        if (v.description === undefined && row.text) v.description = row.text;
       }
     }
   }
 
-  const switches = ops.filter((op) => op.action === 'switch_hierarchy');
-  if (switches.length === 0) return;
-  const { body } = await client.get(`/sap/bw/modeling/query/${bwSeg(queryName.toLowerCase())}/a`, queryAccept());
-  const doc = stripCheckMarkers(body);
   for (const op of switches) {
+    const to = op.to_hierarchy!;
+    switchTargets.set(op, (cha) => cache.get(key(cha, to)));
     let scope: string;
     if (op.member_id || op.description || op.component_name) {
       // A member added earlier in the same call is not in the stored query yet.
@@ -1643,6 +1732,7 @@ async function checkHierarchyNodes(
       }
     }
   }
+  return switchTargets;
 }
 
 /** Build a selection member of a characteristic structure, the form the modeling tools write. */
@@ -2890,7 +2980,7 @@ export async function bwUpdateQueryKeyFigures(
       nodeVariableDefs.push(resolved);
     }
   }
-  await checkHierarchyNodes(client, args.query_name, kind, ops);
+  const switchTargets = await checkHierarchyNodes(client, args.query_name, kind, ops);
 
   const touchedCharacteristics = new Set<string>();
   for (const op of ops) for (const r of op.restrictions ?? []) touchedCharacteristics.add(r.infoobject.toUpperCase());
@@ -3086,7 +3176,7 @@ export async function bwUpdateQueryKeyFigures(
           end = cd.end;
           scope = `the ${kind === 'characteristics' ? 'characteristic' : 'key figure'} structure`;
         }
-        const switched = switchHierarchyInXml(doc.slice(start, end), from, to, op.node_map);
+        const switched = switchHierarchyInXml(doc.slice(start, end), from, to, op.node_map, switchTargets.get(op));
         if (switched.count === 0) {
           throw new Error(`switch_hierarchy: no node restriction on hierarchy '${from}' found in ${scope}.`);
         }

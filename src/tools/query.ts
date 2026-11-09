@@ -263,6 +263,8 @@ function parseSelectionGroups(
       if (fromValueDesc) tok['valueDesc'] = fromValueDesc;
       const hierarchy = t['@_hierarchyName'] as string | undefined;
       if (hierarchy) tok['hierarchy'] = hierarchy;
+      // A text node names 0HIER_NODE in toValue; a value node of the hierarchy has none.
+      if (tok['selectionType'] === 'nodes' && t['Qry:toValue'] === undefined) tok['valueNode'] = true;
       return tok;
     });
     return {
@@ -605,7 +607,8 @@ export function formatMemberSelection(selections: Record<string, unknown>[]): st
         continue;
       }
       if (t['selectionType'] === 'nodes') {
-        restrictions.push(`${not}${iobj}=node ${value}${inHierarchy}`);
+        const kind = t['valueNode'] ? 'value node' : 'node';
+        restrictions.push(`${not}${iobj}=${kind} ${value}${inHierarchy}`);
         continue;
       }
       const op = t['operator'] === 'Equal' ? '=' : ` ${String(t['operator'] ?? '')} `;
