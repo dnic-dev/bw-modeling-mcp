@@ -61,7 +61,41 @@ A two-part blog series about this project (both available in German and English)
 
 ---
 
-## 🆕 What's New — v1.9.1 · Secure Sign-in on SAP BTP
+## 🆕 What's New — v1.10.0 · Repeat a Failed Chain Step
+
+### BW/4HANA
+
+**🔁 Process chains, repaired in place**
+
+- New `bw_restart_process_chain_step` — repeats a failed or canceled step of a chain run, as
+  "Repeat" in the process chain monitor does: the step runs again as a new instance of the
+  same run and the chain carries on along its success links, instead of restarting the
+  whole chain or running the DTP on its own
+
+**💶 Key figures with a variable unit or currency**
+
+- `bw_create_infoobject` and `bw_update_infoobject` take `unit_currency_infoobject`, the unit
+  characteristic that supplies the currency or unit per record — an amount carrying several
+  currencies can now be created at all
+
+### On every release (BW/4HANA and BW 7.5)
+
+**📐 Query design, continued**
+
+- Structure members can be restricted to characteristic values in a hierarchy, not only to
+  text nodes, and `switch_hierarchy` takes key and node type from the new hierarchy (#52)
+- `bw_update_query_characteristic` sets a query-specific description for a characteristic
+
+### Also in this release
+
+- Fixed: a transformation with a combined quantity + unit rule can be changed again (#51);
+  aggregations BW ignores are refused instead of reported as set; descriptions land in the
+  logon language; restricted key figures keep their value on characteristics with a
+  conversion routine
+
+---
+
+## What's New — v1.9.1 · Secure Sign-in on SAP BTP
 
 **🔒 Security fix for hosted servers.** On SAP BTP, a client that registered itself could
 complete the sign-in of a user who was already logged in through SSO without that user's
@@ -144,91 +178,13 @@ Thanks to @alxy for #50, and to @army113 and @MWKAnalytics for the analysis behi
 
 ---
 
-## What's New — v1.8.0 · Agentic Planning Modelling
-
-An agent can now build a BW planning model end to end — aggregation level, planning
-functions, filters and the planning sequence that ties them together — and start the
-process chain that runs it.
-
-### BW/4HANA
-
-**🧮 Agentic Planning Modelling**
-
-- New `bw_create_planning_function` / `bw_update_planning_function` — every standard
-  function type, each one created and read back: copy, delete, repost, distribution by key
-  and by reference data, set values, revaluation, formula (FOX), characteristic
-  relationships, currency and unit translation, forecasting
-- Characteristic usage, conditions, parameters (constant or variable), key figure and data
-  selections in the same call; what the function type may not change is refused before saving
-- New `bw_create_planning_filter` / `bw_update_planning_filter` and
-  `bw_create_planning_sequence` / `bw_update_planning_sequence`; `bw_delete` removes both
-- Deeper reads: `bw_get_planning_filter`, characteristic relationships and data slices in
-  `bw_get_planning_properties`, the function type with all its parameters and the block
-  characteristics in `bw_get_planning_function`
-
-**💱 Currency translation and unit conversion types**
-
-- New `bw_get_conversion_type` / `bw_create_conversion_type` — currency translation and
-  unit conversion types with every option of the BW Modeling Tools: source and target fixed,
-  from the record or from a variable; exchange rate type, rate and time reference; unit
-  factors from T006, an InfoObject or SI units; `bw_delete` removes them
-- Not a planning-only object: a translation type created here serves queries,
-  transformation rules and planning functions alike — until now none could be created
-  outside the modeling tools
-
-**▶️ Process chains start on request**
-
-- New `bw_start_process_chain` — starts a chain now, in the background; with
-  `wait_seconds` it waits for the result, and the log ID leads straight into
-  `bw_get_process_chain_run_detail`
-
-**🌳 Hierarchies**
-
-- New `bw_get_hierarchy`, `bw_create_hierarchy`, `bw_update_hierarchy`,
-  `bw_delete_hierarchy` — text and value nodes; replacing the tree keeps the hierarchy ID,
-  so queries that use it keep working
-
-**🔁 Transformations on a transport**
-
-- `bw_create_transformation` takes a transport request and can activate in the same call (#32)
-
-### On every release (BW/4HANA and BW 7.5)
-
-**📈 Query statistics without SAP GUI**
-
-- New `bw_query_statistics` — executions, users, runtime percentiles and the slowest runs
-  broken down by layer, read from the BW statistics; `bw_query_data` with
-  `with_statistics` measures its own call (#44)
-
-**🔤 Formula and text variables**
-
-- `bw_create_variable` creates formula variables (dimension, default value, unit or
-  currency) and text variables (replacement path or exit); text variables in descriptions
-  are bound so they resolve at runtime instead of showing `&NAME&` (#47)
-
-**🔍 Query data that says what happened**
-
-- `bw_query_data` filters hierarchy nodes, keeps interval bounds, says whether more rows
-  follow and lists what BW did not apply (#45); `bw_get_query` shows display hierarchies
-
-**🛠️ Fixes**
-
-- A short dump no longer leaves the server unable to lock; amount key figures activate;
-  creates work behind a BTP destination and release their lock when they fail; master
-  system read from the system (#34); rate limit per client on Cloud Foundry (#35);
-  dependency advisories cleared (#40)
-
-Thanks to @MWKAnalytics and @oliverluette for the analyses behind #44, #45 and #47.
-
----
-
-**Earlier releases** — the "What's New" notes for v1.7.0 and older are archived in [WHATS_NEW.md](WHATS_NEW.md); the full structured history is in [CHANGELOG.md](CHANGELOG.md).
+**Earlier releases** — the "What's New" notes for v1.8.0 and older are archived in [WHATS_NEW.md](WHATS_NEW.md); the full structured history is in [CHANGELOG.md](CHANGELOG.md).
 
 ---
 
 ## What it can do
 
-An overview by area. Every tool in detail — parameters, behaviour, and the sequences it belongs in — is in the **[Tools Reference](TOOLS.md)** (130 tools).
+An overview by area. Every tool in detail — parameters, behaviour, and the sequences it belongs in — is in the **[Tools Reference](TOOLS.md)** (131 tools).
 
 <p align="center">
   <picture>

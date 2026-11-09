@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [1.10.0] — 2026-11-09
+
 ### Added
 
 - **Repeat a failed process chain step** — new `bw_restart_process_chain_step` repeats a failed or canceled step of a chain run, as "Repeat" in the process chain monitor does: the step runs again as a new instance of the same run and the chain carries on along its success links. Until now the only options were starting the whole chain again, which reruns every finished step, or running the DTP on its own, which leaves the rest of the chain unrun. Without a step number the single failed step is taken; several failed steps need one. The backend answers the call identically whether or not it started anything, so the tool reads the run again and names the new instance. Verified on BW/4HANA: a DTP step that had failed on a lock ran again as a new instance and the chain continued with its successors.

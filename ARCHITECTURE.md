@@ -508,6 +508,7 @@ server's own to end, so the logoff is skipped there.
 | Purpose | Endpoint |
 |---|---|
 | Component value validator | `/sap/bw/modeling/comp/validator` (RKF restriction value → internal key) |
+| Hierarchy as the query editor reads it | `/sap/bw/modeling/comp/hierarchy?characteristic=…&hierarchy=…&iprov=…&members=true` (text node or value, internal and external key — node restrictions in query structures) |
 | InfoObjects | `/sap/bw/modeling/is/values/infoobject` |
 | InfoProviders | `/sap/bw/modeling/is/values/infoprovider` |
 | DataSources | `/sap/bw/modeling/is/values/datasources` |
