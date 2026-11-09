@@ -960,6 +960,15 @@ export interface UpdateRkfArgs {
   transport_request?: string;
 }
 
+interface ValidatedValue {
+  low: string;
+  lowIntKey: string;
+  lowDesc: string;
+  high?: string;
+  highIntKey?: string;
+  highDesc?: string;
+}
+
 /** Validate one restriction value and return its internal key plus display text. */
 async function validateValue(
   client: BwClient,
@@ -967,7 +976,7 @@ async function validateValue(
   provider: string,
   low: string,
   high: string | undefined
-): Promise<{ lowIntKey: string; lowDesc: string; highIntKey?: string; highDesc?: string }> {
+): Promise<ValidatedValue> {
   const highParam = high !== undefined ? `&highvalue=${encodeURIComponent(high)}` : '';
   const result = await client.rawGet(
     `/sap/bw/modeling/comp/validator?name=${encodeURIComponent(characteristic)}` +
@@ -982,7 +991,8 @@ async function validateValue(
         `no internal key. Check the value is valid on InfoProvider '${provider}'.`
     );
   }
-  const out: { lowIntKey: string; lowDesc: string; highIntKey?: string; highDesc?: string } = {
+  const out: ValidatedValue = {
+    low,
     lowIntKey,
     lowDesc: header(result.headers, 'lowdesc') ?? '',
   };
@@ -993,24 +1003,22 @@ async function validateValue(
         `Validation failed for characteristic '${characteristic}' high value '${high}': no internal key.`
       );
     }
+    out.high = high;
     out.highIntKey = highIntKey;
     out.highDesc = header(result.headers, 'highdesc') ?? '';
   }
   return out;
 }
 
-function buildRestrictionToken(
-  operator: RkfOperator,
-  exclude: boolean,
-  v: { lowIntKey: string; lowDesc: string; highIntKey?: string; highDesc?: string }
-): string {
+/** Qry:value carries the external value, internalValue the key; see rkf_create.ts. */
+function buildRestrictionToken(operator: RkfOperator, exclude: boolean, v: ValidatedValue): string {
   const excludeAttr = exclude ? ' exclude="true"' : '';
   const fromDescAttr = v.lowDesc ? ` fromValueDesc="${escapeXml(v.lowDesc)}"` : '';
   if (operator === 'Between') {
     const toDescAttr = v.highDesc ? ` toValueDesc="${escapeXml(v.highDesc)}"` : '';
-    return `<Qry:tokens xsi:type="Qry:SelectionRange" usageType="asFilter"${excludeAttr}${fromDescAttr}${toDescAttr} operator="Between"><Qry:fromValue><Qry:type>Value</Qry:type><Qry:value>${escapeXml(v.lowIntKey)}</Qry:value></Qry:fromValue><Qry:toValue><Qry:type>Value</Qry:type><Qry:value>${escapeXml(v.highIntKey ?? '')}</Qry:value></Qry:toValue></Qry:tokens>`;
+    return `<Qry:tokens xsi:type="Qry:SelectionRange" usageType="asFilter"${excludeAttr}${fromDescAttr}${toDescAttr} operator="Between"><Qry:fromValue internalValue="${escapeXml(v.lowIntKey)}"><Qry:type>Value</Qry:type><Qry:value>${escapeXml(v.low)}</Qry:value></Qry:fromValue><Qry:toValue internalValue="${escapeXml(v.highIntKey ?? '')}"><Qry:type>Value</Qry:type><Qry:value>${escapeXml(v.high ?? '')}</Qry:value></Qry:toValue></Qry:tokens>`;
   }
-  return `<Qry:tokens xsi:type="Qry:SelectionRange" usageType="asFilter"${excludeAttr}${fromDescAttr} operator="${operator}"><Qry:fromValue><Qry:type>Value</Qry:type><Qry:value>${escapeXml(v.lowIntKey)}</Qry:value></Qry:fromValue></Qry:tokens>`;
+  return `<Qry:tokens xsi:type="Qry:SelectionRange" usageType="asFilter"${excludeAttr}${fromDescAttr} operator="${operator}"><Qry:fromValue internalValue="${escapeXml(v.lowIntKey)}"><Qry:type>Value</Qry:type><Qry:value>${escapeXml(v.low)}</Qry:value></Qry:fromValue></Qry:tokens>`;
 }
 
 /** Split a member's groups into the 1KYFNM (base measure) group and the rest. */

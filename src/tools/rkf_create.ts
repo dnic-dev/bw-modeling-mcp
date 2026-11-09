@@ -113,13 +113,19 @@ const RKF_ACCEPT_LIST =
   'application/vnd.sap.bw.modeling.rkf-v1_10_0+xml';
 
 interface ValidatedValue {
+  low: string;
   lowIntKey: string;
   lowDesc: string;
+  high?: string;
   highIntKey?: string;
   highDesc?: string;
 }
 
-/** One restriction token (Qry:tokens / Qry:SelectionRange) built from validated values. */
+/**
+ * One restriction token (Qry:tokens / Qry:SelectionRange) built from validated values.
+ * BW reads Qry:value in external format and takes the internal key from the internalValue
+ * attribute; an internal key in Qry:value is converted again (a month 202401 becomes 240120).
+ */
 function buildRestrictionToken(
   operator: RkfOperator,
   exclude: boolean,
@@ -130,20 +136,20 @@ function buildRestrictionToken(
   if (operator === 'Between') {
     const toDescAttr = v.highDesc ? ` toValueDesc="${escapeXml(v.highDesc)}"` : '';
     return `        <Qry:tokens xsi:type="Qry:SelectionRange" usageType="asFilter"${excludeAttr}${fromDescAttr}${toDescAttr} operator="Between">
-          <Qry:fromValue>
+          <Qry:fromValue internalValue="${escapeXml(v.lowIntKey)}">
             <Qry:type>Value</Qry:type>
-            <Qry:value>${escapeXml(v.lowIntKey)}</Qry:value>
+            <Qry:value>${escapeXml(v.low)}</Qry:value>
           </Qry:fromValue>
-          <Qry:toValue>
+          <Qry:toValue internalValue="${escapeXml(v.highIntKey ?? '')}">
             <Qry:type>Value</Qry:type>
-            <Qry:value>${escapeXml(v.highIntKey ?? '')}</Qry:value>
+            <Qry:value>${escapeXml(v.high ?? '')}</Qry:value>
           </Qry:toValue>
         </Qry:tokens>`;
   }
   return `        <Qry:tokens xsi:type="Qry:SelectionRange" usageType="asFilter"${excludeAttr}${fromDescAttr} operator="${operator}">
-          <Qry:fromValue>
+          <Qry:fromValue internalValue="${escapeXml(v.lowIntKey)}">
             <Qry:type>Value</Qry:type>
-            <Qry:value>${escapeXml(v.lowIntKey)}</Qry:value>
+            <Qry:value>${escapeXml(v.low)}</Qry:value>
           </Qry:fromValue>
         </Qry:tokens>`;
 }
@@ -483,6 +489,7 @@ async function validateValue(
     );
   }
   const validated: ValidatedValue = {
+    low,
     lowIntKey,
     lowDesc: header(result.headers, 'lowdesc') ?? '',
   };
@@ -494,6 +501,7 @@ async function validateValue(
           `comp/validator returned no internal key (highIntKey).`
       );
     }
+    validated.high = high;
     validated.highIntKey = highIntKey;
     validated.highDesc = header(result.headers, 'highdesc') ?? '';
   }
