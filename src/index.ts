@@ -108,7 +108,7 @@ import {
   bwRunRemodeling,
   type RemodelingAction,
 } from './tools/remodeling.js';
-import { bwGetOpenHub } from './tools/openhub.js';
+import { bwGetOpenHub, bwCreateOpenHub, type OpenHubCreateOptions } from './tools/openhub.js';
 import {
   bwGetAggregationLevel,
   bwCreateAggregationLevel,
@@ -1352,10 +1352,10 @@ const TOOL_DEFINITIONS = [
         properties: {
           object_type: {
             type: 'string',
-            enum: ['adso', 'trfn', 'dtpa', 'iobj', 'trcs', 'rsds', 'hcpr', 'alvl'],
+            enum: ['adso', 'trfn', 'dtpa', 'iobj', 'trcs', 'rsds', 'hcpr', 'alvl', 'dest'],
             description:
               'Object type: adso, trfn, dtpa, iobj, trcs, rsds (DataSource), hcpr (CompositeProvider), ' +
-              'or alvl (Aggregation Level).',
+              'alvl (Aggregation Level) or dest (Open Hub Destination).',
           },
           object_name: {
             type: 'string',
@@ -4942,10 +4942,11 @@ const TOOL_DEFINITIONS = [
     {
       name: 'bw_get_open_hub',
       description:
-        'Read an Open Hub Destination (TLOGO DEST) definition — destination type, source, ' +
-        'DB table, InfoArea, package, status, the complete output field list with type/length, ' +
-        'InfoObject binding, conversion routine, compounding, and key flag, ' +
-        'plus file properties when the destination type is FILE.',
+        'Read an Open Hub Destination (TLOGO DEST) definition — destination type, DB table, InfoArea, ' +
+        'package, status, database properties (write mode, technical key, connection) or file properties ' +
+        '(type, name, location, separator), third-party properties, RFC notification flags, and the ' +
+        'complete output field list with type/length, InfoObject binding, conversion routine, ' +
+        'compounding, key flag and external format.',
       inputSchema: {
         type: 'object',
         properties: {
@@ -4955,6 +4956,99 @@ const TOOL_DEFINITIONS = [
           },
         },
         required: ['open_hub_name'],
+      },
+    },
+    {
+      name: 'bw_create_open_hub',
+      description:
+        'Create an Open Hub Destination (TLOGO DEST) from a template object: the server copies the fields ' +
+        'and key of the given aDSO or CompositeProvider and generates the DB table name. ' +
+        'destination_type "TAB" writes into a database table (write mode, technical key, connection), ' +
+        '"FILE" into a flat file (CSV, fixed length or XML; on the application server or the local workstation). ' +
+        'Created inactive — call bw_activate with object_type "dest" and lock_handle "" afterwards, ' +
+        'then bw_create_dtp with target_type "DEST" to load it.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          open_hub_name: {
+            type: 'string',
+            description: 'Technical name of the new Open Hub Destination (e.g. "OBJECT_NAME").',
+          },
+          description: {
+            type: 'string',
+            description: 'Description / label.',
+          },
+          info_area: {
+            type: 'string',
+            description: 'InfoArea to create the destination in (e.g. "INFOAREA_NAME").',
+          },
+          package: {
+            type: 'string',
+            description: 'Development package (default "$TMP").',
+          },
+          destination_type: {
+            type: 'string',
+            enum: ['TAB', 'FILE'],
+            description: 'TAB = database table, FILE = flat file. Default "TAB".',
+          },
+          template_object_name: {
+            type: 'string',
+            description: 'Technical name of the object whose fields and key are copied (an aDSO or a CompositeProvider).',
+          },
+          template_object_type: {
+            type: 'string',
+            enum: ['ADSO', 'HCPR'],
+            description: 'Type of the template object. Default "ADSO".',
+          },
+          write_mode: {
+            type: 'string',
+            enum: ['INSERT', 'DEL_INSERT', 'OVERWRITE'],
+            description: 'TAB only. INSERT (default), DEL_INSERT (delete table contents, then insert) or OVERWRITE (needs a semantic key, not allowed with use_technical_key).',
+          },
+          use_technical_key: {
+            type: 'boolean',
+            description: 'TAB only. true = technical key (request, data package, record number) instead of the semantic key copied from the template. Default false.',
+          },
+          connection_type: {
+            type: 'string',
+            enum: ['LOCAL', 'SDA', 'DBCON'],
+            description: 'TAB only. LOCAL (default) = BW database; SDA or DBCON need db_connection_name.',
+          },
+          db_connection_name: {
+            type: 'string',
+            description: 'TAB only. Name of the SDA or DBCON connection when connection_type is not LOCAL.',
+          },
+          file_type: {
+            type: 'string',
+            enum: ['CSV', 'FIXED', 'XML'],
+            description: 'FILE only. CSV (default), FIXED (fixed length TXT) or XML.',
+          },
+          file_name: {
+            type: 'string',
+            description: 'FILE only. File name; default is the destination name with the extension of the file type (.CSV, .TXT, .XML).',
+          },
+          separator: {
+            type: 'string',
+            description: 'FILE only, CSV only. One character, default ";".',
+          },
+          file_on_app_server: {
+            type: 'boolean',
+            description: 'FILE only. true = file on the application server (server_name, directory, logical_file_name apply); false (default) = local workstation.',
+          },
+          server_name: {
+            type: 'string',
+            description: 'FILE only. Application server name when file_on_app_server is true.',
+          },
+          logical_file_name: {
+            type: 'string',
+            description: 'FILE only. Logical file name (transaction FILE) instead of file_name; application server only.',
+          },
+          directory: {
+            type: 'string',
+            description: 'FILE only. Directory for a file on the local workstation (required there). On the application server the server always uses its work directory on create.',
+          },
+        },
+        required: ['open_hub_name', 'description', 'info_area', 'template_object_name'],
       },
     },
     {
@@ -7653,6 +7747,30 @@ async function handleToolCall(
       case 'bw_get_open_hub':
         text = await bwGetOpenHub(client, args?.open_hub_name as string);
         break;
+
+      case 'bw_create_open_hub': {
+        const options: OpenHubCreateOptions = {
+          description: args?.description as string,
+          infoArea: args?.info_area as string,
+          pkg: args?.package as string | undefined,
+          destinationType: ((args?.destination_type as string | undefined) ?? 'TAB') as OpenHubCreateOptions['destinationType'],
+          templateObjectName: args?.template_object_name as string,
+          templateObjectType: ((args?.template_object_type as string | undefined) ?? 'ADSO') as OpenHubCreateOptions['templateObjectType'],
+          writeMode: args?.write_mode as OpenHubCreateOptions['writeMode'],
+          useTechnicalKey: args?.use_technical_key as boolean | undefined,
+          connectionType: args?.connection_type as OpenHubCreateOptions['connectionType'],
+          dbConnectionName: args?.db_connection_name as string | undefined,
+          fileType: args?.file_type as OpenHubCreateOptions['fileType'],
+          fileName: args?.file_name as string | undefined,
+          separator: args?.separator as string | undefined,
+          fileOnAppServer: args?.file_on_app_server as boolean | undefined,
+          serverName: args?.server_name as string | undefined,
+          logicalFileName: args?.logical_file_name as string | undefined,
+          directory: args?.directory as string | undefined,
+        };
+        text = await bwCreateOpenHub(client, args?.open_hub_name as string, options);
+        break;
+      }
 
       case 'bw_create_aggregation_level':
         text = await bwCreateAggregationLevel(client, args?.aggregation_level_name as string, {

@@ -55,10 +55,10 @@ export async function bwActivate(
   const typeLower = objectType.toLowerCase();
 
   // Validate object type
-  if (!['adso', 'trfn', 'dtpa', 'iobj', 'trcs', 'rsds', 'hcpr', 'alvl'].includes(typeLower)) {
+  if (!['adso', 'trfn', 'dtpa', 'iobj', 'trcs', 'rsds', 'hcpr', 'alvl', 'dest'].includes(typeLower)) {
     return JSON.stringify({
       success: false,
-      message: `Unknown object type: ${objectType}. Supported: adso, trfn, dtpa, iobj, trcs, rsds, hcpr, alvl`,
+      message: `Unknown object type: ${objectType}. Supported: adso, trfn, dtpa, iobj, trcs, rsds, hcpr, alvl, dest`,
     });
   }
 
