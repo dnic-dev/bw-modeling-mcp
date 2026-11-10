@@ -318,6 +318,365 @@ export async function bwGetOpenHub(client: BwClient, openHubName: string): Promi
   return formatOpenHub(parseOpenHubXml(result.body, status), result.body);
 }
 
+// ── Update ───────────────────────────────────────────────────────────────────
+
+export interface OpenHubFieldInput {
+  name: string;
+  infoObjectName?: string;
+  type: string;
+  length: number;
+  label: string;
+  isKey?: boolean;
+}
+
+export interface OpenHubUpdateOptions {
+  description?: string;
+  writeMode?: OpenHubWriteMode;
+  useTechnicalKey?: boolean;
+  connectionType?: OpenHubConnectionType;
+  dbConnectionName?: string;
+  fileType?: OpenHubFileType;
+  fileName?: string;
+  separator?: string;
+  fileOnAppServer?: boolean;
+  serverName?: string;
+  logicalFileName?: string;
+  directory?: string;
+  keyFields?: string[];
+  externalFormatOn?: string[];
+  externalFormatOff?: string[];
+  sendNotificationRfc?: boolean;
+  rfcDestination?: string;
+  dtpExternalProgram?: boolean;
+  fields?: OpenHubFieldInput[];
+  removeFields?: string[];
+  transport?: string;
+}
+
+/**
+ * The output length of a field in external format, as the modeling tools compute it from the
+ * inline type when the external format is switched on.
+ */
+function externalOutputLength(inlineTypeTag: string): number {
+  const type = attr(inlineTypeTag, 'name');
+  const length = Number(attr(inlineTypeTag, 'length') || 0);
+  const precision = Number(attr(inlineTypeTag, 'precision') || 0);
+  const scale = Number(attr(inlineTypeTag, 'scale') || 0);
+  switch (type) {
+    case 'CHAR': case 'NUMC': return length;
+    case 'STRG': case 'SSTR': case 'RSTR': return 0;
+    case 'CUKY': return 5;
+    case 'UNIT': return 3;
+    case 'DEC': case 'CURR': case 'QUAN': {
+      let charLength = 31;
+      if (length !== 0) charLength = Math.floor(length / 2) * 2 + 1;
+      if (precision !== 0) {
+        charLength = Math.floor(precision / 2) * 2 + 1;
+        if (scale > 0) {
+          charLength += 1 + scale;
+          if (scale > 31) charLength -= 31;
+        }
+      }
+      return charLength;
+    }
+    case 'FLTP': return 23;
+    case 'INT1': return 3;
+    case 'INT2': return 5;
+    case 'INT4': return 10;
+    case 'INT8': return 19;
+    case 'LANG': return 2;
+    case 'DATS': return 10;
+    case 'TIMS': return 8;
+    case 'CLNT': return 3;
+    default: return 10;
+  }
+}
+
+function setTagAttr(tag: string, name: string, value: string): string {
+  const re = new RegExp(`\\s${name}="[^"]*"`);
+  return re.test(tag) ? tag.replace(re, ` ${name}="${value}"`) : tag.replace(/(\s*\/?>)$/, ` ${name}="${value}"$1`);
+}
+
+function setElementAttr(xml: string, element: string, name: string, value: string, destName: string): string {
+  const re = new RegExp(`<${element}\\b[^>]*>`);
+  const m = xml.match(re);
+  if (!m) throw new Error(`Open Hub Destination ${destName} has no <${element}> element; this option applies to the other destination type.`);
+  return xml.replace(re, () => setTagAttr(m[0], name, value));
+}
+
+function elementBlock(xml: string, fieldName: string): RegExpMatchArray | null {
+  const esc = fieldName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  return xml.match(new RegExp(`<element\\b[^>]*\\bname="${esc}"[^>]*>[\\s\\S]*?</element>`));
+}
+
+function buildDestElement(field: OpenHubFieldInput): string {
+  const name = field.name.toUpperCase();
+  const label = escapeXmlAttr(field.label);
+  if (field.infoObjectName) {
+    const iobj = field.infoObjectName.toUpperCase();
+    return (
+      `<element externalFormat="false" xsi:type="dest:DestElement" name="${name}" infoObjectName="${iobj}">` +
+      `<endUserTexts label="${label}"/>` +
+      `<inlineType name="${field.type}" globalElementName="${iobj}" length="${field.length}"/>` +
+      `<localProperties xsi:type="BwCore:LocalCharacteristicProperties"/>` +
+      `<associationType>1</associationType>` +
+      `</element>`
+    );
+  }
+  return (
+    `<element externalFormat="false" xsi:type="dest:DestElement" name="${name}">` +
+    `<endUserTexts label="${label}"/>` +
+    `<inlineType name="${field.type}" length="${field.length}"/>` +
+    `<localProperties xsi:type="BwCore:LocalCharacteristicProperties"/>` +
+    `</element>`
+  );
+}
+
+/**
+ * Change an Open Hub Destination as the modeling tools' editor does: the document is read,
+ * changed in place and written back. The destination type itself is not switched here, since
+ * the editor drops every property and the key on a switch; create a new destination instead.
+ */
+export async function bwUpdateOpenHub(client: BwClient, openHubName: string, o: OpenHubUpdateOptions): Promise<string> {
+  const name = openHubName.toUpperCase();
+  const destMedia = MEDIA_TYPES['dest'];
+  const path = `/sap/bw/modeling/dest/${bwSeg(name)}/m`;
+  const applied: string[] = [];
+
+  const lockHandle = await client.lock('dest', name);
+  try {
+    const got = await client.get(`${path}?forceCacheUpdate=true`, destMedia);
+    const timestamp = got.headers['timestamp'] ?? got.headers['TIMESTAMP'];
+    let xml = got.body;
+    const destType = attr(xml.match(/<dest:destination\b[^>]*>/)?.[0] ?? '', 'destinationType');
+    const isTable = destType === 'TAB';
+    const isFile = destType === 'FILE';
+
+    if (o.description !== undefined) {
+      const at = xml.indexOf('<element');
+      const head = at >= 0 ? xml.slice(0, at) : xml;
+      const tag = `<endUserTexts label="${escapeXmlAttr(o.description)}"/>`;
+      xml = /<endUserTexts\b[^>]*\/>/.test(head)
+        ? head.replace(/<endUserTexts\b[^>]*\/>/, tag) + (at >= 0 ? xml.slice(at) : '')
+        : xml.replace(/(<dest:destination\b[^>]*>)/, `$1${tag}`);
+      applied.push('description');
+    }
+
+    const dbOptions = o.writeMode !== undefined || o.useTechnicalKey !== undefined || o.connectionType !== undefined || o.dbConnectionName !== undefined;
+    if (dbOptions && !isTable) throw new Error(`Open Hub Destination ${name} is a ${destType} destination; the database options apply to a table destination only.`);
+    const fileOptions = o.fileType !== undefined || o.fileName !== undefined || o.separator !== undefined || o.fileOnAppServer !== undefined || o.serverName !== undefined || o.logicalFileName !== undefined || o.directory !== undefined;
+    if (fileOptions && !isFile) throw new Error(`Open Hub Destination ${name} is a ${destType} destination; the file options apply to a file destination only.`);
+
+    if (isTable) {
+      const dbTag = () => xml.match(/<databaseProperties\b[^>]*>/)?.[0] ?? '';
+      const technicalKey = o.useTechnicalKey ?? attr(dbTag(), 'useTechnicalKey') === 'true';
+      let writeMode = o.writeMode ?? attr(dbTag(), 'writeMode');
+      if (o.useTechnicalKey !== undefined) {
+        xml = setElementAttr(xml, 'databaseProperties', 'useTechnicalKey', String(o.useTechnicalKey), name);
+        applied.push(`technical key ${o.useTechnicalKey}`);
+        if (o.useTechnicalKey) {
+          // The editor clears the semantic key and turns overwrite into delete-and-insert.
+          if (/<keyElement>/.test(xml)) {
+            xml = xml.replace(/<keyElement>[^<]*<\/keyElement>/g, '');
+            applied.push('semantic key removed (technical key)');
+          }
+          if (writeMode === 'OVERWRITE' && o.writeMode === undefined) {
+            writeMode = 'DEL_INSERT';
+            xml = setElementAttr(xml, 'databaseProperties', 'writeMode', 'DEL_INSERT', name);
+            applied.push('write mode DEL_INSERT (overwrite needs a semantic key)');
+          }
+        }
+      }
+      if (o.writeMode !== undefined) {
+        if (technicalKey && o.writeMode === 'OVERWRITE') {
+          throw new Error('write_mode "OVERWRITE" needs a semantic key; with a technical key only "INSERT" or "DEL_INSERT" are possible.');
+        }
+        xml = setElementAttr(xml, 'databaseProperties', 'writeMode', o.writeMode, name);
+        applied.push(`write mode ${o.writeMode}`);
+      }
+      if (o.connectionType !== undefined) {
+        const connectionName = o.dbConnectionName ?? attr(dbTag(), 'dbConnectionName');
+        if (o.connectionType !== 'LOCAL' && !connectionName) throw new Error(`connection_type "${o.connectionType}" requires db_connection_name.`);
+        xml = setElementAttr(xml, 'databaseProperties', 'connectionType', o.connectionType, name);
+        if (o.connectionType === 'LOCAL' && o.dbConnectionName === undefined) xml = setElementAttr(xml, 'databaseProperties', 'dbConnectionName', '', name);
+        applied.push(`connection type ${o.connectionType}`);
+      }
+      if (o.dbConnectionName !== undefined) {
+        xml = setElementAttr(xml, 'databaseProperties', 'dbConnectionName', escapeXmlAttr(o.dbConnectionName), name);
+        applied.push(`connection name ${o.dbConnectionName || '(none)'}`);
+      }
+      if (o.keyFields !== undefined) {
+        if (technicalKey) throw new Error('key_fields cannot be set while the technical key is used; set use_technical_key false first.');
+        const names = o.keyFields.map((f) => f.trim()).filter(Boolean);
+        for (const f of names) {
+          if (!elementBlock(xml, f) && !(o.fields ?? []).some((n) => n.name.toUpperCase() === f.toUpperCase())) {
+            throw new Error(`key field ${f} is not a field of Open Hub Destination ${name}. bw_get_open_hub lists the field names, including any $BIC$ prefix.`);
+          }
+        }
+        xml = xml.replace(/<keyElement>[^<]*<\/keyElement>/g, '');
+        const keyXml = names.map((f) => `<keyElement>#///${f}</keyElement>`).join('');
+        xml = xml.replace(/<tlogoProperties\b/, `${keyXml}<tlogoProperties`);
+        applied.push(`key fields ${names.join(', ') || '(none)'}`);
+      }
+    } else if (o.keyFields !== undefined) {
+      throw new Error(`key_fields apply to a table destination only; ${name} is a ${destType} destination.`);
+    }
+
+    if (isFile) {
+      const fpTag = () => xml.match(/<fileProperties\b[^>]*>/)?.[0] ?? '';
+      if (o.fileType !== undefined) {
+        const lit = FILE_TYPE_LITERALS[o.fileType];
+        xml = setElementAttr(xml, 'fileProperties', 'fileType', lit.literal, name);
+        const current = attr(fpTag(), 'fileName');
+        if (o.fileName === undefined && current.includes('.')) {
+          xml = setElementAttr(xml, 'fileProperties', 'fileName', current.replace(/\.[^.]*$/, '') + lit.extension, name);
+        }
+        if (o.fileType === 'XML' && attr(fpTag(), 'isSapStandardXml') !== 'true' && attr(fpTag(), 'isStandardBinaryXml') !== 'true') {
+          xml = setElementAttr(xml, 'fileProperties', 'isSapStandardXml', 'true', name);
+        }
+        applied.push(`file type ${o.fileType}`);
+      }
+      if (o.fileName !== undefined) {
+        xml = setElementAttr(xml, 'fileProperties', 'fileName', escapeXmlAttr(o.fileName), name);
+        applied.push(`file name ${o.fileName}`);
+      }
+      if (o.separator !== undefined) {
+        if (attr(fpTag(), 'fileType') !== 'FILE') throw new Error('separator applies to a CSV file only.');
+        if (o.separator.length !== 1) throw new Error('separator must be exactly one character.');
+        xml = setElementAttr(xml, 'fileProperties', 'separator', escapeXmlAttr(o.separator), name);
+        applied.push(`separator ${o.separator}`);
+      }
+      if (o.fileOnAppServer !== undefined) {
+        xml = setElementAttr(xml, 'fileProperties', 'isFileOnAppserver', String(o.fileOnAppServer), name);
+        if (!o.fileOnAppServer) {
+          // The editor drops the logical file name and the directory when the file leaves the server.
+          xml = setElementAttr(xml, 'fileProperties', 'isLogicalFileNameSet', 'false', name);
+          xml = setElementAttr(xml, 'fileProperties', 'path', o.directory !== undefined ? escapeXmlAttr(o.directory) : '', name);
+        }
+        applied.push(`file on application server ${o.fileOnAppServer}`);
+      }
+      const onServer = attr(fpTag(), 'isFileOnAppserver') === 'true';
+      if (o.serverName !== undefined) {
+        if (!onServer) throw new Error('server_name applies to a file on the application server.');
+        xml = setElementAttr(xml, 'fileProperties', 'serverName', escapeXmlAttr(o.serverName), name);
+        applied.push(`server ${o.serverName}`);
+      }
+      if (o.logicalFileName !== undefined) {
+        if (!onServer) throw new Error('logical_file_name applies to a file on the application server.');
+        xml = setElementAttr(xml, 'fileProperties', 'isLogicalFileNameSet', String(o.logicalFileName !== ''), name);
+        xml = setElementAttr(xml, 'fileProperties', 'logicalFileName', escapeXmlAttr(o.logicalFileName), name);
+        applied.push(o.logicalFileName ? `logical file name ${o.logicalFileName}` : 'logical file name removed');
+      }
+      if (o.directory !== undefined && o.fileOnAppServer !== false) {
+        // The server keeps its work directory for a file on the application server, whatever is sent.
+        if (onServer) throw new Error('directory applies to a file on the local workstation; on the application server the server always uses its work directory.');
+        xml = setElementAttr(xml, 'fileProperties', 'path', escapeXmlAttr(o.directory), name);
+        applied.push(`directory ${o.directory || '(none)'}`);
+      }
+    }
+
+    if (o.sendNotificationRfc !== undefined || o.rfcDestination !== undefined) {
+      const send = o.sendNotificationRfc ?? attr(xml.match(/<dest:destination\b[^>]*>/)?.[0] ?? '', 'sendNotificationRFC') === 'true';
+      if (send && !(o.rfcDestination ?? attr(xml.match(/<dest:destination\b[^>]*>/)?.[0] ?? '', 'sendNotificationRFCDest'))) {
+        throw new Error('send_notification_rfc needs rfc_destination, the RFC destination that is notified after a load.');
+      }
+      xml = setElementAttr(xml, 'dest:destination', 'sendNotificationRFC', String(send), name);
+      xml = setElementAttr(xml, 'dest:destination', 'sendNotificationRFCDest', send ? escapeXmlAttr(o.rfcDestination ?? '') : '', name);
+      applied.push(send ? `RFC notification to ${o.rfcDestination}` : 'RFC notification off');
+    }
+    if (o.dtpExternalProgram !== undefined) {
+      xml = setElementAttr(xml, 'dest:destination', 'dtpExternalProgram', String(o.dtpExternalProgram), name);
+      applied.push(`DTP started by external program ${o.dtpExternalProgram}`);
+    }
+
+    if (o.removeFields?.length) {
+      for (const raw of o.removeFields) {
+        const block = elementBlock(xml, raw);
+        if (!block) throw new Error(`field ${raw} is not a field of Open Hub Destination ${name}.`);
+        xml = xml.replace(block[0], '');
+        xml = xml.replace(new RegExp(`<keyElement>#///${raw.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}</keyElement>`), '');
+      }
+      applied.push(`fields removed ${o.removeFields.join(', ')}`);
+    }
+    if (o.fields?.length) {
+      const added: string[] = [];
+      const keys: string[] = [];
+      for (const f of o.fields) {
+        if (elementBlock(xml, f.name.toUpperCase())) continue;
+        xml = xml.replace(/<keyElement>|<tlogoProperties\b/, (m) => buildDestElement(f) + m);
+        added.push(f.name.toUpperCase());
+        if (f.isKey) keys.push(f.name.toUpperCase());
+      }
+      if (keys.length) {
+        if (!isTable || attr(xml.match(/<databaseProperties\b[^>]*>/)?.[0] ?? '', 'useTechnicalKey') === 'true') {
+          throw new Error('is_key needs a table destination with a semantic key.');
+        }
+        xml = xml.replace(/<tlogoProperties\b/, keys.map((k) => `<keyElement>#///${k}</keyElement>`).join('') + '<tlogoProperties');
+      }
+      applied.push(added.length ? `fields added ${added.join(', ')}` : 'no new fields (all exist)');
+    }
+
+    const formatChanges: Array<[string[] | undefined, boolean]> = [[o.externalFormatOn, true], [o.externalFormatOff, false]];
+    for (const [list, on] of formatChanges) {
+      for (const raw of list ?? []) {
+        const block = elementBlock(xml, raw);
+        if (!block) throw new Error(`field ${raw} is not a field of Open Hub Destination ${name}.`);
+        let el = block[0];
+        const openTag = el.match(/<element\b[^>]*>/)![0];
+        let newTag = setTagAttr(openTag, 'externalFormat', String(on));
+        if (on) {
+          const inlineTag = el.match(/<inlineType\b[^>]*>/)?.[0] ?? '';
+          newTag = setTagAttr(newTag, 'outputLength', String(externalOutputLength(inlineTag)));
+          newTag = setTagAttr(newTag, 'outputDataType', /name="(STRG|SSTR|RSTR)"/.test(inlineTag) ? 'STRG' : 'CHAR');
+        } else {
+          newTag = newTag.replace(/\soutputDataType="[^"]*"/, '');
+        }
+        el = el.replace(openTag, newTag);
+        xml = xml.replace(block[0], () => el);
+      }
+      if (list?.length) applied.push(`external format ${on ? 'on' : 'off'} for ${list.join(', ')}`);
+    }
+    if (isTable && o.externalFormatOn?.length) {
+      // The editor refuses a key whose external output lengths exceed 449 characters.
+      const keyNames = [...xml.matchAll(/<keyElement>#\/\/\/([^<]+)<\/keyElement>/g)].map((m) => m[1]);
+      let sum = 0;
+      for (const k of keyNames) {
+        const tag = elementBlock(xml, k)?.[0].match(/<element\b[^>]*>/)?.[0] ?? '';
+        if (attr(tag, 'externalFormat') === 'true') sum += Number(attr(tag, 'outputLength') || 0);
+      }
+      if (sum > 449) throw new Error(`The external output lengths of the key fields add up to ${sum}, more than the 449 characters the modeling tools allow.`);
+    }
+
+    if (applied.length === 0) {
+      return JSON.stringify({ success: true, open_hub_name: name, message: 'Nothing to change.' });
+    }
+    xml = xml.replace(/<consumptionViewProperties\b[^>]*\/>/g, '');
+    xml = xml.replace(/<contentState>[^<]*<\/contentState>/, '<contentState>REV</contentState>');
+    await client.put('dest', name, lockHandle, xml, timestamp, o.transport);
+  } finally {
+    await client.unlock('dest', name).catch(() => {/* the result of the write decides */});
+  }
+
+  const result = await client.get(path, destMedia);
+  const status = result.headers['object_status'] ?? result.headers['OBJECT_STATUS'] ?? 'unknown';
+  const info = parseOpenHubXml(result.body, status);
+  return JSON.stringify(
+    {
+      success: true,
+      open_hub_name: name,
+      status: info.status,
+      applied,
+      field_count: info.fields.length,
+      key_fields: info.fields.filter((f) => f.key).map((f) => f.name),
+      database_properties: info.databaseProperties,
+      file_properties: info.fileProperties,
+      message: `Open Hub Destination ${name} updated (${applied.join('; ')}). Activate it with bw_activate (object_type "dest", lock_handle "").`,
+    },
+    null,
+    2,
+  );
+}
+
 // ── Create ───────────────────────────────────────────────────────────────────
 
 export type OpenHubDestinationType = 'TAB' | 'FILE';

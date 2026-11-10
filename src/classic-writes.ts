@@ -35,6 +35,7 @@ export const CLASSIC_WRITE_STATUS: Record<string, ClassicWriteStatus> = {
   bw_update_adso: { verdict: 'verified', note: 'add_field, add_pure_field, manage_keys, update_settings, update_field_properties' },
   bw_create_infosource: { verdict: 'verified' },
   bw_create_open_hub: { verdict: 'verified', note: 'table and file destinations from an aDSO template, activated and deleted; no SDA connection type on this release' },
+  bw_update_open_hub: { verdict: 'verified', note: 'description, write mode, key, external format and a new field on a table destination, activated' },
   bw_update_infosource: { verdict: 'verified' },
   bw_create_composite_provider: { verdict: 'verified' },
   bw_update_composite_provider: { verdict: 'verified', note: 'add_input, update_mapping' },

@@ -108,7 +108,7 @@ import {
   bwRunRemodeling,
   type RemodelingAction,
 } from './tools/remodeling.js';
-import { bwGetOpenHub, bwCreateOpenHub, type OpenHubCreateOptions } from './tools/openhub.js';
+import { bwGetOpenHub, bwCreateOpenHub, bwUpdateOpenHub, type OpenHubCreateOptions, type OpenHubUpdateOptions } from './tools/openhub.js';
 import {
   bwGetAggregationLevel,
   bwCreateAggregationLevel,
@@ -5138,6 +5138,63 @@ const TOOL_DEFINITIONS = [
       },
     },
     {
+      name: 'bw_update_open_hub',
+      description:
+        'Change an Open Hub Destination (TLOGO DEST): description, the database options of a table destination ' +
+        '(write mode, technical key, connection), the file options of a file destination (type, name, separator, ' +
+        'location, directory, logical file name), the semantic key, the external format of fields, the RFC notification, ' +
+        'and the field list (add or remove fields). The rules of the modeling tools apply: a technical key removes the ' +
+        'semantic key and turns overwrite into delete-and-insert; overwrite needs a semantic key. The destination type ' +
+        'itself is not switched. Saved inactive — call bw_activate with object_type "dest" and lock_handle "" afterwards.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          open_hub_name: { type: 'string', description: 'Technical name of the Open Hub Destination (e.g. "OBJECT_NAME").' },
+          description: { type: 'string', description: 'New description / label.' },
+          write_mode: { type: 'string', enum: ['INSERT', 'DEL_INSERT', 'OVERWRITE'], description: 'Table only. OVERWRITE needs a semantic key.' },
+          use_technical_key: { type: 'boolean', description: 'Table only. true removes the semantic key (and turns OVERWRITE into DEL_INSERT); false allows key_fields again.' },
+          connection_type: { type: 'string', enum: ['LOCAL', 'SDA', 'DBCON'], description: 'Table only. SDA or DBCON need db_connection_name.' },
+          db_connection_name: { type: 'string', description: 'Table only. Connection name for SDA or DBCON; empty string clears it.' },
+          key_fields: {
+            type: 'array',
+            items: { type: 'string' },
+            description: 'Table only, without technical key. The complete semantic key in order, by field name as bw_get_open_hub lists it (including any $BIC$ prefix); an empty array clears the key.',
+          },
+          external_format_on: { type: 'array', items: { type: 'string' }, description: 'Fields to switch to external format; output type and length follow the modeling tools (CHAR with the display length, STRG for strings).' },
+          external_format_off: { type: 'array', items: { type: 'string' }, description: 'Fields to switch back to internal format.' },
+          file_type: { type: 'string', enum: ['CSV', 'FIXED', 'XML'], description: 'File only. The file name extension follows (.CSV, .TXT, .XML) unless file_name is given.' },
+          file_name: { type: 'string', description: 'File only.' },
+          separator: { type: 'string', description: 'File only, CSV only. One character.' },
+          file_on_app_server: { type: 'boolean', description: 'File only. false moves the file to the local workstation and drops server name, logical file name and directory (pass directory for the workstation).' },
+          server_name: { type: 'string', description: 'File only, application server only.' },
+          logical_file_name: { type: 'string', description: 'File only, application server only. Logical file name (transaction FILE); an empty string returns to the physical file name.' },
+          directory: { type: 'string', description: 'File only, local workstation only. On the application server the server always uses its work directory.' },
+          send_notification_rfc: { type: 'boolean', description: 'Notify an RFC destination after a load; needs rfc_destination.' },
+          rfc_destination: { type: 'string', description: 'RFC destination for the notification.' },
+          dtp_external_program: { type: 'boolean', description: 'The DTP into this destination is started by an external program.' },
+          fields: {
+            type: 'array',
+            description: 'Fields to add; existing fields are kept. A field bound to an InfoObject takes its type and length.',
+            items: {
+              type: 'object',
+              properties: {
+                name: { type: 'string', description: 'Field name (uppercase).' },
+                infoobject_name: { type: 'string', description: 'InfoObject to bind the field to (omit for a plain field).' },
+                type: { type: 'string', description: 'Data type (e.g. CHAR, NUMC, DEC, CURR, DATS).' },
+                length: { type: 'number', description: 'Field length.' },
+                label: { type: 'string', description: 'Field label.' },
+                is_key: { type: 'boolean', description: 'Also add the field to the semantic key (table destination without technical key).' },
+              },
+              required: ['name', 'type', 'length', 'label'],
+            },
+          },
+          remove_fields: { type: 'array', items: { type: 'string' }, description: 'Field names to remove, including from the key.' },
+          transport: { type: 'string', description: 'Transport request to record the change on.' },
+        },
+        required: ['open_hub_name'],
+      },
+    },
+    {
       name: 'bw_get_aggregation_level',
       description:
         'Read an Aggregation Level (TLOGO ALVL) definition — the planning-enabled view on top of ' +
@@ -7875,6 +7932,42 @@ async function handleToolCall(
           directory: args?.directory as string | undefined,
         };
         text = await bwCreateOpenHub(client, args?.open_hub_name as string, options);
+        break;
+      }
+
+      case 'bw_update_open_hub': {
+        const rawFields = args?.fields as Array<Record<string, unknown>> | undefined;
+        const options: OpenHubUpdateOptions = {
+          description: args?.description as string | undefined,
+          writeMode: args?.write_mode as OpenHubUpdateOptions['writeMode'],
+          useTechnicalKey: args?.use_technical_key as boolean | undefined,
+          connectionType: args?.connection_type as OpenHubUpdateOptions['connectionType'],
+          dbConnectionName: args?.db_connection_name as string | undefined,
+          keyFields: args?.key_fields as string[] | undefined,
+          externalFormatOn: args?.external_format_on as string[] | undefined,
+          externalFormatOff: args?.external_format_off as string[] | undefined,
+          fileType: args?.file_type as OpenHubUpdateOptions['fileType'],
+          fileName: args?.file_name as string | undefined,
+          separator: args?.separator as string | undefined,
+          fileOnAppServer: args?.file_on_app_server as boolean | undefined,
+          serverName: args?.server_name as string | undefined,
+          logicalFileName: args?.logical_file_name as string | undefined,
+          directory: args?.directory as string | undefined,
+          sendNotificationRfc: args?.send_notification_rfc as boolean | undefined,
+          rfcDestination: args?.rfc_destination as string | undefined,
+          dtpExternalProgram: args?.dtp_external_program as boolean | undefined,
+          fields: rawFields?.map((f) => ({
+            name: f['name'] as string,
+            infoObjectName: f['infoobject_name'] as string | undefined,
+            type: f['type'] as string,
+            length: f['length'] as number,
+            label: f['label'] as string,
+            isKey: f['is_key'] as boolean | undefined,
+          })),
+          removeFields: args?.remove_fields as string[] | undefined,
+          transport: args?.transport as string | undefined,
+        };
+        text = await bwUpdateOpenHub(client, args?.open_hub_name as string, options);
         break;
       }
 
