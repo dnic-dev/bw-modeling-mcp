@@ -129,6 +129,58 @@ interface DtpInfo {
   filterFields: DtpFilterField[];
   globalRoutineCode: string[];
   semanticGroupFields: { name: string; description: string; isKey: boolean; isField: boolean }[];
+  admissible: Map<string, string[]>;
+}
+
+/**
+ * The values the server allows for the settings of this DTP, as the modeling tools read them:
+ * one <admissibleAttributes attribute="..."> per setting with its <value> entries. A setting
+ * with a single value cannot be changed; "X" and "" are the flag values true and false.
+ */
+export function parseAdmissibleAttributes(xml: string): Map<string, string[]> {
+  const result = new Map<string, string[]>();
+  for (const m of xml.matchAll(/<admissibleAttributes\b[^>]*\battribute="([^"]*)"[^>]*?(?:\/>|>([\s\S]*?)<\/admissibleAttributes>)/g)) {
+    const values = [...(m[2] ?? '').matchAll(/<value(?:\/>|>([^<]*)<\/value>)/g)].map((v) => v[1] ?? '');
+    result.set(m[1], values);
+  }
+  return result;
+}
+
+/** The DTP settings the admissible attributes govern, with the model attribute each one maps to. */
+export const DTP_ADMISSIBLE_SETTINGS: Record<string, { label: string; flag: boolean }> = {
+  UPDMODE: { label: 'extraction mode (extractionSettings/extractionMode)', flag: false },
+  PAR_X: { label: 'parallel extraction (extractionSettings/parallelExtraction)', flag: true },
+  IGNORE_QUALOK: { label: 'extract all green requests (requestSelection/extractAllGreenRequests)', flag: true },
+  FETCHUNTILEOF: { label: 'retrieve until no more new data (requestSelection/retrieveUntilNoMoreNewData)', flag: true },
+  SINGLEREQUEST: { label: 'get all new data request by request (requestSelection/getAllNewDataRequestByRequest)', flag: true },
+  INITSIMU: { label: 'delta init without data (requestSelection/deltaInitWithoutData)', flag: true },
+  ONLYLASTREQUEST: { label: 'only retrieve last request (requestSelection/onlyRetrieveLastRequest)', flag: true },
+  DELTAONLYONCE: { label: 'only get delta once (requestSelection/onlyGetDeltaOnce)', flag: true },
+  AUTOQUALOK: { label: 'automatic overall request status (overallRequestStatus)', flag: true },
+  ERRORHANDLING: { label: 'error handling (errorHandling/requestHandling)', flag: false },
+  TRACK_RECORDS: { label: 'track records after failed request (errorHandling/trackRecords)', flag: true },
+  ADSO_EXTRACT_FROM: { label: 'extraction from (source/dataStoreObject/extractionFrom)', flag: false },
+  ADSO_HIST_MOVEMENTS: { label: 'historical movements (target/dataStoreObject)', flag: true },
+  IOBJ_INSERTONLY: { label: 'insert only (target/infoObjectMasterData)', flag: true },
+  IOBJ_BOOKMODE: { label: 'book mode (target/infoObjectMasterData)', flag: true },
+  IOBJ_HANDLE_DUPREC: { label: 'handle duplicate records (target/infoObjectMasterData)', flag: true },
+};
+
+/**
+ * Refuse a value the server does not admit for this DTP before anything is written. Without
+ * the check the server answers the PUT with HTTP 500 and no message. A setting the document
+ * does not list is left to the server.
+ */
+export function assertAdmissible(admissible: Map<string, string[]>, attribute: string, value: string, shown: string): void {
+  const allowed = admissible.get(attribute);
+  if (!allowed || allowed.includes(value)) return;
+  const label = DTP_ADMISSIBLE_SETTINGS[attribute]?.label ?? attribute;
+  const show = (v: string) => (v === '' ? '"" (off)' : v === 'X' ? '"X" (on)' : `"${v}"`);
+  throw new Error(
+    `${shown} is not admissible for this DTP: the server allows ${allowed.map(show).join(', ')} for the ${label}` +
+    (allowed.length === 1 ? ', so this setting cannot be changed here' : '') +
+    '. bw_get_dtp lists the admissible values of every setting.',
+  );
 }
 
 function parseDtpXml(xml: string, status: string): DtpInfo {
@@ -247,6 +299,7 @@ function parseDtpXml(xml: string, status: string): DtpInfo {
     filterFields,
     globalRoutineCode,
     semanticGroupFields,
+    admissible: parseAdmissibleAttributes(xml),
   };
 }
 
@@ -331,6 +384,16 @@ export async function bwGetDtp(client: BwClient, dtpName: string, format: 'text'
     lines.push('', '── Global Routine Code ──');
     for (const line of info.globalRoutineCode) {
       lines.push(`  ${line}`);
+    }
+  }
+
+  if (info.admissible.size > 0) {
+    lines.push('', `── Admissible Settings (what the server allows for this DTP) ──`);
+    for (const [attribute, values] of info.admissible) {
+      const def = DTP_ADMISSIBLE_SETTINGS[attribute];
+      const shown = values.map((v) => (def?.flag ? (v === 'X' ? 'on' : v === '' ? 'off' : v) : v === '' ? '""' : v));
+      const fixed = values.length <= 1 ? ' (fixed)' : '';
+      lines.push(`  ${attribute}${def ? ` — ${def.label}` : ''}: ${shown.join(' | ')}${fixed}`);
     }
   }
 
@@ -1091,6 +1154,7 @@ export async function bwUpdateDtp(
     if (args.extraction_mode !== undefined) {
       const extractionMode = args.extraction_mode === 'full' ? 'F' : 'D';
       const deltaSettingStatus = args.extraction_mode === 'full' ? '0' : '2';
+      assertAdmissible(parseAdmissibleAttributes(putXml), 'UPDMODE', extractionMode, `extraction_mode "${args.extraction_mode}"`);
       putXml = putXml.replace(
         /<extractionSettings\b[^>]*\/>/,
         (tag) => tag

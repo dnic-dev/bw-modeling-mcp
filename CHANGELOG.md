@@ -9,6 +9,7 @@
 
 ### Improved
 
+- **`bw_update_dtp` refuses an extraction mode the server does not admit** — the server lists, per DTP, the values each setting may take, as the modeling tools read them to grey out what cannot be changed. A DTP whose delta is initialized admits only delta, for one. Until now the tool wrote the mode anyway and the server answered HTTP 500 without a message; the value is now checked against that list before anything is written, and refused with the admissible values named. `bw_get_dtp` shows the admissible values of every setting, marking the ones that are fixed for this DTP.
 - **`bw_create_composite_provider` writes the schema version the system announces** — the version came fixed from the code; it is now taken from the CompositeProvider content type in the system's discovery document, as the modeling tools do, so a system on another resource version gets its own version instead of a foreign one.
 
 ### Fixed
