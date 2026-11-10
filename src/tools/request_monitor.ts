@@ -169,6 +169,15 @@ export async function bwGetRequest(
   storage: string = 'AQ',
   format: 'text' | 'raw' = 'text',
 ): Promise<string> {
+  // Without a request the processes endpoint answers with every process step of the system,
+  // tens of thousands of lines, so the call must stop here instead of reading that list.
+  if (!requestTsn || !/^\d{23}$/.test(String(requestTsn).trim())) {
+    throw new Error(
+      `request_tsn must be the 23-digit request TSN (e.g. "20250101120000000001000"), got ${JSON.stringify(requestTsn)}. ` +
+      `Take it from bw_list_requests or bw_run_dtp.`,
+    );
+  }
+  requestTsn = String(requestTsn).trim();
   const s = storage.toLowerCase();
   const headerUrl = `/sap/bc/http/sap/bw4/v1/manage/requests/${encodeURIComponent(requestTsn)}/${s}`;
   const dtpInfoUrl = `/sap/bc/http/sap/bw4/v1/manage/requests/${encodeURIComponent(requestTsn)}/${s}/datatransferprocessinformation`;
