@@ -1080,6 +1080,20 @@ export async function bwRunDtp(dtpName: string): Promise<string> {
   }
   const requestId = location.split('/').filter(Boolean).pop() ?? '';
 
+  // A delta DTP whose source has no new request opens no request at all; the backend then
+  // answers with a Location whose request id is all zeros.
+  if (/^0+$/.test(requestId)) {
+    return JSON.stringify({
+      success: true,
+      dtp_name: dtpUpper,
+      request_id: null,
+      no_new_data: true,
+      message:
+        `DTP ${dtpUpper} ran but loaded nothing: the source holds no new data for this DTP, so no request was created ` +
+        `(a delta DTP only picks up source requests it has not transferred yet). Nothing to monitor.`,
+    });
+  }
+
   return JSON.stringify({
     success: true,
     dtp_name: dtpUpper,
