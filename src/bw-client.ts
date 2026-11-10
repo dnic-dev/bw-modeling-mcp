@@ -351,6 +351,8 @@ function holdsLock(client: BwClient): boolean {
  */
 const sessionScope = new AsyncLocalStorage<Set<BwClient>>();
 const openScopes = new Set<Set<BwClient>>();
+/** The scope every client of this process joins, once trackSessionsForProcess() has set it up. */
+let processScope: Set<BwClient> | undefined;
 const SESSION_CLOSE_TIMEOUT_MS = 5000;
 
 /** `BW_SESSION_CLOSE=off` keeps sessions open, for a proxy that holds the session itself. */
@@ -404,6 +406,23 @@ export async function closeAllSessions(): Promise<void> {
   lockSessions.clear();
   logoffInBackground(clients);
   await sessionsClosed();
+}
+
+/**
+ * Track every session of this process in one scope and end them all when the process is about to
+ * exit. For scripts that call the tool functions directly, outside the server's per-call scope:
+ * without it every client they create keeps its logon until the backend's session timeout, and a
+ * series of such scripts fills the backend with sessions (50 of them, 65 MB each, brought a single
+ * instance to "server resources exhausted").
+ */
+export function trackSessionsForProcess(): void {
+  const scope = new Set<BwClient>();
+  openScopes.add(scope);
+  processScope = scope;
+  let closing: Promise<void> | undefined;
+  process.on('beforeExit', () => {
+    if (!closing) closing = closeAllSessions();
+  });
 }
 
 export class BwClient {
@@ -621,6 +640,7 @@ export class BwClient {
     // On every response rather than at construction: a client cached across calls has to be
     // ended by each call that used it, not only by the one that built it.
     sessionScope.getStore()?.add(this);
+    processScope?.add(this);
     const setCookies = response.headers['set-cookie'];
     if (!setCookies) return;
     if (this.sessionDebug) {
