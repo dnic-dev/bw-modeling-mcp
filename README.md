@@ -245,6 +245,7 @@ For **local (stdio)** use, the server is configured via environment variables. F
 | `BW_COOKIE_FILE` | Path to a browser-exported cookie file for SAML-/OAuth-fronted systems (e.g. BW Bridge). Netscape or `name=value` format. When set, `BW_USER` / `BW_PASSWORD` are optional. | no |
 | `BW_MCP_SERVER_NAME` | Server name advertised in the MCP `initialize` handshake. Default: `bw-modeling-mcp`. Give each instance a unique name when running several against different BW systems. | no |
 | `BW_MCP_SYSTEM_LABEL` | Free-text label of the connected BW system (e.g. `AP4 (BW production, read-only)`), put at the top of the MCP server instructions. Lets a model tell look-alike instances apart even in clients that show an opaque connector id instead of the server name. | no |
+| `BW_TOOL_MODE` | `full` (default) or `focused`. `focused` offers about twenty tools in place of the full set: each stands for a group of operations and selects one through its `type` or `operation` parameter, and `bw_describe` gives the complete parameter definition of any operation. A third of the tool payload, the same operations, the same handlers. See [Focused mode](TOOLS.md#focused-mode). | no |
 | `BW_PLATFORM` | `auto` (default), `classic` or `bw4`. The server detects whether it is talking to BW/4HANA or a classic release and offers only the tools that release can answer. `classic` forces that verdict when detection cannot run, `bw4` switches the filter off. See [bw75/BW75-SUPPORT.md](bw75/BW75-SUPPORT.md). | no |
 | `BW_SESSION_CLOSE` | `on` (default) or `off`. The server ends the SAP sessions of a tool call once it is answered, and all remaining ones when it stops. Set `off` only behind a proxy that holds the SAP session itself. | no |
 
@@ -334,8 +335,9 @@ endpoint reference.
 
 ## Roadmap
 
-- **Focused mode** — an optional, reduced tool surface: a handful of broad tools in place of
-  the full set, for clients and models that work better with fewer tools to choose from.
+- **Focused mode as the default** — the reduced tool surface (`BW_TOOL_MODE=focused`) is
+  optional today; once the tool-selection benchmark shows it holds up, it becomes the default
+  and the full surface the fallback.
 
 ---
 

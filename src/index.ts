@@ -15,6 +15,7 @@ import { createRequire } from 'node:module';
 import { closeAllSessions, createClientFromEnv, withSessionScope, type BwClient } from './bw-client.js';
 import { currentClient } from './request-context.js';
 import { filterToolsByScope, mayCall, requiredScope, scopesFor } from './scopes.js';
+import { buildFocusedTools, resolveFocusedCall, toolMode, type ToolDefinition } from './surface/focused.js';
 import { undeclaredArguments } from './arguments.js';
 import {
   cachedPlatform,
@@ -8348,6 +8349,14 @@ function buildInstructions(): string {
     'definitions on this system.',
     '',
     'One BW system per instance: there is no system selector, by design.',
+    ...(toolMode() === 'focused'
+      ? [
+          '',
+          'Focused tool surface: each tool stands for a group of operations selected by its type',
+          'or operation parameter. bw_describe lists them and gives the complete parameter',
+          'definition of one operation.',
+        ]
+      : []),
     ...platformInstructions(cachedPlatform()),
   ].join('\n');
 }
@@ -8378,11 +8387,30 @@ export function createServer(): Server {
     } catch {
       profile = cachedPlatform();
     }
-    return { tools: filterToolsByPlatform(filterToolsByScope(TOOL_DEFINITIONS, extra.authInfo), profile) };
+    const offered = filterToolsByPlatform(filterToolsByScope(TOOL_DEFINITIONS, extra.authInfo), profile);
+    // The focused surface is built from the offered full tools, so whatever the scope or the
+    // platform removes is gone from the focused tools' discriminators too.
+    return { tools: toolMode() === 'focused' ? buildFocusedTools(offered as ToolDefinition[]) : offered };
   });
 
   server.setRequestHandler(CallToolRequestSchema, (request, extra) =>
-    withSessionScope(() => handleToolCall(request, extra)));
+    withSessionScope(async () => {
+      if (toolMode() === 'focused') {
+        const offered = filterToolsByPlatform(
+          filterToolsByScope(TOOL_DEFINITIONS, extra.authInfo),
+          cachedPlatform(),
+        ) as ToolDefinition[];
+        const resolved = resolveFocusedCall(request.params.name, request.params.arguments, offered);
+        if (resolved?.kind === 'describe') return { content: [{ type: 'text' as const, text: resolved.text }] };
+        if (resolved?.kind === 'error') return { content: [{ type: 'text' as const, text: resolved.text }], isError: true };
+        if (resolved?.kind === 'dispatch') {
+          // The full tool's own scope and platform checks apply to the forwarded call.
+          return handleToolCall({ params: { name: resolved.tool, arguments: resolved.arguments } }, extra);
+        }
+      }
+      // A full tool name is answered in either mode: a client holding a list from the other mode keeps working.
+      return handleToolCall(request, extra);
+    }));
 
   return server;
 }

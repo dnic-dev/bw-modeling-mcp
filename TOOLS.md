@@ -10,6 +10,47 @@ For the architecture and the full endpoint list, see [ARCHITECTURE.md](ARCHITECT
 
 ---
 
+## Focused mode
+
+`BW_TOOL_MODE=focused` offers 21 tools in place of the full set, about a third of the tool payload
+in the model's context. Every operation below stays reachable: a focused tool stands for a group of
+full tools and selects one of them through its `type` (reads) or `operation` (everything else)
+parameter, then hands the call to that tool's handler unchanged — same parameters, same enums, same
+behaviour. The parameters of a focused tool are the union of its members' parameters, each marked with
+the operations that use it; `bw_read` takes one `name` in place of the members' own name parameters.
+Large nested item schemas (query operations, process chain steps) keep their type and first sentence,
+and `bw_describe(tool, operation)` returns the complete definition of one operation. A wrong or missing
+`operation` is refused with the allowed values before anything reaches BW, and so is a missing required
+parameter. The scope and platform filters apply to the members, so an operation the caller may not
+invoke or the system cannot answer is not listed. A full tool name remains callable in focused mode, so a
+client holding the full list keeps working.
+
+| Focused tool | Selector | Operations (full tool in brackets) |
+|---|---|---|
+| `bw_read` | `type` | `adso` (get_adso), `iobj` (get_infoobject), `area` (get_infoarea), `trcs` (get_infosource), `trfn` (get_transformation), `dtpa` (get_dtp), `query` (get_query), `hcpr` (get_composite_provider), `ckf` (get_ckf), `rkf` (get_rkf), `structure` (get_structure), `variable` (get_variable), `rsds` (get_datasource), `lsys` (get_source_system), `dest` (get_open_hub), `rspc` (get_process_chain), `process_variant` (get_process_variant), `alvl` (get_aggregation_level), `plse` (get_planning_function), `plsq` (get_planning_sequence), `planning_filter` (get_planning_filter), `planning_properties` (get_planning_properties), `conversion_type` (get_conversion_type), `hierarchy` (get_hierarchy), `push_schema` (get_push_schema), `afo_workbook` (get_afo_workbook), `query_roles` (get_query_roles) |
+| `bw_find` | `operation` | `search` (search), `xref` (xref), `contents` (list_contents), `dataflow` (get_dataflow), `dtps` (get_dtps), `source_systems` (list_source_systems), `datasources` (list_datasources), `remote_entities` (list_remote_entities), `afo_workbooks` (list_afo_workbooks), `roles` (get_roles), `role_queries` (get_role_queries), `metadata_tables` (read_metadata_tables), `system_profile` (system_profile) |
+| `bw_monitor` | `operation` | `requests` (list_requests), `request` (get_request), `chain_runs` (list_process_chain_runs), `chain_run_detail` (get_process_chain_run_detail), `chain_last_status` (list_process_chain_last_status), `remodeling_requests` (list_remodeling_requests), `remodeling_request` (get_remodeling_request), `query_statistics` (query_statistics) |
+| `bw_query_data` | `operation` | `run` (query_data) |
+| `bw_data` | `operation` | `filter_values` (get_filter_values), `preview_datasource` (preview_datasource), `push` (push_data), `delete_selective` (delete_adso_data_selective), `save_afo_workbook` (save_afo_workbook) |
+| `bw_activate` | `operation` | `activate` (activate), `unlock` (unlock), `activate_process_chain` (activate_process_chain) |
+| `bw_delete` | `operation` | `delete` (delete) |
+| `bw_run` | `operation` | `dtp` (run_dtp), `process_chain` (start_process_chain), `restart_chain_step` (restart_process_chain_step), `activate_request` (activate_request), `delete_request` (delete_request), `remodeling` (run_remodeling) |
+| `bw_write_adso` | `operation` | `create` (create_adso), `update` (update_adso), `set_planning_mode` (set_adso_planning_mode) |
+| `bw_write_infoobject` | `operation` | `create` (create_infoobject), `update` (update_infoobject), `create_hierarchy` (create_hierarchy), `update_hierarchy` (update_hierarchy), `delete_hierarchy` (delete_hierarchy) |
+| `bw_write_infosource` | `operation` | `create` (create_infosource), `update` (update_infosource) |
+| `bw_write_composite_provider` | `operation` | `create` (create_composite_provider), `update` (update_composite_provider) |
+| `bw_write_transformation` | `operation` | `create` (create_transformation), `update_rule` (update_transformation), `set_routine` (set_transformation_routine), `set_expert_routine` (set_transformation_expert_routine), `set_routine_fields` (set_transformation_routine_fields), `delete_routine` (delete_transformation_routine), `set_runtime` (set_transformation_runtime) |
+| `bw_write_dtp` | `operation` | `create` (create_dtp), `update` (update_dtp), `set_filter_routine` (set_dtp_filter_routine) |
+| `bw_write_datasource` | `operation` | `create` (create_datasource), `set_fields` (set_datasource_fields), `change_delta` (change_datasource_delta) |
+| `bw_write_open_hub` | `operation` | `create` (create_open_hub), `update` (update_open_hub) |
+| `bw_write_query` | `operation` | `create` (create_query), `update_layout` (update_query_layout), `update_filter` (update_query_filter), `update_key_figures` (update_query_key_figures), `update_characteristic` (update_query_characteristic), `update_cells` (update_query_cells), `update_exceptions` (update_query_exceptions), `update_settings` (update_query_settings), `create_rkf` (create_rkf), `update_rkf` (update_rkf), `create_ckf` (create_ckf), `update_ckf` (update_ckf), `create_structure` (create_structure), `update_structure` (update_structure), `create_variable` (create_variable), `update_variable` (update_variable), `set_roles` (set_query_roles) |
+| `bw_write_planning` | `operation` | `create_aggregation_level` (create_aggregation_level), `update_aggregation_level` (update_aggregation_level), `create_function` (create_planning_function), `update_function` (update_planning_function), `create_sequence` (create_planning_sequence), `update_sequence` (update_planning_sequence), `create_filter` (create_planning_filter), `update_filter` (update_planning_filter), `create_conversion_type` (create_conversion_type) |
+| `bw_write_process_chain` | `operation` | `create` (create_process_chain), `update` (update_process_chain), `append_dtp` (append_process_chain_dtp), `swap_dtp` (swap_process_chain_dtp), `add_program` (add_process_chain_program), `add_plswitch` (add_process_chain_plswitch), `add_edge` (add_process_chain_edge), `remove_edge` (remove_process_chain_edge), `remove_step` (remove_process_chain_step), `add_error_links` (add_process_chain_error_links), `create_decision_variant` (create_decision_variant) |
+| `bw_manage` | `operation` | `create_infoarea` (create_infoarea), `move_object` (move_object), `change_package` (change_package), `create_transport_task` (create_transport_task), `changeable_transports` (list_changeable_transports) |
+| `bw_describe` | — | the catalogue, or the full parameter definition of one operation |
+
+---
+
 ## Contents
 
 - [Discovery & System](#discovery--system) — 6 tools

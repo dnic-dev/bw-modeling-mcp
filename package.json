@@ -44,6 +44,7 @@
     "fast-xml-parser": "^4.3.0"
   },
   "devDependencies": {
+    "@anthropic-ai/sdk": "^1.8.0",
     "@types/express": "^5.0.6",
     "@types/node": "^20.0.0",
     "typescript": "^5.0.0"

@@ -163,6 +163,23 @@ A second addition follows the same rules on both platforms: aggregation levels. 
 
 ---
 
+## Focused Tool Surface
+
+`BW_TOOL_MODE=focused` (`src/surface/focused.ts`) puts a reduced surface in front of the full one without
+touching a handler. The operation table maps every full tool to one focused tool and one discriminator
+value (`type` for reads, `operation` for everything else; no full tool has a parameter of either name).
+Everything else is derived from that table and the full tool definitions at `tools/list` time: the
+discriminator enum with a one-line summary and the required parameters per value, the union of the
+members' parameter schemas (reads share one `name`, translated back to the member's own parameter on
+the call), and the folding of nested item schemas above a size limit to type plus first sentence with a
+pointer to `bw_describe`, which answers with the member's full schema. Because the focused tools are built
+from the *offered* full tools, the scope and platform filters need no second table: what they remove is
+gone from the discriminators too. A call is resolved to the full tool and handed to the same dispatcher,
+so the full tool's scope check, platform check and argument validation apply. Full tool names stay
+callable in focused mode. The test suite asserts that every full tool is covered exactly once, that the
+default mode is unchanged, and that the payload stays about a third of the full one; a tool-selection
+benchmark sends the same prompts against both surfaces and compares the first call's tool and parameters.
+
 ## Push API
 
 Write-interface aDSOs support direct data push via a separate API:
@@ -188,6 +205,8 @@ src/
 ├── destination.ts        # builds a BwClient from a BTP destination (PrincipalPropagation or BasicAuthentication)
 ├── request-context.ts    # AsyncLocalStorage holding the per-request BW client under principal propagation
 ├── scopes.ts             # read/write scope classification and tools/list filtering for XSUAA role-based access
+├── surface/
+│   └── focused.ts        # the focused tool surface: operation table, schema derivation, call resolution, bw_describe
 ├── soap-rfc.ts           # calling an RFC-enabled function module over /sap/bc/soap/rfc, with a clear
 │                         # message when the ICF service is inactive
 ├── arguments.ts          # refusal of undeclared arguments to writing tools
