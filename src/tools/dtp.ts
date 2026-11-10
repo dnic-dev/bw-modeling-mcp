@@ -126,6 +126,13 @@ interface DtpInfo {
   transformation: { name: string; description: string };
   extractionMode: string;
   packageSize: string;
+  parallelExtraction: string;
+  execution: Record<string, string>;
+  requestSelection: Record<string, string>;
+  errorHandling: Record<string, string>;
+  hanaExecution: Record<string, string>;
+  levelOfDetail: string;
+  batchManager: Record<string, string>;
   filterFields: DtpFilterField[];
   globalRoutineCode: string[];
   semanticGroupFields: { name: string; description: string; isKey: boolean; isField: boolean }[];
@@ -287,6 +294,11 @@ function parseDtpXml(xml: string, status: string): DtpInfo {
     });
   }
 
+  const attrsOf = (element: string): Record<string, string> => {
+    const tag = xml.match(new RegExp(`<${element}\\b([^>]*)>`))?.[1] ?? '';
+    return Object.fromEntries([...tag.matchAll(/\b([A-Za-z]+)="([^"]*)"/g)].map((m) => [m[1], decodeXmlEntities(m[2])]));
+  };
+
   return {
     name,
     description,
@@ -296,6 +308,13 @@ function parseDtpXml(xml: string, status: string): DtpInfo {
     transformation,
     extractionMode,
     packageSize,
+    parallelExtraction: attr(extrMatch?.[1] ?? '', 'parallelExtraction'),
+    execution: attrsOf('execution'),
+    requestSelection: attrsOf('requestSelection'),
+    errorHandling: attrsOf('errorHandling'),
+    hanaExecution: attrsOf('sapHANAExecution'),
+    levelOfDetail: attrsOf('runtimeProperties')['levelOfDetail'] ?? '',
+    batchManager: attrsOf('batchManager'),
     filterFields,
     globalRoutineCode,
     semanticGroupFields,
@@ -334,9 +353,47 @@ export async function bwGetDtp(client: BwClient, dtpName: string, format: 'text'
     `── Extraction Settings ──`,
     `  Mode:        ${modeLabel} (${info.extractionMode})`,
     `  Package Size: ${info.packageSize}`,
+    `  Parallel Extraction: ${info.parallelExtraction || 'false'}`,
+  ];
+
+  const yesNo = (v: string | undefined) => (v === 'true' ? 'yes' : 'no');
+  const pick = <T extends string>(map: Record<T, string>, literal: string | undefined): string =>
+    (Object.entries(map).find(([, l]) => l === literal)?.[0] as string | undefined) ?? (literal ?? '');
+  const rs = info.requestSelection;
+  lines.push(
+    '',
+    `── Request Selection ──`,
+    `  Extract all green requests:           ${yesNo(rs['extractAllGreenRequests'])}`,
+    `  Retrieve until no more new data:      ${yesNo(rs['retrieveUntilNoMoreNewData'])}`,
+    `  Get all new data request by request:  ${yesNo(rs['getAllNewDataRequestByRequest'])}`,
+    `  Delta init without data:              ${yesNo(rs['deltaInitWithoutData'])}`,
+    `  Only retrieve last request:           ${yesNo(rs['onlyRetrieveLastRequest'])}`,
+    `  Only get delta once:                  ${yesNo(rs['onlyGetDeltaOnce'])}`,
+  );
+  const ex = info.execution;
+  const eh = info.errorHandling;
+  lines.push(
+    '',
+    `── Execution ──`,
+    `  Processing mode:         ${ex['processingMode'] ?? ''}`,
+    `  SAP HANA execution:      ${yesNo(info.hanaExecution['selected'])}${info.hanaExecution['allowed'] === 'true' ? ' (allowed)' : ''}`,
+    `  Technical request status: ${ex['technicalRequestStatus'] === 'X' ? 'red' : 'green'}`,
+    `  Overall request status:  ${ex['overallStatusOfRequest'] === 'M' ? 'manual' : 'automatic'}`,
+    `  Repeat red requests in process chain: ${yesNo(ex['automaticallyRepeatRedRequestsInProcessChain'])}`,
+    '',
+    `── Error Handling ──`,
+    `  Request handling:        ${pick(REQUEST_HANDLING_LITERAL, eh['requestHandling'])}`,
+    `  Errors per package:      ${eh['numberOfErrorsPerPackage'] ?? '0'}`,
+    `  Track records:           ${yesNo(eh['trackRecords'])}`,
+    '',
+    `── Runtime / Batch Manager ──`,
+    `  Level of detail:         ${pick(LEVEL_OF_DETAIL_LITERAL, info.levelOfDetail)}`,
+    `  Parallel processes:      ${info.batchManager['parallelProcesses'] ?? ''}`,
+    `  Batch class:             ${pick(BATCH_CLASS_LITERAL, info.batchManager['batchClass'])}`,
+    `  Server type:             ${pick(SERVER_TYPE_LITERAL, info.batchManager['serverType'])}${info.batchManager['serverName'] ? ` (${info.batchManager['serverName']})` : ''}`,
     '',
     `── Filter Fields (${info.filterFields.length}) ──`,
-  ];
+  );
 
   if (info.filterFields.length === 0) {
     lines.push('  (no filter fields)');
@@ -1045,8 +1102,209 @@ export interface UpdateDtpArgs {
   filter_clear_fields?: string;
   extraction_mode?: 'full' | 'delta';
   semantic_group_fields?: string;
+  package_size?: number;
+  parallel_extraction?: boolean;
+  technical_request_status?: 'green' | 'red';
+  overall_request_status?: 'automatic' | 'manual';
+  repeat_red_requests_in_process_chain?: boolean;
+  extract_all_green_requests?: boolean;
+  retrieve_until_no_more_new_data?: boolean;
+  get_all_new_data_request_by_request?: boolean;
+  delta_init_without_data?: boolean;
+  only_retrieve_last_request?: boolean;
+  only_get_delta_once?: boolean;
+  request_handling?: 'cancel_no_track' | 'cancel_track_first' | 'red_write_error_stack' | 'green_write_error_stack';
+  number_of_errors_per_package?: number;
+  track_records?: boolean;
+  hana_execution?: boolean;
+  level_of_detail?: 'package' | 'erroneous_records' | 'record';
+  parallel_processes?: number;
+  batch_class?: 'high' | 'medium' | 'low';
+  server_type?: 'servers' | 'group' | 'host';
+  server_name?: string;
   transport?: string;
   transport_lock_holder?: string;
+}
+
+const REQUEST_HANDLING_LITERAL: Record<NonNullable<UpdateDtpArgs['request_handling']>, string> = {
+  cancel_track_first: '_',
+  cancel_no_track: '0',
+  red_write_error_stack: '1',
+  green_write_error_stack: '2',
+};
+const LEVEL_OF_DETAIL_LITERAL: Record<NonNullable<UpdateDtpArgs['level_of_detail']>, string> = {
+  package: '0',
+  erroneous_records: '1',
+  record: '2',
+};
+const BATCH_CLASS_LITERAL: Record<NonNullable<UpdateDtpArgs['batch_class']>, string> = { high: 'A', medium: 'B', low: 'C' };
+const SERVER_TYPE_LITERAL: Record<NonNullable<UpdateDtpArgs['server_type']>, string> = { servers: 'S', group: 'G', host: 'H' };
+
+/** Set or add one attribute on the first tag of the given element name. */
+function setElementAttr(xml: string, element: string, attr: string, value: string, dtpName: string): string {
+  const re = new RegExp(`<${element}\\b([^>]*?)(\\s*/?>)`);
+  const m = xml.match(re);
+  if (!m) throw new Error(`DTP '${dtpName}' has no <${element}> element; this setting is not available here.`);
+  const attrs = m[1];
+  const attrRe = new RegExp(`\\b${attr}="[^"]*"`);
+  const newAttrs = attrRe.test(attrs) ? attrs.replace(attrRe, `${attr}="${value}"`) : `${attrs} ${attr}="${value}"`;
+  return xml.replace(re, () => `<${element}${newAttrs}${m[2]}`);
+}
+
+function elementAttr(xml: string, element: string, attr: string): string | undefined {
+  const tag = xml.match(new RegExp(`<${element}\\b[^>]*>`))?.[0] ?? '';
+  return tag.match(new RegExp(`\\b${attr}="([^"]*)"`))?.[1];
+}
+
+function assertRange(name: string, value: number, min: number, max: number): void {
+  if (!Number.isInteger(value) || value < min || value > max) {
+    throw new Error(`${name} must be an integer between ${min} and ${max}, got ${value}.`);
+  }
+}
+
+/**
+ * Apply the execution settings of a DTP as the modeling tools' editor pages do: every value
+ * is checked against the admissible values the server lists for this DTP, and the rules that
+ * grey out or reset controls in the editor are applied before the PUT.
+ */
+function applyDtpExecutionSettings(xml: string, args: UpdateDtpArgs, dtpName: string): { xml: string; applied: string[] } {
+  const applied: string[] = [];
+  const admissible = parseAdmissibleAttributes(xml);
+  const flagValue = (b: boolean) => (b ? 'X' : '');
+
+  if (args.package_size !== undefined) {
+    assertRange('package_size', args.package_size, 1, 2147483647);
+    xml = setElementAttr(xml, 'extractionSettings', 'packageSize', String(args.package_size), dtpName);
+    applied.push(`package size ${args.package_size}`);
+  }
+  if (args.parallel_extraction !== undefined) {
+    assertAdmissible(admissible, 'PAR_X', flagValue(args.parallel_extraction), `parallel_extraction ${args.parallel_extraction}`);
+    xml = setElementAttr(xml, 'extractionSettings', 'parallelExtraction', String(args.parallel_extraction), dtpName);
+    applied.push(`parallel extraction ${args.parallel_extraction}`);
+  }
+  if (args.technical_request_status !== undefined) {
+    xml = setElementAttr(xml, 'execution', 'technicalRequestStatus', args.technical_request_status === 'red' ? 'X' : '_', dtpName);
+    applied.push(`technical request status ${args.technical_request_status}`);
+  }
+  if (args.overall_request_status !== undefined) {
+    const automatic = args.overall_request_status === 'automatic';
+    assertAdmissible(admissible, 'AUTOQUALOK', flagValue(automatic), `overall_request_status "${args.overall_request_status}"`);
+    if (automatic && /<openHubDestination\b[^>]*\brequestStateSetExternally="true"/.test(xml)) {
+      throw new Error('overall_request_status "automatic" is not possible: the Open Hub Destination sets the request status externally, so it stays "manual".');
+    }
+    xml = setElementAttr(xml, 'execution', 'overallStatusOfRequest', automatic ? 'A' : 'M', dtpName);
+    applied.push(`overall request status ${args.overall_request_status}`);
+  }
+  if (args.repeat_red_requests_in_process_chain !== undefined) {
+    xml = setElementAttr(xml, 'execution', 'automaticallyRepeatRedRequestsInProcessChain', String(args.repeat_red_requests_in_process_chain), dtpName);
+    applied.push(`repeat red requests in process chain ${args.repeat_red_requests_in_process_chain}`);
+  }
+
+  // Request selection: the delta-only flags are greyed out and reset on a full DTP.
+  const requestFlags: Array<[keyof UpdateDtpArgs, string, string, boolean]> = [
+    ['extract_all_green_requests', 'IGNORE_QUALOK', 'extractAllGreenRequests', false],
+    ['retrieve_until_no_more_new_data', 'FETCHUNTILEOF', 'retrieveUntilNoMoreNewData', false],
+    ['get_all_new_data_request_by_request', 'SINGLEREQUEST', 'getAllNewDataRequestByRequest', true],
+    ['delta_init_without_data', 'INITSIMU', 'deltaInitWithoutData', true],
+    ['only_retrieve_last_request', 'ONLYLASTREQUEST', 'onlyRetrieveLastRequest', false],
+    ['only_get_delta_once', 'DELTAONLYONCE', 'onlyGetDeltaOnce', true],
+  ];
+  const extractionMode = elementAttr(xml, 'extractionSettings', 'extractionMode');
+  for (const [arg, attribute, feature, deltaOnly] of requestFlags) {
+    const value = args[arg] as boolean | undefined;
+    if (value === undefined) continue;
+    if (deltaOnly && value && extractionMode === 'F') {
+      throw new Error(`${arg} is only available on a delta DTP; this DTP extracts in full mode.`);
+    }
+    assertAdmissible(admissible, attribute, flagValue(value), `${arg} ${value}`);
+    // The server leaves the element out while no flag is set; the model places it before the
+    // extraction settings.
+    if (!/<requestSelection\b/.test(xml)) {
+      xml = xml.replace(/<extractionSettings\b/, '<requestSelection/><extractionSettings');
+    }
+    xml = setElementAttr(xml, 'requestSelection', feature, String(value), dtpName);
+    applied.push(`${arg.replace(/_/g, ' ')} ${value}`);
+  }
+
+  // Error handling: the error count is 100 by default when an error stack is written and 0
+  // otherwise; record tracking is possible only when the request is cancelled without one.
+  if (args.request_handling !== undefined) {
+    const literal = REQUEST_HANDLING_LITERAL[args.request_handling];
+    const allowed = admissible.get('ERRORHANDLING');
+    if (allowed) {
+      const normalized = allowed.map((v) => (v === '' ? '0' : v));
+      if (!normalized.includes(literal)) {
+        assertAdmissible(new Map([['ERRORHANDLING', normalized]]), 'ERRORHANDLING', literal, `request_handling "${args.request_handling}"`);
+      }
+    }
+    xml = setElementAttr(xml, 'errorHandling', 'requestHandling', literal, dtpName);
+    applied.push(`request handling ${args.request_handling}`);
+  }
+  const handlingNow = elementAttr(xml, 'errorHandling', 'requestHandling');
+  const writesErrorStack = handlingNow === '1' || handlingNow === '2';
+  if (args.number_of_errors_per_package !== undefined) {
+    if (!writesErrorStack) {
+      throw new Error('number_of_errors_per_package applies only when an error stack is written (request_handling "red_write_error_stack" or "green_write_error_stack").');
+    }
+    assertRange('number_of_errors_per_package', args.number_of_errors_per_package, 0, 2147483647);
+    xml = setElementAttr(xml, 'errorHandling', 'numberOfErrorsPerPackage', String(args.number_of_errors_per_package), dtpName);
+    applied.push(`errors per package ${args.number_of_errors_per_package}`);
+  } else if (args.request_handling !== undefined) {
+    const current = Number(elementAttr(xml, 'errorHandling', 'numberOfErrorsPerPackage') ?? '0');
+    const next = writesErrorStack ? (current === 0 ? 100 : current) : 0;
+    if (next !== current) {
+      xml = setElementAttr(xml, 'errorHandling', 'numberOfErrorsPerPackage', String(next), dtpName);
+      applied.push(`errors per package ${next} (default for this request handling)`);
+    }
+  }
+  if (args.track_records !== undefined) {
+    if (args.track_records && handlingNow !== '0') {
+      throw new Error('track_records is only possible with request_handling "cancel_no_track".');
+    }
+    assertAdmissible(admissible, 'TRACK_RECORDS', flagValue(args.track_records), `track_records ${args.track_records}`);
+    xml = setElementAttr(xml, 'errorHandling', 'trackRecords', String(args.track_records), dtpName);
+    applied.push(`track records ${args.track_records}`);
+  } else if (args.request_handling !== undefined && handlingNow !== '0' && elementAttr(xml, 'errorHandling', 'trackRecords') === 'true') {
+    xml = setElementAttr(xml, 'errorHandling', 'trackRecords', 'false', dtpName);
+    applied.push('track records false (not possible with this request handling)');
+  }
+
+  // Runtime: HANA execution is offered only when the server allows it; the level of detail
+  // belongs to the temporary storage, which exists only without HANA execution.
+  if (args.hana_execution !== undefined) {
+    const allowedHana = elementAttr(xml, 'sapHANAExecution', 'allowed') === 'true' || elementAttr(xml, 'sapHANAExecution', 'selected') === 'true';
+    if (args.hana_execution && !allowedHana) {
+      throw new Error('hana_execution is not offered for this DTP (the server does not allow SAP HANA execution here).');
+    }
+    xml = setElementAttr(xml, 'sapHANAExecution', 'selected', String(args.hana_execution), dtpName);
+    applied.push(`SAP HANA execution ${args.hana_execution}`);
+  }
+  const hanaSelected = elementAttr(xml, 'sapHANAExecution', 'selected') === 'true';
+  if (args.level_of_detail !== undefined) {
+    if (hanaSelected) {
+      throw new Error('level_of_detail belongs to the temporary storage, which a DTP with SAP HANA execution does not have.');
+    }
+    xml = setElementAttr(xml, 'runtimeProperties', 'levelOfDetail', LEVEL_OF_DETAIL_LITERAL[args.level_of_detail], dtpName);
+    applied.push(`level of detail ${args.level_of_detail}`);
+  }
+  if (args.parallel_processes !== undefined) {
+    assertRange('parallel_processes', args.parallel_processes, 1, 99);
+    xml = setElementAttr(xml, 'batchManager', 'parallelProcesses', String(args.parallel_processes), dtpName);
+    applied.push(`parallel processes ${args.parallel_processes}`);
+  }
+  if (args.batch_class !== undefined) {
+    xml = setElementAttr(xml, 'batchManager', 'batchClass', BATCH_CLASS_LITERAL[args.batch_class], dtpName);
+    applied.push(`batch class ${args.batch_class}`);
+  }
+  if (args.server_type !== undefined) {
+    xml = setElementAttr(xml, 'batchManager', 'serverType', SERVER_TYPE_LITERAL[args.server_type], dtpName);
+    applied.push(`server type ${args.server_type}`);
+  }
+  if (args.server_name !== undefined) {
+    xml = setElementAttr(xml, 'batchManager', 'serverName', args.server_name, dtpName);
+    applied.push(`server name ${args.server_name || '(none)'}`);
+  }
+  return { xml, applied };
 }
 
 /**
@@ -1167,6 +1425,9 @@ export async function bwUpdateDtp(
       putXml = applySemanticGroup(putXml, args.semantic_group_fields, dtpName);
     }
 
+    const execution = applyDtpExecutionSettings(putXml, args, dtpName);
+    putXml = execution.xml;
+
     // PUT on a fresh stateless client — Eclipse uses a separate stateless session for PUT
     const putClient = createClientFromEnv();
     await putClient.put('dtpa', dtpName, lockHandle, putXml, timestamp, args.transport, args.transport_lock_holder);
@@ -1177,6 +1438,7 @@ export async function bwUpdateDtp(
     return JSON.stringify({
       success: true,
       dtp_name: dtpName,
+      ...(execution.applied.length ? { settings: execution.applied } : {}),
       // Reported per field so a truncated value set is visible in the result itself:
       // the selection is replaced as a whole, it is not appended to.
       filter: filterSelections

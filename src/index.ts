@@ -29,7 +29,7 @@ import { bwGetTransformation, bwUpdateTransformation, bwCreateTransformation, bw
 import { bwActivate } from './tools/activation.js';
 import { bwSystemProfile } from './tools/system_profile.js';
 import { bwReadMetadataTables } from './tools/metadata_tables.js';
-import { bwGetDtps, bwGetDtp, bwCreateDtp, bwRunDtp, bwUpdateDtp, bwSetDtpFilterRoutine, bwUnlockDtp, DtpFilterSelectionInput } from './tools/dtp.js';
+import { bwGetDtps, bwGetDtp, bwCreateDtp, bwRunDtp, bwUpdateDtp, bwSetDtpFilterRoutine, bwUnlockDtp, DtpFilterSelectionInput, type UpdateDtpArgs } from './tools/dtp.js';
 import { bwSearch, bwXref } from './tools/search.js';
 import { bwDelete } from './tools/delete.js';
 import { bwCreateInfoArea, bwMoveObject, bwGetInfoarea } from './tools/infoarea.js';
@@ -2214,6 +2214,92 @@ const TOOL_DEFINITIONS = [
           transport: {
             type: 'string',
             description: 'Transport request number. Required on systems with transport obligation.',
+          },
+          package_size: {
+            type: 'number',
+            description: 'Extraction: package size in records (at least 1).',
+          },
+          parallel_extraction: {
+            type: 'boolean',
+            description: 'Extraction: extract data packages in parallel. Only when the server admits it for this DTP (see bw_get_dtp, PAR_X).',
+          },
+          technical_request_status: {
+            type: 'string',
+            enum: ['green', 'red'],
+            description: 'Execution: technical status of a request with warnings.',
+          },
+          overall_request_status: {
+            type: 'string',
+            enum: ['automatic', 'manual'],
+            description: 'Execution: how the overall request status is set. An Open Hub Destination that sets the status externally stays "manual".',
+          },
+          repeat_red_requests_in_process_chain: {
+            type: 'boolean',
+            description: 'Execution: automatically repeat red requests when the DTP runs in a process chain.',
+          },
+          extract_all_green_requests: {
+            type: 'boolean',
+            description: 'Request selection: extract all green requests (ignore the overall status). Only when the server admits it (IGNORE_QUALOK).',
+          },
+          retrieve_until_no_more_new_data: {
+            type: 'boolean',
+            description: 'Request selection: retrieve until no more new data (FETCHUNTILEOF).',
+          },
+          get_all_new_data_request_by_request: {
+            type: 'boolean',
+            description: 'Request selection, delta only: get all new data request by request (SINGLEREQUEST).',
+          },
+          delta_init_without_data: {
+            type: 'boolean',
+            description: 'Request selection, delta only: perform the delta initialization without data transfer (INITSIMU).',
+          },
+          only_retrieve_last_request: {
+            type: 'boolean',
+            description: 'Request selection: only retrieve the last request (ONLYLASTREQUEST).',
+          },
+          only_get_delta_once: {
+            type: 'boolean',
+            description: 'Request selection, delta only: only get the delta once (DELTAONLYONCE).',
+          },
+          request_handling: {
+            type: 'string',
+            enum: ['cancel_no_track', 'cancel_track_first', 'red_write_error_stack', 'green_write_error_stack'],
+            description: 'Error handling: what happens to a request with errors. Only the values the server admits for this DTP (ERRORHANDLING). Switching to an error stack sets the error count to 100 if it was 0; switching away sets it to 0 and clears record tracking.',
+          },
+          number_of_errors_per_package: {
+            type: 'number',
+            description: 'Error handling: maximum number of errors per package before the request is cancelled. Only with an error stack (request_handling red_* or green_*).',
+          },
+          track_records: {
+            type: 'boolean',
+            description: 'Error handling: track records after a failed request. Only with request_handling "cancel_no_track" and when the server admits it (TRACK_RECORDS).',
+          },
+          hana_execution: {
+            type: 'boolean',
+            description: 'Runtime: execute the DTP in SAP HANA. Only when the server allows it for this DTP; a DTP executed in SAP HANA has no temporary storage.',
+          },
+          level_of_detail: {
+            type: 'string',
+            enum: ['package', 'erroneous_records', 'record'],
+            description: 'Runtime: level of detail of the temporary storage (trace by package, erroneous records, or by record). Not available with SAP HANA execution.',
+          },
+          parallel_processes: {
+            type: 'number',
+            description: 'Batch manager: number of parallel processes (1..99).',
+          },
+          batch_class: {
+            type: 'string',
+            enum: ['high', 'medium', 'low'],
+            description: 'Batch manager: job priority (class A, B or C).',
+          },
+          server_type: {
+            type: 'string',
+            enum: ['servers', 'group', 'host'],
+            description: 'Batch manager: where the parallel jobs run; with "group" or "host", pass server_name.',
+          },
+          server_name: {
+            type: 'string',
+            description: 'Batch manager: the server group or host name for server_type "group" or "host"; an empty string clears it.',
           },
           transport_lock_holder: {
             type: 'string',
@@ -7174,6 +7260,26 @@ async function handleToolCall(
           filter_clear_fields: args?.filter_clear_fields as string | undefined,
           extraction_mode: args?.extraction_mode as 'full' | 'delta' | undefined,
           semantic_group_fields: args?.semantic_group_fields as string | undefined,
+          package_size: args?.package_size as number | undefined,
+          parallel_extraction: args?.parallel_extraction as boolean | undefined,
+          technical_request_status: args?.technical_request_status as 'green' | 'red' | undefined,
+          overall_request_status: args?.overall_request_status as 'automatic' | 'manual' | undefined,
+          repeat_red_requests_in_process_chain: args?.repeat_red_requests_in_process_chain as boolean | undefined,
+          extract_all_green_requests: args?.extract_all_green_requests as boolean | undefined,
+          retrieve_until_no_more_new_data: args?.retrieve_until_no_more_new_data as boolean | undefined,
+          get_all_new_data_request_by_request: args?.get_all_new_data_request_by_request as boolean | undefined,
+          delta_init_without_data: args?.delta_init_without_data as boolean | undefined,
+          only_retrieve_last_request: args?.only_retrieve_last_request as boolean | undefined,
+          only_get_delta_once: args?.only_get_delta_once as boolean | undefined,
+          request_handling: args?.request_handling as UpdateDtpArgs['request_handling'],
+          number_of_errors_per_package: args?.number_of_errors_per_package as number | undefined,
+          track_records: args?.track_records as boolean | undefined,
+          hana_execution: args?.hana_execution as boolean | undefined,
+          level_of_detail: args?.level_of_detail as UpdateDtpArgs['level_of_detail'],
+          parallel_processes: args?.parallel_processes as number | undefined,
+          batch_class: args?.batch_class as UpdateDtpArgs['batch_class'],
+          server_type: args?.server_type as UpdateDtpArgs['server_type'],
+          server_name: args?.server_name as string | undefined,
           transport: args?.transport as string | undefined,
           transport_lock_holder: args?.transport_lock_holder as string | undefined,
         });
