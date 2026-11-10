@@ -1033,15 +1033,16 @@ const TOOL_DEFINITIONS = [
     {
       name: 'bw_update_transformation',
       description:
-        'Map a source field to a target InfoObject in a Transformation, or convert an existing rule to a field routine (StepRoutine) or formula rule (StepFormula). ' +
-        'rule_type="direct" (default): changes a StepNoUpdate/StepInitial rule to StepDirect. ' +
-        'rule_type="routine": converts an existing StepDirect, StepInitial, or StepNoUpdate rule to StepRoutine (AMDP field routine). ' +
+        'Map a source field to a target field in a Transformation, or change the type of the rule of a field — direct, time conversion, routine, formula, constant, lookup, or no mapping — from whatever type it has now, as the rule editor of the modeling tools does. ' +
+        'rule_type="direct" (default): maps the source field directly (StepDirect). A target that is a time characteristic gets a time conversion (StepTime) instead, the only assignment the modeling tools offer there. ' +
+        'rule_type="time": a time conversion into a time characteristic (StepTime), e.g. a month derived from a day; refused for a target that is not a time characteristic. Whether the two time characteristics convert into each other is checked by the server on activation. ' +
+        'rule_type="routine": converts the rule to a StepRoutine (AMDP field routine) from any type. Every source field the rule has stays and is wired into the routine; source_field and additional_source_fields add further ones. A rule without any source needs source_field. A rule that already is a routine keeps its class and method, so this also adds source fields to an existing routine. ' +
         'rule_type="formula": writes the rule as StepFormula whatever step type it has now, including an existing formula rule whose text is to be changed — no ABAP class generated, BW evaluates the formula natively. ' +
         'Every operand of the expression is registered as a source of the rule, so a formula over several source fields works; the operands are read out of the formula and need not be listed. ' +
-        'rule_type="constant": sets a fixed constant value on the target field — no source field needed. ' +
-        'For routine on StepNoUpdate rules, source_field is required. ' +
-        'For routine on StepDirect/StepInitial rules, source_field is ignored (field is already mapped). ' +
-        'source_field is always ignored for rule_type="constant". ' +
+        'rule_type="constant": sets a fixed constant value on the target field from any rule type — no source field needed, source_field is ignored. ' +
+        'rule_type="no_update": removes the mapping. A key field becomes StepInitial (filled with its initial value), any other field StepNoUpdate — the only reset the modeling tools offer for either kind. ' +
+        'A rule that maps a key figure together with its unit or currency keeps the unit half when the type of the key figure changes; the unit half itself is changed through the key figure. A rule with a currency or unit conversion step is refused until the conversion is removed. ' +
+        'A field that had no mapping and gets one is added to the field list of the END routine, when there is one. ' +
         'rule_type="direct" with unit_source_field set: creates a COMBINED key-figure + unit/currency ' +
         'direct rule (multi-source/target) — maps a quantity together with its unit (or an amount with ' +
         'its currency) in one rule, as the Eclipse rule editor shows it. ' +
@@ -1059,9 +1060,9 @@ const TOOL_DEFINITIONS = [
             type: 'string',
             description:
               'Source field name in the source segment (e.g. "FIELD_NAME"). ' +
-              'Required for rule_type="direct" if the existing rule has no source mapping. ' +
-              'Also required for routine/formula when the target has no source mapping yet (StepNoUpdate). ' +
-              'Required for rule_type="lookup".',
+              'Required for rule_type="direct" and "time" if the existing rule has no source mapping. ' +
+              'Also required for routine/formula when the rule has no source field yet. ' +
+              'For rule_type="lookup" it feeds the InfoObject read from, or the one key field no source field is named for.',
           },
           target_infoobject: {
             type: 'string',
@@ -1069,14 +1070,15 @@ const TOOL_DEFINITIONS = [
           },
           rule_type: {
             type: 'string',
-            enum: ['direct', 'routine', 'formula', 'constant', 'lookup', 'no_update'],
+            enum: ['direct', 'time', 'routine', 'formula', 'constant', 'lookup', 'no_update'],
             description:
-              'Rule type to assign. "direct" (default): maps source field directly (StepDirect). ' +
-              '"routine": converts the rule to an AMDP field routine (StepRoutine) — the server generates the ABAP class automatically. ' +
+              'Rule type to assign. "direct" (default): maps the source field directly (StepDirect); a time characteristic target gets StepTime instead. ' +
+              '"time": time conversion into a time characteristic (StepTime). ' +
+              '"routine": converts the rule to an AMDP field routine (StepRoutine) from any type, keeping its source fields — the server generates the ABAP class automatically. ' +
               '"formula": writes the rule as a formula rule (StepFormula) — requires the formula parameter; also used to change the formula text of an existing formula rule. ' +
-              '"constant": sets a fixed constant value (StepConstant) — requires the constant_value parameter, source_field is ignored. ' +
+              '"constant": sets a fixed constant value (StepConstant) from any type — requires the constant_value parameter, source_field is ignored. ' +
               '"lookup": converts the rule to a StepRead (Lookup) rule — requires lookup_object and lookup_object_type. ' +
-              '"no_update": reverts any existing mapping back to StepNoUpdate (no mapping, field stays empty). ' +
+              '"no_update": removes the mapping — StepInitial for a key field, StepNoUpdate for any other. ' +
               'IMPORTANT: AMDP SQLSCRIPT methods only allow ASCII 7-bit characters — no German umlauts or special symbols in code or comments.',
           },
           formula: {
@@ -1106,14 +1108,22 @@ const TOOL_DEFINITIONS = [
             enum: ['IOBJ', 'ADSO'],
             description: 'Type of the lookup object. "IOBJ" for InfoObject, "ADSO" for aDSO. Required for rule_type="lookup".',
           },
+          lookup_key_mapping: {
+            type: 'object',
+            additionalProperties: { type: 'string' },
+            description:
+              'For rule_type="lookup": which source field feeds each key field of the lookup object (key field → source field), ' +
+              'e.g. {"KEY_FIELD": "SOURCE_FIELD"}. A key field whose name exists in the source segment takes that field on its own; ' +
+              'source_field alone feeds the InfoObject itself or the one key that is still open. Every key field must end up with a source, ' +
+              'or the rule does not activate.',
+          },
           additional_source_fields: {
             type: 'array',
             items: { type: 'string' },
             description:
-              'Additional source fields for rule_type="formula" when the formula references more than one source field. ' +
-              'Combined with source_field, all listed fields are registered as inputs on the StepFormula rule — alongside ' +
-              'the operands read out of the formula itself, so this is only needed for a field the expression does not name ' +
-              'under its source-segment name. Example: ["QUANTITY_SOLD", "COST_PER_UNIT"].',
+              'Additional source fields for rule_type="formula" and "routine". For a formula, combined with source_field, all listed fields are registered as inputs ' +
+              'on the StepFormula rule — alongside the operands read out of the formula itself, so this is only needed for a field the expression does not name ' +
+              'under its source-segment name. For a routine, the fields are wired into the routine next to the ones the rule already has. Example: ["QUANTITY_SOLD", "COST_PER_UNIT"].',
           },
           unit_source_field: {
             type: 'string',
@@ -7016,7 +7026,7 @@ async function handleToolCall(
           args?.transformation_name as string,
           args?.source_field as string | undefined,
           args?.target_infoobject as string,
-          (args?.rule_type as 'direct' | 'routine' | 'formula' | 'constant' | 'lookup' | 'no_update' | undefined) ?? 'direct',
+          (args?.rule_type as 'direct' | 'time' | 'routine' | 'formula' | 'constant' | 'lookup' | 'no_update' | undefined) ?? 'direct',
           args?.formula as string | undefined,
           args?.constant_value as string | undefined,
           args?.lookup_object as string | undefined,
@@ -7027,6 +7037,7 @@ async function handleToolCall(
           args?.conversion as RuleConversion | undefined,
           args?.aggregation as string | undefined,
           args?.rule_type !== undefined,
+          args?.lookup_key_mapping as Record<string, string> | undefined,
         );
         break;
 
