@@ -8,6 +8,16 @@ import {
   stripInfoAreaSentinel,
 } from '../bw-client.js';
 
+/**
+ * The schema version the modeling tools write on create is the major.minor of the content type
+ * the system announces for CompositeProviders in its discovery document, which MEDIA_TYPES
+ * carries once loaded. The highest version this module accepts is the fallback.
+ */
+function hcprSchemaVersion(): string {
+  const m = (MEDIA_TYPES['hcpr'] ?? '').match(/-v(\d+)_(\d+)_\d+\+xml$/);
+  return m ? `${m[1]}.${m[2]}` : '1.15';
+}
+
 const HCPR_ACCEPT = [
   'application/vnd.sap.bw.modeling.hcpr-v1_0_0+xml',
   'application/vnd.sap.bw.modeling.hcpr-v1_4_0+xml',
@@ -455,7 +465,7 @@ export async function bwCreateCompositeProvider(
 
   const body =
     `<?xml version="1.0" encoding="UTF-8"?>\n` +
-    `<Composite:compositeView ${HCPR_XMLNS} schemaVersion="1.15" name="${nameUpper}" readOnly="false"` +
+    `<Composite:compositeView ${HCPR_XMLNS} schemaVersion="${hcprSchemaVersion()}" name="${nameUpper}" readOnly="false"` +
     ` defaultNode="#///${nodeName}" clientDependent="false"${stackableAttr}>\n` +
     `  <endUserTexts label="${escapeXmlAttr(label)}"/>\n` +
     `  <viewNode xsi:type="${xsiType}" name="${nodeName}">\n` +
