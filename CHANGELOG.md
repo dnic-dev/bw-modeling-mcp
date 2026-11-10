@@ -9,6 +9,7 @@
 
 ### Fixed
 
+- **Switching an aDSO to data mart or inbound-only left a key definition the type cannot carry** — `bw_update_adso` with `update_settings` and `adso_type` "datamart" or "staging_inbound_only" kept the key fields of the previous type, and activation then failed ("key definition not allowed", "all characteristics are key"). As the modeling tools do, the key definition is now removed when the new type cannot have one (a data mart, or no active data); a write-optimized aDSO also loses its partitioning. Direct update keeps its key. The removed key fields are named in the answer. The `direct_update` preset now carries the reporting flag the modeling tools set; the server set it anyway. Verified on BW/4HANA: both types switched from a standard aDSO with seven key fields and activated.
 - **`bw_get_request` without a valid request returned every process step of the system** — called with a missing or malformed `request_tsn`, the tool asked the backend for the process steps of request "undefined", which answers with the complete process history (tens of thousands of steps, several megabytes) instead of an error. The request TSN is now checked before anything is read, and a missing or malformed one is refused with the expected format.
 
 ## [1.10.0] — 2026-11-09

@@ -53,7 +53,7 @@ const typePresets: Record<string, Record<string, boolean>> = {
     activateData: false,
     cubeDeltaOnly: false,
     directUpdate: true,
-    isReportingObject: false,
+    isReportingObject: true,
     noAqDeletion: false,
   },
 };
@@ -175,6 +175,27 @@ export async function bwUpdateAdsoSettings(
     xml = setRootAttr(xml, 'pushMode', String(settings.writeInterface));
   }
 
+  // 3b. The modeling tools drop what the new type cannot carry, and the activation check refuses
+  // it otherwise: a data mart treats every characteristic as key and an inbound-only aDSO has no
+  // active table, so neither keeps a key definition; a write-optimized aDSO (no active data, no
+  // change log) keeps no partitions either. Direct update keeps its key.
+  const rootTag = xml.match(/<adso:dataStore\b[^>]*>/)?.[0] ?? '';
+  const flag = (name: string) => new RegExp(`\\b${name}="true"`).test(rootTag);
+  const removedKeyFields: string[] = [];
+  let removedPartitions = false;
+  if (!flag('directUpdate') && (flag('cubeDeltaOnly') || !flag('activateData'))) {
+    for (const m of xml.matchAll(/<keyElement>[^<]*\/([^<\/]+)<\/keyElement>/g)) removedKeyFields.push(m[1]);
+    xml = xml.replace(/[ \t]*<keyElement>[^<]*<\/keyElement>\n?/g, '');
+    const writeOptimized = !['activateData', 'writeChangelog', 'snapShotScenario', 'uniqueDataRecords',
+      'isReportingObject', 'noAqDeletion', 'cubeDeltaOnly', 'directUpdate'].some(flag);
+    if (writeOptimized && /<partitioningcriteria\b/.test(xml)) {
+      xml = xml.replace(/[ \t]*<partitioningcriteria\b[^>]*\/>\n?/g, '');
+      xml = xml.replace(/[ \t]*<partitioningcriteria\b[^>]*>[\s\S]*?<\/partitioningcriteria>\n?/g, '');
+      xml = xml.replace(/\s+dynamicPartitions="[^"]*"/, '').replace(/\s+dynamicPartitionGranularity="[^"]*"/, '');
+      removedPartitions = true;
+    }
+  }
+
   // 4. Update label in the aDSO's own <endUserTexts label="..."/>: the one before
   // <tlogoProperties>. The server serves the texts of the logon language; an aDSO without a text
   // in that language has no such element, and the first <endUserTexts> of the document is then
@@ -200,13 +221,21 @@ export async function bwUpdateAdsoSettings(
     throw err;
   }
 
+  const dropped = [
+    removedKeyFields.length ? `the key definition (${removedKeyFields.join(', ')})` : '',
+    removedPartitions ? 'the partitioning' : '',
+  ].filter(Boolean).join(' and ');
   return JSON.stringify({
     success: true,
-    message: `aDSO ${adsoUpper} settings updated. Call bw_activate to activate.`,
+    message:
+      `aDSO ${adsoUpper} settings updated. Call bw_activate to activate.` +
+      (dropped ? ` The new type cannot carry ${dropped}, which was removed as the modeling tools do.` : ''),
     lock_handle: lockHandle,
     adso_name: adsoUpper,
     object_type: 'adso',
     applied: settings,
+    ...(removedKeyFields.length ? { removed_key_fields: removedKeyFields } : {}),
+    ...(removedPartitions ? { removed_partitioning: true } : {}),
   });
 }
 
