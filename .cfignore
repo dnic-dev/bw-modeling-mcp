@@ -7,3 +7,5 @@ docs/
 payloads/
 tsconfig.json
 *.md
+poc/
+playbooks/
