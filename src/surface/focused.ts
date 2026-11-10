@@ -515,7 +515,15 @@ export function resolveFocusedCall(
   if (!spec) return undefined;
   const members = spec.members.filter((m) => byName.has(m.tool));
   const value = args?.[spec.discriminator];
-  const member = typeof value === 'string' ? members.find((m) => m.value === value) : undefined;
+  // A focused tool that shares its name with a full tool (bw_activate, bw_delete, bw_query_data)
+  // answers a call without the discriminator as that full tool, so a client holding the full
+  // list keeps working.
+  const member =
+    typeof value === 'string'
+      ? members.find((m) => m.value === value)
+      : value === undefined
+        ? members.find((m) => m.tool === name)
+        : undefined;
   if (!member) {
     return {
       kind: 'error',
