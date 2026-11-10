@@ -15,7 +15,7 @@ import { createRequire } from 'node:module';
 import { closeAllSessions, createClientFromEnv, withSessionScope, type BwClient } from './bw-client.js';
 import { currentClient } from './request-context.js';
 import { filterToolsByScope, mayCall, requiredScope, scopesFor } from './scopes.js';
-import { buildFocusedTools, resolveFocusedCall, toolMode, type ToolDefinition } from './surface/focused.js';
+import { buildFocusedTools, resolveFocusedCall, toolMode, translateToolNames, type ToolDefinition } from './surface/focused.js';
 import { undeclaredArguments } from './arguments.js';
 import {
   cachedPlatform,
@@ -8357,7 +8357,8 @@ function buildInstructions(): string {
           'definition of one operation.',
         ]
       : []),
-    ...platformInstructions(cachedPlatform()),
+    // The platform's routes name full tools; in focused mode the model only sees the focused ones.
+    ...platformInstructions(cachedPlatform()).map((line) => (toolMode() === 'focused' ? translateToolNames(line) : line)),
   ].join('\n');
 }
 

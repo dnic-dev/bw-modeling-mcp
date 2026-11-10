@@ -10,20 +10,22 @@ For the architecture and the full endpoint list, see [ARCHITECTURE.md](ARCHITECT
 
 ---
 
-## Focused mode
+## Tool modes
 
-`BW_TOOL_MODE=focused` offers 21 tools in place of the full set, about a third of the tool payload
-in the model's context. Every operation below stays reachable: a focused tool stands for a group of
-full tools and selects one of them through its `type` (reads) or `operation` (everything else)
-parameter, then hands the call to that tool's handler unchanged — same parameters, same enums, same
-behaviour. The parameters of a focused tool are the union of its members' parameters, each marked with
+The server offers 21 tools by default, about a third of the tool payload of the full set in the
+model's context; `BW_TOOL_MODE=full` offers every operation as a tool of its own instead, as documented
+in the reference below. Every operation stays reachable in the default mode: a focused tool stands for
+a group of full tools and selects one of them through its `type` (reads) or `operation` (everything
+else) parameter, then hands the call to that tool's handler unchanged — same parameters, same enums,
+same behaviour. The parameters of a focused tool are the union of its members' parameters, each marked with
 the operations that use it; `bw_read` takes one `name` in place of the members' own name parameters.
 Large nested item schemas (query operations, process chain steps) keep their type and first sentence,
 and `bw_describe(tool, operation)` returns the complete definition of one operation. A wrong or missing
 `operation` is refused with the allowed values before anything reaches BW, and so is a missing required
 parameter. The scope and platform filters apply to the members, so an operation the caller may not
-invoke or the system cannot answer is not listed. A full tool name remains callable in focused mode, so a
-client holding the full list keeps working.
+invoke or the system cannot answer is not listed, and the routes the server's instructions give on a classic
+release name the focused calls. A full tool name remains callable in focused mode, so a client holding the
+full list keeps working.
 
 | Focused tool | Selector | Operations (full tool in brackets) |
 |---|---|---|

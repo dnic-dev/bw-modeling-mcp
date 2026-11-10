@@ -1,7 +1,8 @@
 /**
  * The focused tool surface: a reduced set of tools in front of the full one.
  *
- * `BW_TOOL_MODE=focused` offers about twenty tools instead of the full set. Each focused tool
+ * The server offers about twenty tools instead of the full set unless `BW_TOOL_MODE=full` asks
+ * for every operation as a tool of its own. Each focused tool
  * stands for a group of the full tools and selects one of them through a discriminator
  * (`type` for reads, `operation` for everything else; no full tool has a parameter of either name). The call
  * is then handed to the full tool's handler unchanged, so a focused tool never has behaviour of
@@ -31,7 +32,21 @@ export interface ToolDefinition {
 export type ToolMode = 'full' | 'focused';
 
 export function toolMode(): ToolMode {
-  return /^focused$/i.test(process.env.BW_TOOL_MODE ?? '') ? 'focused' : 'full';
+  return /^full$/i.test(process.env.BW_TOOL_MODE ?? '') ? 'full' : 'focused';
+}
+
+/** The focused call that stands for a full tool, for texts that name the full tool. */
+export function focusedCallFor(fullTool: string): string | undefined {
+  for (const spec of FOCUSED_TOOLS) {
+    const member = spec.members.find((m) => m.tool === fullTool);
+    if (member) return `${spec.name} with ${spec.discriminator}="${member.value}"`;
+  }
+  return undefined;
+}
+
+/** Rewrite the full tool names in a text to the focused calls, for the server instructions. */
+export function translateToolNames(text: string): string {
+  return text.replace(/\bbw_[a-z_]+\b/g, (name) => focusedCallFor(name) ?? name);
 }
 
 interface Member {

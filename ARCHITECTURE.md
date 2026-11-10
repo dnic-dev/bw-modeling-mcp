@@ -165,8 +165,9 @@ A second addition follows the same rules on both platforms: aggregation levels. 
 
 ## Focused Tool Surface
 
-`BW_TOOL_MODE=focused` (`src/surface/focused.ts`) puts a reduced surface in front of the full one without
-touching a handler. The operation table maps every full tool to one focused tool and one discriminator
+The focused surface (`src/surface/focused.ts`), the default since the tool-selection benchmark showed it
+holds up, puts a reduced surface in front of the full one without touching a handler; `BW_TOOL_MODE=full`
+offers the full one instead. The operation table maps every full tool to one focused tool and one discriminator
 value (`type` for reads, `operation` for everything else; no full tool has a parameter of either name).
 Everything else is derived from that table and the full tool definitions at `tools/list` time: the
 discriminator enum with a one-line summary and the required parameters per value, the union of the
@@ -176,8 +177,9 @@ pointer to `bw_describe`, which answers with the member's full schema. Because t
 from the *offered* full tools, the scope and platform filters need no second table: what they remove is
 gone from the discriminators too. A call is resolved to the full tool and handed to the same dispatcher,
 so the full tool's scope check, platform check and argument validation apply. Full tool names stay
-callable in focused mode. The test suite asserts that every full tool is covered exactly once, that the
-default mode is unchanged, and that the payload stays about a third of the full one; a tool-selection
+callable in focused mode, and the full tool names in the platform instructions are rewritten to the
+focused calls. The test suite asserts that every full tool is covered exactly once, that the full
+mode is unchanged, and that the payload stays about a third of the full one; a tool-selection
 benchmark sends the same prompts against both surfaces and compares the first call's tool and parameters.
 
 ## Push API
