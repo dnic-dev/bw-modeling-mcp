@@ -1291,16 +1291,35 @@ function applyRuleChange(
  * The key fields of a lookup object, in key order: for a DataStore object its key, for an
  * InfoObject the characteristic itself followed by its compounding parents. The read dialog of
  * the modeling tools gives the read step one input per key field, each bound to a source field.
+ *
+ * A DataStore object can only be read from when it has direct update, or activation together
+ * with a change log (message RSTRAN 360 at activation, raised for the modeling tools as well);
+ * `readable` says so, with the reason when it cannot.
  */
-async function lookupObjectKeyFields(client: BwClient, objectType: string, objectName: string): Promise<string[]> {
+async function lookupObjectKeyFields(
+  client: BwClient,
+  objectType: string,
+  objectName: string,
+): Promise<{ keyFields: string[]; readable: boolean; reason?: string }> {
   const nameLower = objectName.toLowerCase();
   if (objectType === 'ADSO') {
     const xml = (await freshRead(`/sap/bw/modeling/adso/${bwSeg(nameLower)}/a`, MEDIA_TYPES['adso'])).body;
-    return [...xml.matchAll(/<keyElement>[^<]*\/([^<\/]+)<\/keyElement>/g)].map((m) => m[1].toUpperCase());
+    const keyFields = [...xml.matchAll(/<keyElement>[^<]*\/([^<\/]+)<\/keyElement>/g)].map((m) => m[1].toUpperCase());
+    const root = xml.match(/<adso:dataStore\b[^>]*>/)?.[0] ?? '';
+    const flag = (name: string) => new RegExp(`\\b${name}="true"`).test(root);
+    const readable = flag('directUpdate') || (flag('activateData') && flag('writeChangelog'));
+    return {
+      keyFields,
+      readable,
+      reason: readable
+        ? undefined
+        : `only a DataStore object with direct update, or with activation and a change log, can be read from; ` +
+          `${objectName.toUpperCase()} has ${flag('activateData') ? 'activation but no change log' : 'no activation'}`,
+    };
   }
   const xml = (await client.get(`/sap/bw/modeling/iobj/${bwSeg(nameLower)}/a`, MEDIA_TYPES['iobj'])).body;
   const parents = [...xml.matchAll(/<compoundParent\b[^>]*\bname="([^"]+)"/g)].map((m) => m[1].toUpperCase());
-  return [objectName.toUpperCase(), ...parents];
+  return { keyFields: [objectName.toUpperCase(), ...parents], readable: true };
 }
 
 type RuleChange = { xml: string; keptTargets: string[]; endRoutineExtended: boolean };
@@ -1916,11 +1935,18 @@ async function updateRule(
     // field — the activation check refuses a key without a source. As the read dialog does, a key
     // takes the source field of its own name; lookup_key_mapping names the others, and source_field
     // alone serves the InfoObject itself or the single key that is still open.
-    const keyFields = await lookupObjectKeyFields(client, lookupType, lookupName);
+    const lookupObjectInfo = await lookupObjectKeyFields(client, lookupType, lookupName);
+    const keyFields = lookupObjectInfo.keyFields;
     if (keyFields.length === 0) {
       return JSON.stringify({
         success: false,
         message: `${lookupType} ${lookupName} has no key fields to read by, or does not exist. The rule was not changed.`,
+      });
+    }
+    if (!lookupObjectInfo.readable) {
+      return JSON.stringify({
+        success: false,
+        message: `${lookupType} ${lookupName} cannot be read from: ${lookupObjectInfo.reason}. The rule was not changed.`,
       });
     }
     const segmentFields = listSourceSegmentFields(originalXml);

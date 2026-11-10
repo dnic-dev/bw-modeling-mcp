@@ -1106,7 +1106,9 @@ const TOOL_DEFINITIONS = [
           lookup_object_type: {
             type: 'string',
             enum: ['IOBJ', 'ADSO'],
-            description: 'Type of the lookup object. "IOBJ" for InfoObject, "ADSO" for aDSO. Required for rule_type="lookup".',
+            description:
+              'Type of the lookup object. "IOBJ" for InfoObject, "ADSO" for aDSO. Required for rule_type="lookup". ' +
+              'An aDSO can be read from only with direct update, or with activation and a change log; any other aDSO is refused before anything is written.',
           },
           lookup_key_mapping: {
             type: 'object',
