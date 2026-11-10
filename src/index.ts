@@ -5145,7 +5145,9 @@ const TOOL_DEFINITIONS = [
         'location, directory, logical file name), the semantic key, the external format of fields, the RFC notification, ' +
         'and the field list (add or remove fields). The rules of the modeling tools apply: a technical key removes the ' +
         'semantic key and turns overwrite into delete-and-insert; overwrite needs a semantic key. The destination type ' +
-        'itself is not switched. Saved inactive — call bw_activate with object_type "dest" and lock_handle "" afterwards.',
+        'itself is not switched. Saved inactive — call bw_activate with object_type "dest" and lock_handle "" afterwards. ' +
+        'Every activation recreates the database table, so it is refused while the table holds data: delete the ' +
+        'requests of the destination first (bw_delete_request, target_type "DEST").',
       inputSchema: {
         type: 'object',
         properties: {

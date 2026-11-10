@@ -670,7 +670,9 @@ export async function bwUpdateOpenHub(client: BwClient, openHubName: string, o: 
       key_fields: info.fields.filter((f) => f.key).map((f) => f.name),
       database_properties: info.databaseProperties,
       file_properties: info.fileProperties,
-      message: `Open Hub Destination ${name} updated (${applied.join('; ')}). Activate it with bw_activate (object_type "dest", lock_handle "").`,
+      message:
+        `Open Hub Destination ${name} updated (${applied.join('; ')}). Activate it with bw_activate (object_type "dest", lock_handle ""). ` +
+        `The activation recreates the database table and is refused while the table holds data: delete the requests of ${name} first (bw_delete_request with target_type "DEST").`,
     },
     null,
     2,
