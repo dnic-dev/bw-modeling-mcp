@@ -841,6 +841,11 @@ export interface FilterValue {
   exclude?: boolean;
   /** Set by the hierarchy check: the node is a characteristic value, not a text node. */
   value_node?: boolean;
+  /**
+   * Which node of a hierarchy is meant when a text node and a characteristic value in the tree
+   * carry the same name. Without it such a name is refused rather than guessed.
+   */
+  node_type?: 'text' | 'value';
 }
 
 export interface FilterOperation {
@@ -1551,7 +1556,22 @@ export function parseQueryHierarchy(xml: string): QueryHierarchyIndex | undefine
     index.set(n.name, n);
   }
   for (const n of texts) index.set(n.name, n);
+  // Per kind as well, under the key without leading zeros: a hierarchy can hold a text node and
+  // a characteristic value of the same name, and a value answers to its external key (as shown)
+  // and its internal one (zero-padded) alike.
+  for (const n of values) for (const k of [n.name, n.internal]) index.set(kindKey('value', k), n);
+  for (const n of texts) for (const k of [n.name, n.internal]) index.set(kindKey('text', k), n);
   return index;
+}
+
+const kindKey = (kind: 'text' | 'value', name: string): string => `${kind}:${name.replace(/^0+(?=.)/, '')}`;
+
+/** The text node and the characteristic value a name stands for in a hierarchy, either or both. */
+export function hierarchyNodesNamed(
+  index: QueryHierarchyIndex,
+  name: string
+): { text?: QueryHierarchyNode; value?: QueryHierarchyNode } {
+  return { text: index.get(kindKey('text', name)), value: index.get(kindKey('value', name)) };
 }
 
 /** Read a hierarchy the way the query editor does: in the context of the query's provider. */
@@ -1612,7 +1632,11 @@ export function switchHierarchyInXml(
     const renamed = node ? nodeMap[node] : undefined;
     const targetName = renamed ?? node;
     const cha = groups.find((g) => offset >= g.start && offset < g.end)?.cha;
-    const target = cha ? targets?.(cha)?.get(targetName) : undefined;
+    // A node keeps its kind across the switch where the target hierarchy has the name as both.
+    const targetIndex = cha ? targets?.(cha) : undefined;
+    const named = targetIndex ? hierarchyNodesNamed(targetIndex, targetName) : {};
+    const wasTextNode = /<Qry:toValue\b/.test(body);
+    const target = (wasTextNode ? named.text ?? named.value : named.value ?? named.text) ?? targetIndex?.get(targetName);
     if (target) {
       const newFromValue = fromValue
         .replace(/\binternalValue="[^"]*"/, `internalValue="${escapeXml(target.internal)}"`)
@@ -1677,9 +1701,30 @@ async function checkHierarchyNodes(
     }
     return cache.get(k)!;
   };
-  const checkNode = (nodes: QueryHierarchyIndex, cha: string, hierarchy: string, node: string) => {
-    const row = nodes.get(node);
-    if (!row) throw new Error(`Hierarchy ${hierarchy.toUpperCase()} of ${cha} has no node '${node}'.`);
+  const checkNode = (
+    nodes: QueryHierarchyIndex, cha: string, hierarchy: string, node: string, nodeType?: 'text' | 'value'
+  ) => {
+    const { text, value } = hierarchyNodesNamed(nodes, node);
+    const where = `Hierarchy ${hierarchy.toUpperCase()} of ${cha}`;
+    if (nodeType === 'text' || nodeType === 'value') {
+      const row = nodeType === 'text' ? text : value;
+      if (!row) {
+        const other = nodeType === 'text' ? value : text;
+        throw new Error(
+          `${where} has no ${nodeType === 'text' ? 'text node' : 'characteristic value'} '${node}'` +
+          (other ? `; '${node}' is a ${nodeType === 'text' ? 'characteristic value' : 'text node'} there.` : '.'),
+        );
+      }
+      return row;
+    }
+    if (text && value) {
+      throw new Error(
+        `${where} has '${node}' twice: as a text node ('${text.text || text.name}') and as a characteristic value ` +
+        `('${value.text || value.name}'). Pass node_type "text" or "value" with the value to say which one is meant.`,
+      );
+    }
+    const row = text ?? value ?? nodes.get(node);
+    if (!row) throw new Error(`${where} has no node '${node}'.`);
     return row;
   };
 
@@ -1688,9 +1733,13 @@ async function checkHierarchyNodes(
       if (!r.hierarchy) continue;
       const cha = r.infoobject.toUpperCase();
       const nodes = await nodesOf(cha, r.hierarchy);
-      if (!nodes) continue;
+      if (!nodes) {
+        // Unread hierarchy: the caller's word is all there is to tell the two kinds apart.
+        for (const v of r.values ?? []) if (v.node_type) v.value_node = v.node_type === 'value';
+        continue;
+      }
       for (const v of r.values ?? []) {
-        const row = checkNode(nodes, cha, r.hierarchy, v.value);
+        const row = checkNode(nodes, cha, r.hierarchy, v.value, v.node_type);
         v.value = row.name;
         v.internal_value = row.internal;
         v.value_node = !row.textNode;
@@ -1728,7 +1777,14 @@ async function checkHierarchyNodes(
         const openTag = t[0].match(/^<Qry:tokens\b[^>]*?\/?>/)?.[0] ?? '';
         if (!openTag.includes(`hierarchyName="${from}"`) || !openTag.includes('xsi:type="Qry:SelectionRange"')) continue;
         const node = unescapeXml(t[0].match(/<Qry:fromValue\b[^>]*>[\s\S]*?<Qry:value>([^<]*)<\/Qry:value>/)?.[1] ?? '');
-        if (node) checkNode(nodes, cha, op.to_hierarchy!, op.node_map?.[node] ?? node);
+        if (!node) continue;
+        // Existence only: where the target has the name as text node and as value, the switch
+        // keeps the kind the node has now.
+        const target = op.node_map?.[node] ?? node;
+        const named = hierarchyNodesNamed(nodes, target);
+        if (!named.text && !named.value && !nodes.get(target)) {
+          throw new Error(`Hierarchy ${op.to_hierarchy!.toUpperCase()} of ${cha} has no node '${target}'.`);
+        }
       }
     }
   }

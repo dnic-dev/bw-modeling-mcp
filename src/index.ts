@@ -3247,6 +3247,14 @@ const TOOL_DEFINITIONS = [
                               type: 'string',
                               description: 'Internal value for "value". Defaults to value if omitted.',
                             },
+                            node_type: {
+                              type: 'string',
+                              enum: ['text', 'value'],
+                              description:
+                                'Only with hierarchy: which node is meant when the hierarchy holds a text node and a ' +
+                                'characteristic value of the same name — "text" for the text node, "value" for the ' +
+                                'characteristic value in the tree. Without it such a name is refused with both listed.',
+                            },
                             description: {
                               type: 'string',
                               description: 'Optional description for "value".',
