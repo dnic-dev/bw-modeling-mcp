@@ -8,6 +8,123 @@ For the complete, structured change history see [CHANGELOG.md](CHANGELOG.md).
 
 ---
 
+## What's New — v1.10.0 · Repeat a Failed Chain Step
+
+### BW/4HANA
+
+**🔁 Process chains, repaired in place**
+
+- New `bw_restart_process_chain_step` — repeats a failed or canceled step of a chain run, as
+  "Repeat" in the process chain monitor does: the step runs again as a new instance of the
+  same run and the chain carries on along its success links, instead of restarting the
+  whole chain or running the DTP on its own
+
+**💶 Key figures with a variable unit or currency**
+
+- `bw_create_infoobject` and `bw_update_infoobject` take `unit_currency_infoobject`, the unit
+  characteristic that supplies the currency or unit per record — an amount carrying several
+  currencies can now be created at all
+
+### On every release (BW/4HANA and BW 7.5)
+
+**📐 Query design, continued**
+
+- Structure members can be restricted to characteristic values in a hierarchy, not only to
+  text nodes, and `switch_hierarchy` takes key and node type from the new hierarchy (#52)
+- `bw_update_query_characteristic` sets a query-specific description for a characteristic
+
+### Also in this release
+
+- Fixed: a transformation with a combined quantity + unit rule can be changed again (#51);
+  aggregations BW ignores are refused instead of reported as set; descriptions land in the
+  logon language; restricted key figures keep their value on characteristics with a
+  conversion routine
+
+---
+
+## What's New — v1.9.1 · Secure Sign-in on SAP BTP
+
+**🔒 Security fix for hosted servers.** On SAP BTP, a client that registered itself could
+complete the sign-in of a user who was already logged in through SSO without that user's
+approval ([GHSA-6935-r3wv-f646](https://github.com/arc-mcp/arc-1/security/advisories/GHSA-6935-r3wv-f646)).
+Every new sign-in now shows an approval page with the client's name and return address.
+Local use over stdio is not affected. **If you host the server, update the XSUAA instance
+as well as the app** — `xs-security.json` now holds only the server's exact callback; see
+[docs/CLOUD-FOUNDRY.md](docs/CLOUD-FOUNDRY.md). Thanks to @marianfoo (#49).
+
+### On every release (BW/4HANA and BW 7.5)
+
+**📐 Query design, continued**
+
+- New `bw_update_query_exceptions` — creates, changes and removes the exceptions that colour
+  data cells: thresholds per alert level, fixed or by formula variable, the members they are
+  evaluated on and the cells that show the alert; `for_each_member` creates one per key figure
+- The characteristic structure of a query can now be created, and holds formulas — a
+  comparison of two selections gets its delta and percentage columns in one call
+
+### Also in this release
+
+- `bw_update_composite_provider` switches navigation attributes of a field on or off, and
+  names the union parts that cannot deliver them before activation refuses them
+- Fixed: saving a characteristic with more than one attribute, source fields of providers
+  with field groups, and auto-mapping of reserved fields; dependency advisories cleared
+
+---
+
+## What's New — v1.9.0 · Analysis for Office Workbooks
+
+The workbooks your planners and controllers actually work in are now within reach of the
+agent: find them, see what they depend on, take one out of BW, change it, and put it back
+into the role menu where users open it.
+
+### On every release (BW/4HANA and BW 7.5)
+
+**📊 Analysis for Office workbooks stored in BW**
+
+- New `bw_list_afo_workbooks` — every workbook stored in BW with its where-used list: data
+  sources, planning functions and sequences, BPC models, role menus, last change.
+  `used_object` answers the question to ask before touching a query or planning function:
+  *which workbooks break if I change this?*
+- New `bw_get_afo_workbook` — fetches a workbook exactly as Analysis for Office opens it,
+  without taking the edit lock, so nobody working in it is disturbed. BW checks the
+  caller's authorization, so under principal propagation everyone gets only what they may open
+- New `bw_save_afo_workbook` — saves a workbook back the way Analysis for Office does and
+  adds it to a role menu; the where-used list is built from the file itself, so a planning
+  function added to the workbook is recorded in BW. Nothing is overwritten without
+  `overwrite: true`
+
+Together they close the loop: take a workbook out of BW, change it, and save it back to the
+role menu your users open it from.
+
+**🌳 Hierarchy nodes in query structures**
+
+- Structure members can be restricted to hierarchy nodes or a hierarchy node variable, in the
+  key figure structure and in the characteristic structure
+- `switch_hierarchy` moves every node restriction of a structure to another hierarchy in one
+  save, with renamed nodes mapped; unknown hierarchies and nodes are refused before BW stores
+  them silently (#50)
+
+### BW/4HANA
+
+**🧮 Agentic Planning, continued**
+
+- New `bw_set_adso_planning_mode` — switches a planning aDSO between planning and loading,
+  as the toggle in the BW/4HANA Cockpit does, and checks that the switch took effect
+- New `bw_add_process_chain_plswitch` — puts the switch to load mode and back around the
+  load of a planning aDSO in a process chain, in one call and without the chain editor
+- New `bw_delete_adso_data_selective` — selective deletion by conditions on characteristics;
+  simulates first and counts what would go
+
+**🛠️ Fixes and improvements**
+
+- SAP sessions are ended after every tool call instead of piling up in SM04 until users are
+  locked out (#48); connections to the backend are reused, so reads answer faster; an
+  InfoArea can be moved back to the top level
+
+Thanks to @alxy for #50, and to @army113 and @MWKAnalytics for the analysis behind #48.
+
+---
+
 ## What's New — v1.8.0 · Agentic Planning Modelling
 
 An agent can now build a BW planning model end to end — aggregation level, planning

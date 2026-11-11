@@ -216,7 +216,7 @@ src/
 ├── classic-writes.ts     # per-write-tool status on a classic release, printed by bw_system_profile
 ├── bw-client.ts          # HTTP client (CSRF, session, lock/unlock, GET/PUT/POST/rawGet/rawPost/rawPut)
 └── tools/
-    ├── activation.ts     # bw_activate, bw_unlock
+    ├── activation.ts     # bw_activate, bw_check, bw_unlock
     ├── adso.ts           # bw_get_adso, bw_create_adso, bw_update_adso
     ├── adso_data.ts      # bw_set_adso_planning_mode, bw_delete_adso_data_selective — BW/4HANA
     │                     # manage API for the runtime state and the data of an aDSO
@@ -278,7 +278,7 @@ src/
     │                     # and dependencies resolved into execution order
     ├── logon_user.ts     # the logon user of the system, written as the responsible of new objects
     │                     # when BW_USER is not set (destination, principal propagation)
-    ├── openhub.ts        # bw_get_open_hub
+    ├── openhub.ts        # bw_get_open_hub, bw_create_open_hub, bw_update_open_hub
     ├── planning.ts       # bw_get_aggregation_level, bw_create_aggregation_level,
     │                     # bw_update_aggregation_level, bw_get_planning_properties,
     │                     # bw_get_planning_sequence, bw_get_planning_function
@@ -427,7 +427,9 @@ system serves a lower resource version than the fallback.
 | Purpose | Endpoint |
 |---|---|
 | **Activation** | `POST /sap/bw/modeling/activation` |
-| **Check (pre-activation)** | `POST /sap/bw/modeling/checkruns` |
+| **Check (pre-activation)** | `POST /sap/bw/modeling/checkruns` — same body as the activation, nothing is generated (`bw_check`) |
+| Value conversion (internal ↔ external) | `POST /sap/bw/modeling/is/values/valueInputConversion` — partition bounds of an aDSO, with overlap and range checks |
+| aDSO feature switches | `GET /sap/bw/modeling/adso/{adsonm}/configuration` — what the system offers for this aDSO (dynamic partitioning, …) |
 | ABAP syntax check (ADT) | `POST /sap/bc/adt/checkruns?reporters=abapCheckRun` (DTP filter routine gate) |
 | ELEM component enqueue (lock/unlock) | `POST /sap/bw/modeling/comp/enq/{compid}?action=lock\|unlock` (RKF/Query create) |
 | Validation | `GET /sap/bw/modeling/validation?objectType=...&objectName=...` |

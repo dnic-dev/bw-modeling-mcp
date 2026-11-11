@@ -43,7 +43,7 @@ Principal propagation additionally needs a certificate rule and ICM trust on the
 |---|---|
 | SAP BW/4HANA (all versions) | ✅ Full support |
 | SAP BW Bridge (SAP BTP ABAP stack) | ✅ Via cookie authentication (`BW_COOKIE_FILE`) |
-| SAP BW on HANA (7.5) | ✅ Modelling reads after a small ABAP enhancement, and modelling **writes** for every object type except the InfoObject — aDSOs, InfoAreas, InfoSources, CompositeProviders, queries and their reusable components, aggregation levels. The tool surface adjusts to what the system publishes, and the objects without a REST resource — including planning, chain runs and the APD — are read from their metadata tables. `bw_system_profile` states per write tool what was verified there. See [BW 7.5 Support](bw75/BW75-SUPPORT.md) |
+| SAP BW on HANA (7.5) | ✅ Modelling reads after a small ABAP enhancement, and modelling **writes** for every object type that has a REST resource there — InfoObjects, aDSOs, InfoAreas, InfoSources, CompositeProviders, Open Hub Destinations, queries and their reusable components, aggregation levels. The tool surface adjusts to what the system publishes, and the objects without a REST resource — including planning, chain runs and the APD — are read from their metadata tables. `bw_system_profile` states per write tool what was verified there. See [BW 7.5 Support](bw75/BW75-SUPPORT.md) |
 
 <p><em><sub>On SAP BW 7.5 the REST framework looks up the <code>Accept</code> header case-sensitively while the kernel delivers header names in lower case, so almost every call fails with HTTP 406. A ~20-line post-exit enhancement (no modification) resolves this and makes all REST endpoints that exist on 7.5 reachable. Objects for which BW 7.5 ships no REST resource at all — transformations, DTPs, process chains and their runs, classic DSOs, InfoCubes, the planning objects and the Analysis Process Designer — are readable through <code>bw_read_metadata_tables</code>, which goes to their metadata tables instead, but they cannot be written; Eclipse opens the embedded SAP GUI for those as well. Details, ABAP code and setup steps: <a href="bw75/BW75-SUPPORT.md">bw75/BW75-SUPPORT.md</a>.</sub></em></p>
 
@@ -61,130 +61,113 @@ A two-part blog series about this project (both available in German and English)
 
 ---
 
-## 🆕 What's New — v1.10.0 · Repeat a Failed Chain Step
+## 🆕 What's New — v2.0.0 · 21 Tools Instead of 134
+
+The largest release so far, in two directions at once: the model now works with a tool
+surface a third the size, and the write paths have been checked operation by operation
+against what BW actually accepts — so a change the server reports as saved also activates.
+
+### 🎯 Focused tool surface, now the default
+
+- **21 tools instead of 134.** Each focused tool stands for a group of operations and selects
+  one through its `type` or `operation` parameter: `bw_read` reads any object type,
+  `bw_write_adso` creates and changes aDSOs, `bw_activate` checks, activates and unlocks.
+  Nothing was removed — every operation is still there, with the same parameters and behaviour
+- **A third of the context.** The tool definitions take about a third of the space they
+  took before, which leaves the model more room for the actual work. In our tool-selection benchmark it
+  picked the right operation as often on the focused surface as on the full one
+- **`bw_describe` on demand.** The focused tools carry short parameter notes;
+  `bw_describe(tool, operation)` returns the complete definition of one operation when the
+  model needs it, and a wrong or missing `operation` is refused with the allowed values
+  before anything reaches BW
+- Roles and platform still apply per operation: a Reader sees only the reading operations,
+  and a BW 7.5 system only what it can answer
+
+### Upgrading to 2.0
+
+The one breaking change: **clients now see the focused tool names.**
+
+- **Allowlists and permission settings** that name full tools (`bw_get_adso`,
+  `bw_update_transformation`, …) need the focused names (`bw_read`, `bw_write_transformation`, …)
+  — or set `BW_TOOL_MODE=full` to keep the full surface exactly as it was
+- **Scripts and automations** that call the server directly with full tool names keep working
+  without a change: a full tool name sent to the server is answered in either mode
+- **Skills and prompts** that name full tools in their text are best moved to the focused
+  names — an agent can only pick from the tools it is shown — or run with `BW_TOOL_MODE=full`
+- **Hosted on SAP BTP:** role collections and scopes are unchanged
+- The mapping from every full tool to its focused tool and operation is in
+  [Tool modes](TOOLS.md#tool-modes)
+
+### On every release (BW/4HANA and BW 7.5)
+
+**✅ Check before you activate**
+
+- New `bw_check` (operation `check` of `bw_activate`) — runs the activation checks on the
+  saved version of an object, as "Check" in the modeling tools does, without activating
+  anything and without a lock. The answer says whether the object would activate and why
+  not. It is a read operation, so read-only users can use it too
+
+**🧱 Writes that activate the first time**
+
+- **aDSO** — a type change now writes the type as a whole and drops what the new type cannot
+  carry; removing a field removes its key, partition and index entries with it; an
+  InfoObject brings its compounding parents along; key fields are checked before they are
+  saved, and every one of these is reported in the answer
+- **CompositeProvider** — `update_join` gives both sides of a join key the common target
+  field BW requires, a compounded field brings its compounding parent, and mapping an input
+  again no longer leaves duplicate fields behind
+- **InfoObject** — attributes can be key figures, units and time characteristics, display
+  attributes can be time-dependent, and a navigation attribute BW would refuse is refused
+  before anything is written
+
+**🆕 New capabilities**
+
+- **Open Hub Destinations** can be created from an aDSO or CompositeProvider and changed
+  — table and file destinations, write mode, key, fields and file properties
+  (`bw_create_open_hub`, `bw_update_open_hub`)
+- **Partitions and data tiering of an aDSO** — static range partitions or dynamic
+  partitioning (`manage_partitions`), hot and warm storage per object or per partition
+- **Master data, text and hierarchy properties of a characteristic** — text lengths,
+  language- and time-dependent texts, hierarchies with version and time dependency
 
 ### BW/4HANA
 
-**🔁 Process chains, repaired in place**
+**🔀 Transformations and DTPs**
 
-- New `bw_restart_process_chain_step` — repeats a failed or canceled step of a chain run, as
-  "Repeat" in the process chain monitor does: the step runs again as a new instance of the
-  same run and the chain carries on along its success links, instead of restarting the
-  whole chain or running the DTP on its own
+- The rule of a field can be changed from any type to any other — direct, time conversion,
+  constant, formula, routine with several source fields, lookup — and a lookup binds every
+  key field of the object it reads from
+- `bw_update_dtp` takes the execution settings: package size and parallel extraction,
+  request selection, error handling, SAP HANA execution and the batch manager. Each value is
+  checked against what the server admits for that DTP, so an inadmissible setting is refused
+  with the admissible ones instead of an HTTP 500 without a message
 
-**💶 Key figures with a variable unit or currency**
+**📤 Open Hub from a query**
 
-- `bw_create_infoobject` and `bw_update_infoobject` take `unit_currency_infoobject`, the unit
-  characteristic that supplies the currency or unit per record — an amount carrying several
-  currencies can now be created at all
-
-### On every release (BW/4HANA and BW 7.5)
-
-**📐 Query design, continued**
-
-- Structure members can be restricted to characteristic values in a hierarchy, not only to
-  text nodes, and `switch_hierarchy` takes key and node type from the new hierarchy (#52)
-- `bw_update_query_characteristic` sets a query-specific description for a characteristic
+- A query can be released as an InfoProvider and used as the template and source of an Open
+  Hub Destination, so the result of a query lands in a table or file through a DTP
 
 ### Also in this release
 
-- Fixed: a transformation with a combined quantity + unit rule can be changed again (#51);
-  aggregations BW ignores are refused instead of reported as set; descriptions land in the
-  logon language; restricted key figures keep their value on characteristics with a
-  conversion routine
+- Query structures: where a hierarchy holds a text node and a characteristic value of the same
+  name, `node_type` says which one a restriction means, and `switch_hierarchy` keeps the kind
+  of each node (#52)
+- Fixed: `bw_update_infoobject` reported a refused activation as success — the answer now
+  carries the server's messages and says that the change is saved but not active; a
+  characteristic with a compounded attribute can be changed again; `bw_run_dtp` says when a
+  delta found nothing to load instead of reporting a started request; `bw_get_request`
+  refuses a malformed request id instead of returning the whole process history; texts with
+  `&` or quotes no longer break a save
 
 ---
 
-## What's New — v1.9.1 · Secure Sign-in on SAP BTP
-
-**🔒 Security fix for hosted servers.** On SAP BTP, a client that registered itself could
-complete the sign-in of a user who was already logged in through SSO without that user's
-approval ([GHSA-6935-r3wv-f646](https://github.com/arc-mcp/arc-1/security/advisories/GHSA-6935-r3wv-f646)).
-Every new sign-in now shows an approval page with the client's name and return address.
-Local use over stdio is not affected. **If you host the server, update the XSUAA instance
-as well as the app** — `xs-security.json` now holds only the server's exact callback; see
-[docs/CLOUD-FOUNDRY.md](docs/CLOUD-FOUNDRY.md). Thanks to @marianfoo (#49).
-
-### On every release (BW/4HANA and BW 7.5)
-
-**📐 Query design, continued**
-
-- New `bw_update_query_exceptions` — creates, changes and removes the exceptions that colour
-  data cells: thresholds per alert level, fixed or by formula variable, the members they are
-  evaluated on and the cells that show the alert; `for_each_member` creates one per key figure
-- The characteristic structure of a query can now be created, and holds formulas — a
-  comparison of two selections gets its delta and percentage columns in one call
-
-### Also in this release
-
-- `bw_update_composite_provider` switches navigation attributes of a field on or off, and
-  names the union parts that cannot deliver them before activation refuses them
-- Fixed: saving a characteristic with more than one attribute, source fields of providers
-  with field groups, and auto-mapping of reserved fields; dependency advisories cleared
-
----
-
-## What's New — v1.9.0 · Analysis for Office Workbooks
-
-The workbooks your planners and controllers actually work in are now within reach of the
-agent: find them, see what they depend on, take one out of BW, change it, and put it back
-into the role menu where users open it.
-
-### On every release (BW/4HANA and BW 7.5)
-
-**📊 Analysis for Office workbooks stored in BW**
-
-- New `bw_list_afo_workbooks` — every workbook stored in BW with its where-used list: data
-  sources, planning functions and sequences, BPC models, role menus, last change.
-  `used_object` answers the question to ask before touching a query or planning function:
-  *which workbooks break if I change this?*
-- New `bw_get_afo_workbook` — fetches a workbook exactly as Analysis for Office opens it,
-  without taking the edit lock, so nobody working in it is disturbed. BW checks the
-  caller's authorization, so under principal propagation everyone gets only what they may open
-- New `bw_save_afo_workbook` — saves a workbook back the way Analysis for Office does and
-  adds it to a role menu; the where-used list is built from the file itself, so a planning
-  function added to the workbook is recorded in BW. Nothing is overwritten without
-  `overwrite: true`
-
-Together they close the loop: take a workbook out of BW, change it, and save it back to the
-role menu your users open it from.
-
-**🌳 Hierarchy nodes in query structures**
-
-- Structure members can be restricted to hierarchy nodes or a hierarchy node variable, in the
-  key figure structure and in the characteristic structure
-- `switch_hierarchy` moves every node restriction of a structure to another hierarchy in one
-  save, with renamed nodes mapped; unknown hierarchies and nodes are refused before BW stores
-  them silently (#50)
-
-### BW/4HANA
-
-**🧮 Agentic Planning, continued**
-
-- New `bw_set_adso_planning_mode` — switches a planning aDSO between planning and loading,
-  as the toggle in the BW/4HANA Cockpit does, and checks that the switch took effect
-- New `bw_add_process_chain_plswitch` — puts the switch to load mode and back around the
-  load of a planning aDSO in a process chain, in one call and without the chain editor
-- New `bw_delete_adso_data_selective` — selective deletion by conditions on characteristics;
-  simulates first and counts what would go
-
-**🛠️ Fixes and improvements**
-
-- SAP sessions are ended after every tool call instead of piling up in SM04 until users are
-  locked out (#48); connections to the backend are reused, so reads answer faster; an
-  InfoArea can be moved back to the top level
-
-Thanks to @alxy for #50, and to @army113 and @MWKAnalytics for the analysis behind #48.
-
----
-
-**Earlier releases** — the "What's New" notes for v1.8.0 and older are archived in [WHATS_NEW.md](WHATS_NEW.md); the full structured history is in [CHANGELOG.md](CHANGELOG.md).
+**Earlier releases** — the "What's New" notes for v1.10.0 and older are archived in [WHATS_NEW.md](WHATS_NEW.md); the full structured history is in [CHANGELOG.md](CHANGELOG.md).
 
 ---
 
 ## What it can do
 
-An overview by area. Every tool in detail — parameters, behaviour, and the sequences it belongs in — is in the **[Tools Reference](TOOLS.md)** (131 tools).
+An overview by area. Every tool in detail — parameters, behaviour, and the sequences it belongs in — is in the **[Tools Reference](TOOLS.md)** (134 operations behind 21 focused tools).
 
 <p align="center">
   <picture>
@@ -216,7 +199,7 @@ The ADT MCP server covers ABAP as a subject in its own right: your own reports, 
 
 ## Installation
 
-> **Two ways to run.** Locally as a **stdio** server (one user, one machine — the steps below), or **centrally hosted** on SAP BTP Cloud Foundry behind XSUAA OAuth for a whole team → see [docs/CENTRAL-HOSTING-SETUP.md](docs/CENTRAL-HOSTING-SETUP.md). The installation and configuration below cover local stdio use; upgrading an existing local setup is non-breaking.
+> **Two ways to run.** Locally as a **stdio** server (one user, one machine — the steps below), or **centrally hosted** on SAP BTP Cloud Foundry behind XSUAA OAuth for a whole team → see [docs/CENTRAL-HOSTING-SETUP.md](docs/CENTRAL-HOSTING-SETUP.md). The installation and configuration below cover local stdio use. Upgrading from 1.x: see [Upgrading to 2.0](#upgrading-to-20).
 
 ```bash
 # Option 1: Install via npm (recommended)
