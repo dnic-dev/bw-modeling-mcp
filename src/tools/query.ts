@@ -738,7 +738,7 @@ function renderQueryText(q: Record<string, unknown>): string {
   lines.push('── Settings ──');
   lines.push(`  Zero suppression: rows=${bool(zs['rows'])}  columns=${bool(zs['columns'])}  mode=${s(zs['mode'])}`);
   lines.push(`  Result position: top=${bool(rp['onTop'])}  left=${bool(rp['onLeft'])}`);
-  lines.push(`  RFC=${bool(settings['rfcEnabled'])}  OData=${bool(settings['odataSupport'])}  EasyQuery=${bool(settings['easyQuery'])}`);
+  lines.push(`  RFC=${bool(settings['rfcEnabled'])}  OData=${bool(settings['odataSupport'])}  EasyQuery=${bool(settings['easyQuery'])}  UsedAsInfoProvider=${bool(settings['usedAsInfoProvider'])}`);
   lines.push(`  Sign presentation: ${s(settings['signPresentation'])}`);
   const kd = settings['keyDate'] as Record<string, unknown> | undefined;
   if (kd) {
@@ -1215,7 +1215,9 @@ export function parseQueryDocument(
     columns: zeroSuppr?.['@_columns'] === 'true' || zeroSuppr?.['@_columns'] === true,
   };
   if (zeroSuppr?.['@_mode']) zeroSuppression['mode'] = zeroSuppr['@_mode'] as string;
+  const runtimeProps = mainComp['Qry:runtimeProperties'] as Record<string, unknown> | undefined;
   const settings: Record<string, unknown> = {
+    usedAsInfoProvider: runtimeProps?.['@_infoProviderSupport'] === 'true' || runtimeProps?.['@_infoProviderSupport'] === true,
     rfcEnabled: mainComp['@_rfcEnabled'] === 'true' || mainComp['@_rfcEnabled'] === true,
     easyQuery: mainComp['@_easyQuery'] === 'true' || mainComp['@_easyQuery'] === true,
     odataSupport: mainComp['@_odataSupport'] === 'true' || mainComp['@_odataSupport'] === true,

@@ -3241,6 +3241,7 @@ export interface UpdateQuerySettingsArgs {
   hierarchy_display_rows?: HierarchyDisplay;
   hierarchy_display_columns?: HierarchyDisplay;
   document_links?: DocumentLinks;
+  used_as_infoprovider?: boolean;
   transport?: string;
 }
 
@@ -3412,6 +3413,10 @@ export async function bwUpdateQuerySettings(
     if (args.adjust_formatting !== undefined) {
       doc = setMainComponentAttr(doc, 'adjustFormatting', bool(args.adjust_formatting));
       applied.push('adjust_formatting');
+    }
+    if (args.used_as_infoprovider !== undefined) {
+      doc = setSettingElementAttrs(doc, 'runtimeProperties', { infoProviderSupport: bool(args.used_as_infoprovider) }, 'runtime properties');
+      applied.push('used_as_infoprovider');
     }
 
     return doc;

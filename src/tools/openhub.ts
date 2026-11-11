@@ -1,4 +1,5 @@
 import { BwClient, MEDIA_TYPES, bwSeg, stripInfoAreaSentinel } from '../bw-client.js';
+import { queryAccept } from './query.js';
 
 interface OpenHubField {
   name: string;
@@ -84,7 +85,7 @@ function parseOpenHubXml(xml: string, status: string): OpenHubInfo {
   const name = attr(rootAttrs, 'name');
   const destinationType = attr(rootAttrs, 'destinationType');
   const sourceTlogo = attr(rootAttrs, 'sourceTlogo');
-  const sourceObjectName = attr(rootAttrs, 'sourceObjectName');
+  const sourceObjectName = attr(rootAttrs, 'sourceObjectName') || attr(rootAttrs, 'sourceObjnm');
   const dbTable = attr(rootAttrs, 'dbTable');
   const systemCodePage = [attr(rootAttrs, 'systemCodePage'), attr(rootAttrs, 'systemCodePageDescr')].filter(Boolean).join(' ');
   // A classic release sends no object_status header; the status then comes from the body.
@@ -239,7 +240,7 @@ function formatOpenHub(info: OpenHubInfo, rawXml: string): string {
     '',
     `InfoArea: ${info.infoArea || '(none)'}`,
     `Package:  ${info.package}`,
-    `DB Table: ${info.dbTable}`,
+    `DB Table: ${info.dbTable}${info.destinationType === 'FILE' && info.dbTable ? ' (reserved name only: a file destination has no database table)' : ''}`,
   ];
   if (info.sourceObjectName) lines.push(`Source:   ${info.sourceTlogo} ${info.sourceObjectName}`);
   if (info.systemCodePage) lines.push(`System code page: ${info.systemCodePage}`);
@@ -350,6 +351,8 @@ export interface OpenHubUpdateOptions {
   dtpExternalProgram?: boolean;
   fields?: OpenHubFieldInput[];
   removeFields?: string[];
+  /** Current field name to new field name. */
+  renameFields?: Record<string, string>;
   transport?: string;
 }
 
@@ -407,6 +410,34 @@ function setElementAttr(xml: string, element: string, name: string, value: strin
 function elementBlock(xml: string, fieldName: string): RegExpMatchArray | null {
   const esc = fieldName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
   return xml.match(new RegExp(`<element\\b[^>]*\\bname="${esc}"[^>]*>[\\s\\S]*?</element>`));
+}
+
+const MAX_FIELD_NAME_LENGTH = 16;
+const RESERVED_FIELD_NAMES = new Set(['OHREQUID', 'REQTSN', 'DATAPAKID', 'RECORD']);
+
+/** The rules the activation check applies to the field name of a table destination. */
+function assertValidFieldName(fieldName: string): void {
+  if (fieldName.length > MAX_FIELD_NAME_LENGTH) {
+    throw new Error(`Field name ${fieldName} is longer than ${MAX_FIELD_NAME_LENGTH} characters; the activation check refuses it.`);
+  }
+  if (!/^[A-Z][A-Z0-9_]*$/.test(fieldName)) {
+    throw new Error(`Field name ${fieldName} must start with a letter and consist of letters, digits and underscores.`);
+  }
+  if (RESERVED_FIELD_NAMES.has(fieldName)) {
+    throw new Error(`Field name ${fieldName} is reserved for the technical key of a table destination.`);
+  }
+}
+
+function renameField(xml: string, from: string, to: string, destName: string): string {
+  const block = elementBlock(xml, from);
+  if (!block) throw new Error(`field ${from} is not a field of Open Hub Destination ${destName}.`);
+  if (elementBlock(xml, to)) throw new Error(`Open Hub Destination ${destName} already has a field ${to}.`);
+  const openTag = block[0].match(/<element\b[^>]*>/)![0];
+  const renamed = block[0].replace(openTag, () => setTagAttr(openTag, 'name', to));
+  return xml
+    .replace(block[0], () => renamed)
+    .split(`<keyElement>#///${from}</keyElement>`)
+    .join(`<keyElement>#///${to}</keyElement>`);
 }
 
 function buildDestElement(field: OpenHubFieldInput): string {
@@ -589,6 +620,16 @@ export async function bwUpdateOpenHub(client: BwClient, openHubName: string, o: 
       applied.push(`DTP started by external program ${o.dtpExternalProgram}`);
     }
 
+    const renames = Object.entries(o.renameFields ?? {});
+    if (renames.length) {
+      for (const [from, toRaw] of renames) {
+        const to = toRaw.trim().toUpperCase();
+        assertValidFieldName(to);
+        xml = renameField(xml, from, to, name);
+      }
+      applied.push(`fields renamed ${renames.map(([from, to]) => `${from} to ${to.trim().toUpperCase()}`).join(', ')}`);
+    }
+
     if (o.removeFields?.length) {
       for (const raw of o.removeFields) {
         const block = elementBlock(xml, raw);
@@ -686,13 +727,18 @@ export type OpenHubWriteMode = 'INSERT' | 'DEL_INSERT' | 'OVERWRITE';
 export type OpenHubConnectionType = 'LOCAL' | 'SDA' | 'DBCON';
 export type OpenHubFileType = 'CSV' | 'FIXED' | 'XML';
 
+export type OpenHubTemplateType = 'ADSO' | 'HCPR' | 'QUERY';
+
+// The wizard sends the TLOGO of the template; a query is an ELEM.
+const TEMPLATE_TLOGO: Record<OpenHubTemplateType, string> = { ADSO: 'ADSO', HCPR: 'HCPR', QUERY: 'ELEM' };
+
 export interface OpenHubCreateOptions {
   description: string;
   infoArea: string;
   pkg?: string;
   destinationType: OpenHubDestinationType;
   templateObjectName: string;
-  templateObjectType: 'ADSO' | 'HCPR';
+  templateObjectType: OpenHubTemplateType;
   writeMode?: OpenHubWriteMode;
   useTechnicalKey?: boolean;
   connectionType?: OpenHubConnectionType;
@@ -783,6 +829,28 @@ function buildPropertiesXml(name: string, o: OpenHubCreateOptions): string {
 }
 
 /**
+ * The server only copies the fields of a query that is released as an InfoProvider, and
+ * answers anything else with a message in the logon language. Checking the flag up front
+ * gives the caller the way out.
+ */
+async function assertQueryIsInfoProvider(client: BwClient, queryName: string): Promise<void> {
+  const query = queryName.toUpperCase();
+  let body: string;
+  try {
+    body = (await client.get(`/sap/bw/modeling/query/${bwSeg(query)}/a`, queryAccept())).body;
+  } catch (err) {
+    throw new Error(`Template query ${query} could not be read in its active version: ${err instanceof Error ? err.message : String(err)}`);
+  }
+  const runtimeProps = /<Qry:runtimeProperties\b([^>]*)>/.exec(body)?.[1] ?? '';
+  if (attr(runtimeProps, 'infoProviderSupport') !== 'true') {
+    throw new Error(
+      `Query ${query} is not released as an InfoProvider, so it cannot be the template of an Open Hub Destination. ` +
+      `Release it with bw_update_query_settings (used_as_infoprovider: true) and create the destination again.`,
+    );
+  }
+}
+
+/**
  * Create an Open Hub Destination the way the BW modeling tools' wizard does: a lock with
  * activity CREA, then a POST of the destination shell with the template object as
  * copyFrom parameters. The server copies the template's fields and key, generates the
@@ -792,6 +860,7 @@ function buildPropertiesXml(name: string, o: OpenHubCreateOptions): string {
 export async function bwCreateOpenHub(client: BwClient, openHubName: string, o: OpenHubCreateOptions): Promise<string> {
   validateCreateOptions(o);
   const name = openHubName.toUpperCase();
+  if (o.templateObjectType === 'QUERY') await assertQueryIsInfoProvider(client, o.templateObjectName);
   const pkg = o.pkg ?? '$TMP';
   const destMedia = MEDIA_TYPES['dest'];
   const language = process.env.BW_LANGUAGE ?? 'DE';
@@ -817,7 +886,7 @@ export async function bwCreateOpenHub(client: BwClient, openHubName: string, o: 
   const url =
     `/sap/bw/modeling/dest/${bwSeg(name)}` +
     `?copyFromObjectName=${encodeURIComponent(o.templateObjectName.toUpperCase())}` +
-    `&copyFromObjectType=${o.templateObjectType}` +
+    `&copyFromObjectType=${TEMPLATE_TLOGO[o.templateObjectType]}` +
     `&lockHandle=${lockHandle}`;
   try {
     await client.postWithCsrf(url, body, `application/xml, ${destMedia}`, {
@@ -828,9 +897,33 @@ export async function bwCreateOpenHub(client: BwClient, openHubName: string, o: 
     await client.unlock('dest', name).catch(() => {/* the create result decides, not the unlock */});
   }
 
-  const result = await client.get(`/sap/bw/modeling/dest/${bwSeg(name)}/m`, destMedia);
+  let result = await client.get(`/sap/bw/modeling/dest/${bwSeg(name)}/m`, destMedia);
   const status = result.headers['object_status'] ?? result.headers['OBJECT_STATUS'] ?? 'unknown';
-  const info = parseOpenHubXml(result.body, status);
+  let info = parseOpenHubXml(result.body, status);
+
+  // The server names the key figures of a query after the id of their structure member, which
+  // is longer than the field name of a table destination may be. They get a numbered name, as
+  // the fields of a query have no InfoObject to be named after. A file destination keeps them.
+  const renamedFields: Array<{ name: string; label: string; transformation_source_field: string }> = [];
+  const tooLong = o.destinationType === 'TAB' ? info.fields.filter((f) => f.name.length > MAX_FIELD_NAME_LENGTH) : [];
+  if (tooLong.length) {
+    const taken = new Set(info.fields.map((f) => f.name));
+    const renameFields: Record<string, string> = {};
+    let n = 0;
+    for (const f of tooLong) {
+      let to: string;
+      do {
+        n += 1;
+        to = `FIELDNM${String(n).padStart(3, '0')}`;
+      } while (taken.has(to));
+      taken.add(to);
+      renameFields[f.name] = to;
+      renamedFields.push({ name: to, label: f.label, transformation_source_field: `@${f.name}` });
+    }
+    await bwUpdateOpenHub(client, name, { renameFields });
+    result = await client.get(`/sap/bw/modeling/dest/${bwSeg(name)}/m?forceCacheUpdate=true`, destMedia);
+    info = parseOpenHubXml(result.body, result.headers['object_status'] ?? result.headers['OBJECT_STATUS'] ?? status);
+  }
 
   // The activation check refuses a table destination without any key: the template's key is
   // copied, but a CompositeProvider has none. The technical key is the way out on create.
@@ -839,6 +932,7 @@ export async function bwCreateOpenHub(client: BwClient, openHubName: string, o: 
     info.destinationType === 'TAB' && keyFields.length === 0 && !info.databaseProperties?.useTechnicalKey
       ? 'No key field: the activation check will refuse this destination. Recreate it with use_technical_key: true, or use a template that carries a key.'
       : undefined;
+  const fromQuery = o.templateObjectType === 'QUERY';
 
   return JSON.stringify(
     {
@@ -851,12 +945,22 @@ export async function bwCreateOpenHub(client: BwClient, openHubName: string, o: 
       template: `${o.templateObjectType} ${o.templateObjectName.toUpperCase()}`,
       field_count: info.fields.length,
       key_fields: keyFields,
+      ...(renamedFields.length ? { renamed_fields: renamedFields } : {}),
       database_properties: info.databaseProperties,
       file_properties: info.fileProperties,
       message:
         `Open Hub Destination ${info.name} created inactive in InfoArea ${info.infoArea} with ${info.fields.length} fields ` +
         `copied from ${o.templateObjectType} ${o.templateObjectName.toUpperCase()}. ` +
-        `Activate it with bw_activate (object_type "dest", lock_handle ""); a DTP into it is created with bw_create_dtp (target_type "DEST").`,
+        `Activate it with bw_activate (object_type "dest", lock_handle ""); ` +
+        (fromQuery
+          ? `then create the transformation with bw_create_transformation (source_object_type "ELEM", source_object_name the query, ` +
+            `target_object_type "DEST") and the DTP on it with bw_create_dtp (source_type "ELEM", target_type "DEST"). ` +
+            (renamedFields.length
+              ? `The key figures of the query and their unit and currency fields were renamed (renamed_fields), because a table ` +
+                `destination allows 16 characters per field name; the transformation proposes no rule for them, so map each ` +
+                `transformation_source_field to its field with bw_update_transformation. bw_update_open_hub (rename_fields) gives them other names.`
+              : `The key figures of the query are fields named after the id of their structure member, each with its unit or currency field.`)
+          : `a DTP into it is created with bw_create_dtp (target_type "DEST").`),
     },
     null,
     2,

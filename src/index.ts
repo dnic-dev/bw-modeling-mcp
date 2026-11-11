@@ -797,7 +797,7 @@ const TOOL_DEFINITIONS = [
         properties: {
           source_object_type: {
             type: 'string',
-            description: 'Source object type. Valid values: HCPR (CompositeProvider), ADSO (aDSO), RSDS (DataSource — requires source_system), HAAP (HANA Analysis Process), IOBJ (InfoObject), TRCS (InfoSource), QVIW (Query).',
+            description: 'Source object type. Valid values: HCPR (CompositeProvider), ADSO (aDSO), RSDS (DataSource — requires source_system), HAAP (HANA Analysis Process), IOBJ (InfoObject), TRCS (InfoSource), ELEM (query released as an InfoProvider; source_object_name is the technical name of the query, the target is an Open Hub Destination).',
           },
           source_object_name: {
             type: 'string',
@@ -2104,7 +2104,7 @@ const TOOL_DEFINITIONS = [
           },
           source_type: {
             type: 'string',
-            description: 'Source object type (e.g. "ADSO", "TRCS", "RSDS"). Use "RSDS" for a DataSource source — source_system is then required.',
+            description: 'Source object type (e.g. "ADSO", "TRCS", "RSDS"). Use "RSDS" for a DataSource source — source_system is then required. Use "ELEM" for a query released as an InfoProvider; source_name is then the technical name of the query.',
           },
           source_system: {
             type: 'string',
@@ -3234,6 +3234,12 @@ const TOOL_DEFINITIONS = [
           suppress_repeated_key_values: { type: 'boolean', description: 'Suppress repeated key values.' },
           show_scaling_factor: { type: 'boolean', description: 'Show the scaling factor.' },
           adjust_formatting: { type: 'boolean', description: 'Adjust formatting.' },
+          used_as_infoprovider: {
+            type: 'boolean',
+            description:
+              'Release the query as an InfoProvider. Required before the query can be the template of an Open Hub ' +
+              'Destination or the source of a transformation.',
+          },
           zero_presentation_kind: { type: 'string', description: 'Zero presentation kind (e.g. "withCurrency").' },
           zero_presentation_custom_value: { type: 'string', description: 'Custom value shown for zeros.' },
           hierarchy_display_rows: {
@@ -5061,7 +5067,7 @@ const TOOL_DEFINITIONS = [
       name: 'bw_create_open_hub',
       description:
         'Create an Open Hub Destination (TLOGO DEST) from a template object: the server copies the fields ' +
-        'and key of the given aDSO or CompositeProvider and generates the DB table name. ' +
+        'and key of the given aDSO, CompositeProvider or query and generates the DB table name. ' +
         'destination_type "TAB" writes into a database table (write mode, technical key, connection), ' +
         '"FILE" into a flat file (CSV, fixed length or XML; on the application server or the local workstation). ' +
         'Created inactive — call bw_activate with object_type "dest" and lock_handle "" afterwards, ' +
@@ -5092,12 +5098,17 @@ const TOOL_DEFINITIONS = [
           },
           template_object_name: {
             type: 'string',
-            description: 'Technical name of the object whose fields and key are copied (an aDSO or a CompositeProvider).',
+            description: 'Technical name of the object whose fields and key are copied (an aDSO, a CompositeProvider or a query).',
           },
           template_object_type: {
             type: 'string',
-            enum: ['ADSO', 'HCPR'],
-            description: 'Type of the template object. Default "ADSO".',
+            enum: ['ADSO', 'HCPR', 'QUERY'],
+            description:
+              'Type of the template object. Default "ADSO". "QUERY" copies the output of a query: its characteristics, and each key ' +
+              'figure of the structure with its unit or currency field. The query must be released as an InfoProvider ' +
+              '(bw_update_query_settings, used_as_infoprovider); the destination is then loaded through a transformation and a DTP ' +
+              'with the query as source type "ELEM". In a table destination the key figure fields get the names FIELDNM001, FIELDNM002, ..., ' +
+              'since a field name may have 16 characters and the server names them after the id of the structure member.',
           },
           write_mode: {
             type: 'string',
@@ -5156,7 +5167,7 @@ const TOOL_DEFINITIONS = [
         'Change an Open Hub Destination (TLOGO DEST): description, the database options of a table destination ' +
         '(write mode, technical key, connection), the file options of a file destination (type, name, separator, ' +
         'location, directory, logical file name), the semantic key, the external format of fields, the RFC notification, ' +
-        'and the field list (add or remove fields). The rules of the modeling tools apply: a technical key removes the ' +
+        'and the field list (add, remove or rename fields). The rules of the modeling tools apply: a technical key removes the ' +
         'semantic key and turns overwrite into delete-and-insert; overwrite needs a semantic key. The destination type ' +
         'itself is not switched. Saved inactive — call bw_activate with object_type "dest" and lock_handle "" afterwards. ' +
         'Every activation recreates the database table, so it is refused while the table holds data: delete the ' +
@@ -5204,6 +5215,14 @@ const TOOL_DEFINITIONS = [
             },
           },
           remove_fields: { type: 'array', items: { type: 'string' }, description: 'Field names to remove, including from the key.' },
+          rename_fields: {
+            type: 'object',
+            additionalProperties: { type: 'string' },
+            description:
+              'Fields to rename, as an object of current field name to new field name. A new name has at most 16 characters, starts with a ' +
+              'letter and consists of letters, digits and underscores. The key keeps the field. A transformation into the destination ' +
+              'loses the rule of a renamed field.',
+          },
           transport: { type: 'string', description: 'Transport request to record the change on.' },
         },
         required: ['open_hub_name'],
@@ -7981,6 +8000,7 @@ async function handleToolCall(
             isKey: f['is_key'] as boolean | undefined,
           })),
           removeFields: args?.remove_fields as string[] | undefined,
+          renameFields: args?.rename_fields as Record<string, string> | undefined,
           transport: args?.transport as string | undefined,
         };
         text = await bwUpdateOpenHub(client, args?.open_hub_name as string, options);
