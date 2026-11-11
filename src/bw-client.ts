@@ -1083,6 +1083,46 @@ export class BwClient {
   }
 
   /**
+   * Run the activation checks of one BW object without activating it.
+   *
+   * The modeling tools' "Check" button: the same request body as an activation, posted to the
+   * check collection. Nothing is generated and no lock is needed. The answer is the feed of
+   * check messages; a failed check is HTTP 200 with error entries.
+   */
+  async check(type: string, name: string, sourceSystem?: string): Promise<string> {
+    await this.ensureCsrf();
+    const mediaType = resolveMediaType(type);
+    const typeLower = type.toLowerCase();
+    const href = typeLower === 'rsds'
+      ? `/sap/bw/modeling/rsds/${bwSegUpper(name)}/${(sourceSystem ?? '').toUpperCase()}/m`
+      : `/sap/bw/modeling/${typeLower}/${bwSeg(name)}/m`;
+    const body = `<?xml version="1.0" encoding="UTF-8"?>
+<atom:feed xmlns:atom="http://www.w3.org/2005/Atom" xmlns:bwModel="http://www.sap.com/bw/modeling">
+  <atom:entry>
+    <atom:content type="${mediaType}">
+      <bwModel:checkProperties version="inactive" modelContent="" lockHandle=""/>
+    </atom:content>
+    <atom:link href="${href}" type="application/*" rel="self"/>
+  </atom:entry>
+</atom:feed>`;
+    const response = await this.http.post('/sap/bw/modeling/checkruns', body, {
+      headers: {
+        'Content-Type': 'application/atom+xml;type=entry',
+        Accept: 'application/atom+xml;type=feed',
+        'X-CSRF-Token': this.csrfToken!,
+        ...this.cookieHeaders(),
+      },
+      responseType: 'text',
+    });
+    this.updateCookies(response);
+    this.csrfToken = null;
+    if (response.status >= 400) {
+      throw bwHttpError(`Check of ${type}/${name}`, response.status, response.data);
+    }
+    return response.data as string;
+  }
+
+  /**
    * Activate one BW object.
    * Pattern: POST /sap/bw/modeling/activation
    * lockHandle is empty string for DTP activation.

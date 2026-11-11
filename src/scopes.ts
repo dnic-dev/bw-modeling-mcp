@@ -39,6 +39,7 @@ export type Scope = 'read' | 'analyst' | 'write';
 export const SCOPES: readonly Scope[] = ['read', 'analyst', 'write'];
 
 const READ_TOOLS = new Set([
+  'bw_check',
   'bw_get_adso',
   'bw_get_afo_workbook',
   'bw_get_aggregation_level',

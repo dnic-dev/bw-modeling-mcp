@@ -31,6 +31,67 @@ export function parseDtpsDeactivated(xml: string): string[] {
   return dtps;
 }
 
+const CHECKABLE_TYPES = ['adso', 'trfn', 'dtpa', 'iobj', 'trcs', 'rsds', 'hcpr', 'alvl', 'dest'];
+
+/** The entries of a check or activation feed with their message type. */
+export function parseCheckMessages(xml: string): Array<{ type: string; text: string }> {
+  const decode = (s: string) =>
+    s.replace(/&quot;/g, '"').replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&apos;/g, "'").replace(/&amp;/g, '&');
+  return [...xml.matchAll(/<atom:entry>([\s\S]*?)<\/atom:entry>/g)]
+    .map((m) => ({
+      type: m[1].match(/messageType=["']([^"']*)["']/)?.[1] ?? 'Information',
+      text: decode(m[1].match(/<atom:title>([^<]*)<\/atom:title>/)?.[1] ?? ''),
+    }))
+    .filter((entry) => entry.text !== '');
+}
+
+/**
+ * bw_check — run the activation checks of one object on its saved, inactive version.
+ *
+ * What the modeling tools do on "Check": the object is validated exactly as an activation
+ * would validate it, but nothing is generated and the active version stays as it is. No lock
+ * is needed and none is released, so the check fits between two changes of the same object.
+ */
+export async function bwCheck(
+  client: BwClient,
+  objectType: string,
+  objectName: string,
+  sourceSystem?: string
+): Promise<string> {
+  const typeLower = objectType.toLowerCase();
+  if (!CHECKABLE_TYPES.includes(typeLower)) {
+    return JSON.stringify({
+      success: false,
+      message: `Unknown object type: ${objectType}. Supported: ${CHECKABLE_TYPES.join(', ')}`,
+    });
+  }
+  if (typeLower === 'rsds' && !sourceSystem) {
+    return JSON.stringify({
+      success: false,
+      message: 'object_type "rsds" requires source_system (a DataSource is identified by DataSource name plus source system).',
+    });
+  }
+  // A fresh session: the shared one may still buffer the object as it was before the last save.
+  const feed = await createClientFromEnv().check(typeLower, objectName, sourceSystem);
+  const entries = parseCheckMessages(feed);
+  const of = (type: string) => [...new Set(entries.filter((e) => e.type === type).map((e) => e.text))];
+  const errors = of('Error');
+  const warnings = of('Warning');
+  const consistent = errors.length === 0;
+  return JSON.stringify({
+    success: true,
+    object_type: objectType.toUpperCase(),
+    object_name: objectName.toUpperCase(),
+    consistent,
+    errors,
+    warnings,
+    information: of('Information'),
+    message: consistent
+      ? `${objectName.toUpperCase()} passes the activation checks${warnings.length ? ` with ${warnings.length} warning(s)` : ''}. Nothing was activated.`
+      : `${objectName.toUpperCase()} would not activate: ${errors.join(' ')} Nothing was activated.`,
+  }, null, 2);
+}
+
 /**
  * bw_activate — activate one BW object (aDSO, Transformation, or DTP).
  *

@@ -34,7 +34,7 @@ full list keeps working.
 | `bw_monitor` | `operation` | `requests` (list_requests), `request` (get_request), `chain_runs` (list_process_chain_runs), `chain_run_detail` (get_process_chain_run_detail), `chain_last_status` (list_process_chain_last_status), `remodeling_requests` (list_remodeling_requests), `remodeling_request` (get_remodeling_request), `query_statistics` (query_statistics) |
 | `bw_query_data` | `operation` | `run` (query_data) |
 | `bw_data` | `operation` | `filter_values` (get_filter_values), `preview_datasource` (preview_datasource), `push` (push_data), `delete_selective` (delete_adso_data_selective), `save_afo_workbook` (save_afo_workbook) |
-| `bw_activate` | `operation` | `activate` (activate), `unlock` (unlock), `activate_process_chain` (activate_process_chain) |
+| `bw_activate` | `operation` | `activate` (activate), `check` (check), `unlock` (unlock), `activate_process_chain` (activate_process_chain) |
 | `bw_delete` | `operation` | `delete` (delete) |
 | `bw_run` | `operation` | `dtp` (run_dtp), `process_chain` (start_process_chain), `restart_chain_step` (restart_process_chain_step), `activate_request` (activate_request), `delete_request` (delete_request), `remodeling` (run_remodeling) |
 | `bw_write_adso` | `operation` | `create` (create_adso), `update` (update_adso), `set_planning_mode` (set_adso_planning_mode) |
@@ -622,6 +622,9 @@ Push a JSON record array directly into a write-interface aDSO via the BW Push AP
 
 ### `bw_activate`
 Activate one or more BW objects. Handles impact analysis and automatically deactivated DTPs. Supports: `adso`, `iobj`, `trfn`, `dtp`, `rsds` (DataSource).
+
+### `bw_check`
+Run the activation checks of one BW object without activating it, as "Check" in the modeling tools does. The saved, inactive version is validated exactly as an activation would validate it; nothing is generated and the active version stays as it is. Needs no lock handle. Returns whether the object is consistent, with the errors, warnings and information messages of the check. Supports the object types of `bw_activate`. Read-only.
 
 ### `bw_unlock`
 Release a lock on a BW object without activating (discard changes).

@@ -159,9 +159,10 @@ export const FOCUSED_TOOLS: FocusedToolSpec[] = [
   {
     name: 'bw_activate',
     discriminator: 'operation',
-    purpose: 'Activate an object with the lock handle a write returned, release a lock, or activate a process chain.',
+    purpose: 'Activate an object with the lock handle a write returned, check it without activating, release a lock, or activate a process chain.',
     members: [
       op('activate', 'bw_activate'),
+      op('check', 'bw_check'),
       op('unlock', 'bw_unlock'),
       op('activate_process_chain', 'bw_activate_process_chain'),
     ],

@@ -27,7 +27,7 @@ import {
 import { bwGetAdso, bwCreateAdso, FieldDef, bwUpdateAdso, bwUpdateAdsoAddPureField, bwUpdateAdsoSettings, AdsoSettings, bwUpdateAdsoManageKeys, bwUpdateAdsoFieldProperties, FieldProperties, bwUpdateAdsoPartitions, PartitionSpec } from './tools/adso.js';
 import { bwGetInfoObject, bwCreateInfoObject, bwUpdateInfoObject, AttributeDef } from './tools/infoobject.js';
 import { bwGetTransformation, bwUpdateTransformation, bwCreateTransformation, bwSetTransformationRuntime, bwSetTransformationRoutine, bwDeleteTransformationRoutine, bwSetTransformationRoutineFields, bwSetTransformationExpertRoutine, type RuleConversion } from './tools/transformation.js';
-import { bwActivate } from './tools/activation.js';
+import { bwActivate, bwCheck } from './tools/activation.js';
 import { bwSystemProfile } from './tools/system_profile.js';
 import { bwReadMetadataTables } from './tools/metadata_tables.js';
 import { bwGetDtps, bwGetDtp, bwCreateDtp, bwRunDtp, bwUpdateDtp, bwSetDtpFilterRoutine, bwUnlockDtp, DtpFilterSelectionInput, type UpdateDtpArgs } from './tools/dtp.js';
@@ -1414,6 +1414,36 @@ const TOOL_DEFINITIONS = [
           },
         },
         required: ['transformation_name', 'runtime'],
+      },
+    },
+    {
+      name: 'bw_check',
+      description:
+        'Run the activation checks of one BW object without activating it — the "Check" of the modeling tools. ' +
+        'The saved, inactive version is validated exactly as an activation would validate it; nothing is generated and the active version stays as it is. ' +
+        'Needs no lock handle and releases none, so it fits between two changes of the same object. ' +
+        'Returns consistent true or false with the errors, warnings and information messages of the check. ' +
+        'Use it before bw_activate to see whether the activation would go through, and after a failed activation to check a correction.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          object_type: {
+            type: 'string',
+            enum: ['adso', 'trfn', 'dtpa', 'iobj', 'trcs', 'rsds', 'hcpr', 'alvl', 'dest'],
+            description:
+              'Object type: adso, trfn, dtpa, iobj, trcs, rsds (DataSource), hcpr (CompositeProvider), ' +
+              'alvl (Aggregation Level) or dest (Open Hub Destination).',
+          },
+          object_name: {
+            type: 'string',
+            description: 'Object name (e.g. "OBJECT_NAME" or "DTP_..."). For rsds, the DataSource name.',
+          },
+          source_system: {
+            type: 'string',
+            description: 'Source system name. Required when object_type is "rsds" (e.g. "LSYS_NAME").',
+          },
+        },
+        required: ['object_type', 'object_name'],
       },
     },
     {
@@ -7196,6 +7226,15 @@ async function handleToolCall(
           args?.transformation_name as string,
           args?.runtime as 'hana' | 'abap',
           args?.transport as string | undefined
+        );
+        break;
+
+      case 'bw_check':
+        text = await bwCheck(
+          client,
+          args?.object_type as string,
+          args?.object_name as string,
+          args?.source_system as string | undefined
         );
         break;
 
