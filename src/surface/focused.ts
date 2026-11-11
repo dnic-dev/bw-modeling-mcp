@@ -462,10 +462,16 @@ export function buildFocusedTools(offered: ToolDefinition[]): ToolDefinition[] {
       ordered[param] = def;
     }
 
+    // When the scope or platform filter removed members, the hand-written purpose would still
+    // name them; the lead before the colon stays and the offered operations replace the rest.
+    const purpose =
+      members.length === spec.members.length
+        ? spec.purpose
+        : `${spec.purpose.split(':')[0].replace(/\.$/, '')}: ${members.map((m) => m.value).join(', ')}.`;
     tools.push({
       name: spec.name,
       description:
-        `${spec.purpose} The ${spec.discriminator} enum lists every operation with what it requires; ` +
+        `${purpose} The ${spec.discriminator} enum lists every operation with what it requires; ` +
         `bw_describe(tool: "${spec.name}", ${spec.discriminator}: "…") gives the complete parameter definition of one.`,
       inputSchema: {
         type: 'object',
