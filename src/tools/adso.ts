@@ -6,56 +6,31 @@ import {
   bwSeg,
   stripInfoAreaSentinel,
 } from '../bw-client.js';
-import { parseInfoObjectProps } from './infoobject.js';
+import { parseInfoObjectProps, parseInfoObjectFacts, type InfoObjectFacts } from './infoobject.js';
 import { readPlanningMode, type PlanningMode } from './adso_data.js';
 
 // ── aDSO type presets ────────────────────────────────────────────────────────
 
+/**
+ * The eight root flags that together make the modeling type. A type is always written as the
+ * complete set: a flag left over from the previous type changes what the server reads the
+ * object as — a change log kept on a staging aDSO makes it a standard one again, and on a
+ * direct-update aDSO it fails the consistency check.
+ */
+const TYPE_FLAGS = [
+  'activateData', 'writeChangelog', 'snapShotScenario', 'uniqueDataRecords',
+  'isReportingObject', 'noAqDeletion', 'cubeDeltaOnly', 'directUpdate',
+] as const;
+
+const NO_FLAGS: Record<string, boolean> = Object.fromEntries(TYPE_FLAGS.map((f) => [f, false]));
+
 const typePresets: Record<string, Record<string, boolean>> = {
-  standard: {
-    activateData: true,
-    cubeDeltaOnly: false,
-    directUpdate: false,
-    isReportingObject: true,
-    noAqDeletion: false,
-    writeChangelog: true,
-  },
-  staging_inbound_only: {
-    activateData: false,
-    cubeDeltaOnly: false,
-    directUpdate: false,
-    isReportingObject: false,
-    noAqDeletion: false,
-    writeChangelog: false,
-  },
-  staging_compress: {
-    activateData: true,
-    cubeDeltaOnly: false,
-    directUpdate: false,
-    isReportingObject: false,
-    noAqDeletion: false,
-  },
-  staging_reporting: {
-    activateData: true,
-    cubeDeltaOnly: false,
-    directUpdate: false,
-    isReportingObject: true,
-    noAqDeletion: true,
-  },
-  datamart: {
-    activateData: true,
-    cubeDeltaOnly: true,
-    directUpdate: false,
-    isReportingObject: true,
-    noAqDeletion: false,
-  },
-  direct_update: {
-    activateData: false,
-    cubeDeltaOnly: false,
-    directUpdate: true,
-    isReportingObject: true,
-    noAqDeletion: false,
-  },
+  standard: { ...NO_FLAGS, activateData: true, isReportingObject: true, writeChangelog: true },
+  staging_inbound_only: { ...NO_FLAGS },
+  staging_compress: { ...NO_FLAGS, activateData: true },
+  staging_reporting: { ...NO_FLAGS, activateData: true, noAqDeletion: true, isReportingObject: true },
+  datamart: { ...NO_FLAGS, activateData: true, cubeDeltaOnly: true, isReportingObject: true },
+  direct_update: { ...NO_FLAGS, directUpdate: true, isReportingObject: true },
 };
 
 export type AdsoTypePreset = keyof typeof typePresets;
@@ -113,6 +88,245 @@ function setRootAttr(xml: string, attr: string, value: string): string {
   return xml.replace(/(<adso:dataStore\b(?:[^>]|\n)*?)(\s*>)/, `$1 ${attr}="${value}"$2`);
 }
 
+// ── Document helpers ─────────────────────────────────────────────────────────
+
+const rootTagOf = (xml: string): string => xml.match(/<adso:dataStore\b[^>]*>/)?.[0] ?? '';
+const rootAttrOf = (xml: string, name: string): string | undefined =>
+  rootTagOf(xml).match(new RegExp(`\\b${name}="([^"]*)"`))?.[1];
+const rootFlagOf = (xml: string, name: string): boolean => rootAttrOf(xml, name) === 'true';
+
+/** Replace a root attribute only where the document already carries it. */
+function setRootAttrIfPresent(xml: string, attr: string, value: string): string {
+  return rootAttrOf(xml, attr) === undefined ? xml : setRootAttr(xml, attr, value);
+}
+
+function removeRootAttr(xml: string, attr: string): string {
+  const root = rootTagOf(xml);
+  return root ? xml.replace(root, root.replace(new RegExp(`\\s+${attr}="[^"]*"`), '')) : xml;
+}
+
+const escapeXmlAttr = (s: string): string =>
+  s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+
+interface AdsoElementInfo {
+  name: string;
+  infoObjectName?: string;
+  /** InfoObject type as the server reports it: CHA, KYF, TIM, UNI, XXL. Absent on plain fields. */
+  objectType?: string;
+  sidMode?: string;
+  aggregation?: string;
+  conversionRoutine?: string;
+  dataType: string;
+  length?: number;
+  compoundParents: string[];
+  unitCurrencyElement?: string;
+  highCardinality?: boolean;
+}
+
+const refName = (ref: string): string => ref.trim().replace(/^#\/\/\//, '');
+
+export function adsoElements(xml: string): AdsoElementInfo[] {
+  const attr = (s: string, key: string) => s.match(new RegExp(`\\b${key}="([^"]*)"`))?.[1];
+  const out: AdsoElementInfo[] = [];
+  for (const m of xml.matchAll(/<element\b([^>]*)>([\s\S]*?)<\/element>/g)) {
+    const name = attr(m[1], 'name');
+    if (!name) continue;
+    const inline = m[2].match(/<inlineType\b[^>]*/)?.[0] ?? '';
+    const cv = m[2].match(/<consumptionViewProperties\b[^>]*/)?.[0] ?? '';
+    const length = attr(inline, 'length');
+    const highCard = attr(cv, 'highCardinality');
+    out.push({
+      name,
+      infoObjectName: attr(m[1], 'infoObjectName') || undefined,
+      objectType: attr(cv, 'objectType') || undefined,
+      sidMode: attr(m[1], 'sidDeterminationMode'),
+      aggregation: attr(m[1], 'aggregationBehavior'),
+      conversionRoutine: attr(m[1], 'conversionRoutine') || undefined,
+      dataType: attr(inline, 'name') ?? '',
+      length: length !== undefined ? Number(length) : undefined,
+      compoundParents: [...m[2].matchAll(/<compoundInfoObjects?>([^<]*)<\/compoundInfoObjects?>/g)].map((c) => refName(c[1])),
+      unitCurrencyElement: m[2].match(/<unitCurrencyElement>([^<]*)<\/unitCurrencyElement>/)?.[1].trim().replace(/^#\/\/\//, ''),
+      highCardinality: highCard === undefined ? undefined : highCard === 'true',
+    });
+  }
+  return out;
+}
+
+const keyFieldsOf = (xml: string): string[] =>
+  [...xml.matchAll(/<keyElement>([^<]*)<\/keyElement>/g)].map((m) => refName(m[1]));
+
+/**
+ * Whether the modeling type has a key at all: a data mart treats every characteristic as key
+ * and an aDSO without active data has no active table to key.
+ */
+const canCarryKeys = (xml: string): boolean =>
+  !rootFlagOf(xml, 'cubeDeltaOnly') && (rootFlagOf(xml, 'activateData') || rootFlagOf(xml, 'directUpdate'));
+
+const isWriteOptimized = (xml: string): boolean => !TYPE_FLAGS.some((f) => rootFlagOf(xml, f));
+
+/** A field counts as key figure when it is a key figure InfoObject or aggregates. */
+const isKeyFigureField = (el: AdsoElementInfo): boolean =>
+  el.objectType === 'KYF' || el.objectType === 'XXL' || (el.aggregation !== undefined && el.aggregation !== '' && el.aggregation !== 'NONE');
+
+const TYPES_INVALID_IN_KEY = new Set(['STRG', 'RSTR', 'RAW', 'D16R', 'D34R']);
+const MAX_KEY_FIELDS = 120;
+
+/** Why a field cannot be part of the key or carry the partitioning, or undefined when it can. */
+export function keyObstacle(el: AdsoElementInfo): string | undefined {
+  if (isKeyFigureField(el)) {
+    return el.objectType === 'KYF' || el.objectType === 'XXL'
+      ? `it is a ${el.objectType === 'XXL' ? 'XXL' : 'key figure'} InfoObject`
+      : `it aggregates (${el.aggregation}); only fields with aggregation NONE can be key`;
+  }
+  if (TYPES_INVALID_IN_KEY.has(el.dataType)) return `data type ${el.dataType} is not allowed in a key`;
+  if (el.dataType === 'NUMC' && (el.length ?? 0) > 69) return 'NUMC fields longer than 69 are not allowed in a key';
+  return undefined;
+}
+
+// ── Partitioning ─────────────────────────────────────────────────────────────
+
+const PARTITION_RE = /[ \t]*<partitioningCriteria\b[^>]*?(?:\/>|>[\s\S]*?<\/partitioningCriteria>)\n?/gi;
+
+/** The field all partitions are defined on, or undefined when the aDSO is not partitioned. */
+const partitionFieldOf = (xml: string): string | undefined => {
+  const first = xml.match(/<partitioningCriteria\b[^>]*\bfield="([^"]*)"/i)?.[1];
+  return first === undefined ? undefined : refName(first);
+};
+
+/** Remove every partition together with the dynamic partitioning switches. */
+export function clearPartitioning(xml: string): string {
+  let out = xml.replace(PARTITION_RE, '');
+  out = removeRootAttr(out, 'dynamicPartitions');
+  out = removeRootAttr(out, 'dynamicPartitionGranularity');
+  return out;
+}
+
+/**
+ * Remove every reference to a field outside its own element: key, hash and validity lists,
+ * index elements, criteria, the non-cumulative time reference and the partitioning. The
+ * modeling tools do this on delete; the server does not — a partition left pointing at a
+ * removed field ends in a runtime error on save.
+ */
+export function removeFieldReferences(xml: string, name: string): { xml: string; removed: string[] } {
+  const removed: string[] = [];
+  let out = xml;
+  const listTags: Array<[string, string]> = [
+    ['keyElement', 'key'], ['hashElements', 'hash key'], ['validityElements', 'validity fields'], ['elements', 'index'],
+  ];
+  for (const [tag, label] of listTags) {
+    const re = new RegExp(`[ \\t]*<${tag}>\\s*#\\/\\/\\/${name}\\s*<\\/${tag}>\\n?`, 'g');
+    if (re.test(out)) {
+      out = out.replace(re, '');
+      removed.push(label);
+    }
+  }
+  if (partitionFieldOf(out) === name) {
+    out = clearPartitioning(out);
+    removed.push('partitioning');
+  }
+  const criteria = new RegExp(`[ \\t]*<chaConst\\b[^>]*\\bfield="#\\/\\/\\/${name}"[^>]*?(?:\\/>|>[\\s\\S]*?<\\/chaConst>)\\n?`, 'g');
+  if (criteria.test(out)) {
+    out = out.replace(criteria, '');
+    removed.push('criteria');
+  }
+  if (refName(rootAttrOf(out, 'ncumtim') ?? '') === name) {
+    out = setRootAttr(out, 'ncumtim', '');
+    removed.push('non-cumulative time reference');
+  }
+  return { xml: out, removed };
+}
+
+// ── SID determination mode ───────────────────────────────────────────────────
+
+type SidMode = 'N' | 'R' | 'S' | 'M';
+
+interface SidContext {
+  /** Data mart (cubeDeltaOnly). */
+  cube: boolean;
+  directUpdate: boolean;
+  planning: boolean;
+}
+
+interface SidSubject {
+  objectType?: string;
+  compounded: boolean;
+  attributeOnly: boolean;
+  highCardinality: boolean;
+}
+
+/**
+ * The SID determination modes the modeling tools offer for an InfoObject field. Key figures
+ * and XXL InfoObjects never determine SIDs. A planning-enabled data mart or direct-update
+ * aDSO, and a compounded characteristic in a data mart, need SIDs at load time. A
+ * characteristic that is attribute-only or of high cardinality has no SID table to load into.
+ */
+export function allowedSidModes(subject: SidSubject, ctx: SidContext): SidMode[] {
+  if (subject.objectType === 'KYF' || subject.objectType === 'XXL') return ['N'];
+  let modes: SidMode[] = subject.objectType === 'TIM' || subject.objectType === 'UNI' ? ['N', 'R', 'S'] : ['N', 'R', 'S', 'M'];
+  if (!['CHA', 'TIM', 'UNI'].includes(subject.objectType ?? '')) return modes;
+  if ((ctx.planning && (ctx.cube || ctx.directUpdate)) || (ctx.cube && subject.compounded && !subject.highCardinality)) {
+    modes = modes.filter((m) => m === 'S' || m === 'M');
+  }
+  if (subject.objectType === 'CHA' && (subject.attributeOnly || subject.highCardinality)) {
+    modes = modes.filter((m) => m === 'N' || m === 'R');
+  }
+  return modes;
+}
+
+export function defaultSidMode(subject: SidSubject, ctx: SidContext): SidMode {
+  const modes = allowedSidModes(subject, ctx);
+  if (modes.length > 0 && !modes.includes('S')) {
+    return modes.includes('R') && subject.highCardinality ? 'R' : modes[0];
+  }
+  return 'S';
+}
+
+const sidContextOf = (xml: string): SidContext => ({
+  cube: rootFlagOf(xml, 'cubeDeltaOnly'),
+  directUpdate: rootFlagOf(xml, 'directUpdate'),
+  planning: rootFlagOf(xml, 'planningMode'),
+});
+
+// ── InfoObject facts ─────────────────────────────────────────────────────────
+
+export { parseInfoObjectFacts };
+
+async function readInfoObjectFacts(reader: BwClient, name: string): Promise<InfoObjectFacts> {
+  const result = await reader.get(`/sap/bw/modeling/iobj/${bwSeg(name)}/m?forceCacheUpdate=true`, MEDIA_TYPES['iobj']);
+  return parseInfoObjectFacts(name, result.body);
+}
+
+/**
+ * The modeling tools re-default the SID mode of every characteristic, unit and time field whose
+ * current mode the new type no longer allows. Only the two cases that restrict the list to
+ * load-time SIDs can do that; a field already on S or M is never touched.
+ */
+async function adjustSidModes(
+  xml: string,
+  facts: (el: AdsoElementInfo) => Promise<SidSubject>,
+): Promise<{ xml: string; adjusted: Array<{ field: string; from: string; to: string }> }> {
+  const ctx = sidContextOf(xml);
+  const adjusted: Array<{ field: string; from: string; to: string }> = [];
+  if (!ctx.cube && !(ctx.planning && ctx.directUpdate)) return { xml, adjusted };
+  let out = xml;
+  for (const el of adsoElements(xml)) {
+    if (!el.infoObjectName || !['CHA', 'TIM', 'UNI'].includes(el.objectType ?? '')) continue;
+    if (el.sidMode === 'S' || el.sidMode === 'M') continue;
+    const subject = await facts(el);
+    // The server keeps an attribute-only or high-cardinality characteristic off load-time SIDs
+    // whatever is sent, so those stay as they are.
+    if (subject.attributeOnly || subject.highCardinality) continue;
+    const restricted =
+      (ctx.planning && (ctx.cube || ctx.directUpdate)) || (ctx.cube && el.compoundParents.length > 0);
+    if (!restricted) continue;
+    const open = new RegExp(`(<element\\b[^>]*\\bname="${el.name}"[^>]*?)\\bsidDeterminationMode="[^"]*"`);
+    if (!open.test(out)) continue;
+    out = out.replace(open, '$1sidDeterminationMode="S"');
+    adjusted.push({ field: el.name, from: el.sidMode ?? '', to: 'S' });
+  }
+  return { xml: out, adjusted };
+}
+
 /**
  * Resolved per call, not once at import: discovery runs lazily on the first tool call and
  * rewrites MEDIA_TYPES, which a module-level constant would never see. Binding it early
@@ -128,8 +342,24 @@ export interface AdsoSettings {
   uniqueDataRecords?: boolean;
   planningMode?: boolean;
   writeInterface?: boolean;
+  temperatureSchema?: 'HO' | 'WO' | 'HWO' | 'HWP';
   label?: string;
   transport?: string;
+}
+
+/**
+ * The feature switches the server publishes per aDSO (dynamic partitioning, automatic merge,
+ * …). Best effort: a release without the resource simply has none of them.
+ */
+async function readAdsoConfiguration(adsoName: string): Promise<Record<string, boolean>> {
+  try {
+    const result = await freshRead(`/sap/bw/modeling/adso/${bwSeg(adsoName)}/configuration`, 'application/xml, */*');
+    return Object.fromEntries(
+      [...result.body.matchAll(/<simpleParams\s+(\w+)="(true|false)"/g)].map((m) => [m[1], m[2] === 'true']),
+    );
+  } catch {
+    return {};
+  }
 }
 
 /**
@@ -138,6 +368,12 @@ export interface AdsoSettings {
  * Workflow: GET full XML → lock → apply changes → PUT → return result.
  * Lock handle is returned so the caller can invoke bw_activate next.
  * Never modifies <tables>, <hashElements>, <pushURI>, or <tlogoProperties>.
+ *
+ * A type is written the way the modeling tools write it: all eight type flags are reset and
+ * the ones of the new type set, then everything the new type cannot carry is dropped (key
+ * definition, partitioning, per-partition tiering, dynamic partitioning) and the SID modes the
+ * new type no longer allows are re-defaulted. Change log, snapshot and unique records belong
+ * to the standard type only.
  */
 export async function bwUpdateAdsoSettings(
   client: BwClient,
@@ -152,57 +388,125 @@ export async function bwUpdateAdsoSettings(
   const timestamp = adsoResult.headers['timestamp'] ?? adsoResult.headers['TIMESTAMP'];
   let xml = adsoResult.body;
 
-  // 2. Apply type preset wholesale (overwrites the 5 core attributes)
-  if (settings.adsoType !== undefined) {
-    const preset = typePresets[settings.adsoType];
-    for (const [attr, val] of Object.entries(preset)) {
-      xml = setRootAttr(xml, attr, String(val));
-    }
-  }
-
-  // 3. Apply individual boolean flags on top
-  const boolFlags: Array<keyof AdsoSettings> = [
-    'writeChangelog', 'snapShotScenario', 'uniqueDataRecords', 'planningMode',
+  // 2. Modeling type and its sub-options
+  const currentTypes = adsoTypeCandidates(rootTagOf(xml));
+  const subOptions: Array<['writeChangelog' | 'snapShotScenario' | 'uniqueDataRecords', string]> = [
+    ['writeChangelog', 'write_changelog'], ['snapShotScenario', 'snap_shot_scenario'], ['uniqueDataRecords', 'unique_data_records'],
   ];
-  for (const flag of boolFlags) {
-    if (settings[flag] !== undefined) {
-      xml = setRootAttr(xml, flag, String(settings[flag]));
+  const givenSubOptions = subOptions.filter(([key]) => settings[key] !== undefined);
+  const targetType = settings.adsoType ?? (givenSubOptions.length > 0 ? currentTypes[0] : undefined);
+  const typeChanges = settings.adsoType !== undefined && !currentTypes.includes(settings.adsoType);
+
+  if (targetType !== undefined && targetType !== 'standard') {
+    const enabled = givenSubOptions.filter(([key]) => settings[key] === true).map(([, param]) => param);
+    if (enabled.length > 0) {
+      throw new Error(
+        `${enabled.join(', ')} belong${enabled.length === 1 ? 's' : ''} to the standard type only; ` +
+        (settings.adsoType !== undefined
+          ? `adso_type "${targetType}" cannot carry ${enabled.length === 1 ? 'it' : 'them'}.`
+          : `aDSO ${adsoUpper} is of type "${targetType}". Pass adso_type "standard" in the same call to change the type.`),
+      );
+    }
+  }
+  if (settings.adsoType !== undefined || (targetType === 'standard' && givenSubOptions.length > 0)) {
+    const wasStandard = currentTypes.includes('standard');
+    const flags: Record<string, boolean> = settings.adsoType !== undefined
+      ? { ...typePresets[settings.adsoType] }
+      : Object.fromEntries(TYPE_FLAGS.map((f) => [f, rootFlagOf(xml, f)]));
+    if (targetType === 'standard') {
+      flags.writeChangelog = settings.writeChangelog ?? (wasStandard ? rootFlagOf(xml, 'writeChangelog') : true);
+      flags.snapShotScenario = settings.snapShotScenario ?? (wasStandard ? rootFlagOf(xml, 'snapShotScenario') : false);
+      flags.uniqueDataRecords = settings.uniqueDataRecords ?? (wasStandard ? rootFlagOf(xml, 'uniqueDataRecords') : false);
+      if (flags.snapShotScenario && !flags.writeChangelog) {
+        throw new Error('snap_shot_scenario needs the change log: pass write_changelog true as well.');
+      }
+      if (flags.snapShotScenario && flags.uniqueDataRecords) {
+        throw new Error('snap_shot_scenario and unique_data_records exclude each other.');
+      }
+    }
+    for (const flag of TYPE_FLAGS) xml = setRootAttr(xml, flag, String(flags[flag]));
+  }
+
+  if (settings.planningMode !== undefined) {
+    xml = setRootAttr(xml, 'planningMode', String(settings.planningMode));
+  }
+
+  // writeInterface maps to the XML attribute "pushMode"; the merge mode follows it where the
+  // server offers the automatic merge.
+  if (settings.writeInterface !== undefined && settings.writeInterface !== rootFlagOf(xml, 'pushMode')) {
+    xml = setRootAttr(xml, 'pushMode', String(settings.writeInterface));
+    if ((await readAdsoConfiguration(adsoName))['autoMergeSupported']) {
+      xml = setRootAttr(xml, 'mergeMode', settings.writeInterface ? 'AUTO' : 'SMART');
     }
   }
 
-  // writeInterface maps to the XML attribute "pushMode"
-  if (settings.writeInterface !== undefined) {
-    xml = setRootAttr(xml, 'pushMode', String(settings.writeInterface));
+  // 3. Data tiering. Anything but hot-only needs an active table to tier.
+  if (settings.temperatureSchema !== undefined) {
+    if (settings.temperatureSchema !== 'HO' && !rootFlagOf(xml, 'activateData') && !rootFlagOf(xml, 'directUpdate')) {
+      throw new Error(
+        `temperature_schema "${settings.temperatureSchema}" needs an aDSO with active data or direct update; ` +
+        `aDSO ${adsoUpper} has neither and stays on "HO".`,
+      );
+    }
+    if (settings.temperatureSchema === 'HWP' && (partitionFieldOf(xml) === undefined || isWriteOptimized(xml))) {
+      throw new Error(
+        `temperature_schema "HWP" tiers per partition, and aDSO ${adsoUpper} has no partitions. ` +
+        'Define them with action "manage_partitions" first, or use "HWO" for the whole object.',
+      );
+    }
+    const before = rootAttrOf(xml, 'temperatureSchema');
+    xml = setRootAttr(xml, 'temperatureSchema', settings.temperatureSchema);
+    // The expected row count describes the object-level layout and is reset with it.
+    if (settings.temperatureSchema === 'HWP' && before !== 'HWP' && before !== 'HWCP' && (rootAttrOf(xml, 'expectedRowCount') ?? '0') !== '0') {
+      xml = setRootAttr(xml, 'expectedRowCount', '0');
+    }
   }
 
-  // 3b. The modeling tools drop what the new type cannot carry, and the activation check refuses
-  // it otherwise: a data mart treats every characteristic as key and an inbound-only aDSO has no
-  // active table, so neither keeps a key definition; a write-optimized aDSO (no active data, no
-  // change log) keeps no partitions either. Direct update keeps its key.
-  const rootTag = xml.match(/<adso:dataStore\b[^>]*>/)?.[0] ?? '';
-  const flag = (name: string) => new RegExp(`\\b${name}="true"`).test(rootTag);
+  // 4. Drop what the resulting type cannot carry.
   const removedKeyFields: string[] = [];
   let removedPartitions = false;
-  if (!flag('directUpdate') && (flag('cubeDeltaOnly') || !flag('activateData'))) {
-    for (const m of xml.matchAll(/<keyElement>[^<]*\/([^<\/]+)<\/keyElement>/g)) removedKeyFields.push(m[1]);
-    xml = xml.replace(/[ \t]*<keyElement>[^<]*<\/keyElement>\n?/g, '');
-    const writeOptimized = !['activateData', 'writeChangelog', 'snapShotScenario', 'uniqueDataRecords',
-      'isReportingObject', 'noAqDeletion', 'cubeDeltaOnly', 'directUpdate'].some(flag);
-    if (writeOptimized && /<partitioningcriteria\b/.test(xml)) {
-      xml = xml.replace(/[ \t]*<partitioningcriteria\b[^>]*\/>\n?/g, '');
-      xml = xml.replace(/[ \t]*<partitioningcriteria\b[^>]*>[\s\S]*?<\/partitioningcriteria>\n?/g, '');
-      xml = xml.replace(/\s+dynamicPartitions="[^"]*"/, '').replace(/\s+dynamicPartitionGranularity="[^"]*"/, '');
-      removedPartitions = true;
+  let removedDynamicPartitioning = false;
+  let temperatureReset: string | undefined;
+  if (rootFlagOf(xml, 'directUpdate')) {
+    if (rootFlagOf(xml, 'dynamicPartitions')) {
+      xml = clearPartitioning(xml);
+      removedDynamicPartitioning = true;
+    }
+    xml = setRootAttrIfPresent(xml, 'exceptionalUpdate', 'false');
+  } else {
+    if (rootFlagOf(xml, 'cubeDeltaOnly') || !rootFlagOf(xml, 'activateData')) {
+      removedKeyFields.push(...keyFieldsOf(xml));
+      xml = xml.replace(/[ \t]*<keyElement>[^<]*<\/keyElement>\n?/g, '');
+    }
+    if (isWriteOptimized(xml)) {
+      if (partitionFieldOf(xml) !== undefined || rootFlagOf(xml, 'dynamicPartitions')) {
+        xml = clearPartitioning(xml);
+        removedPartitions = true;
+      }
+      const schema = rootAttrOf(xml, 'temperatureSchema');
+      if (schema !== undefined && /[CP]/.test(schema)) {
+        temperatureReset = schema.includes('H') && schema.includes('W') ? 'HWO' : schema.includes('W') ? 'WO' : 'HO';
+        xml = setRootAttr(xml, 'temperatureSchema', temperatureReset);
+      }
+      xml = setRootAttrIfPresent(xml, 'exceptionalUpdate', 'false');
     }
   }
 
-  // 4. Update label in the aDSO's own <endUserTexts label="..."/>: the one before
+  // 5. SID modes the new type no longer allows
+  let adjustedSid: Array<{ field: string; from: string; to: string }> = [];
+  if (typeChanges || settings.planningMode !== undefined) {
+    const reader = createClientFromEnv();
+    const adjusted = await adjustSidModes(xml, (el) => readInfoObjectFacts(reader, el.infoObjectName!));
+    xml = adjusted.xml;
+    adjustedSid = adjusted.adjusted;
+  }
+
+  // 6. Update label in the aDSO's own <endUserTexts label="..."/>: the one before
   // <tlogoProperties>. The server serves the texts of the logon language; an aDSO without a text
   // in that language has no such element, and the first <endUserTexts> of the document is then
   // the one of the first field — replacing it, as this tool used to, never reached the aDSO.
   if (settings.label !== undefined) {
-    const label = settings.label.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/"/g, '&quot;');
-    const endUserTextsTag = `<endUserTexts label="${label}"/>`;
+    const endUserTextsTag = `<endUserTexts label="${escapeXmlAttr(settings.label)}"/>`;
     const at = xml.indexOf('<tlogoProperties');
     const head = at >= 0 ? xml.slice(0, at) : '';
     if (at >= 0 && /<endUserTexts[^>]*\/>/.test(head)) {
@@ -212,7 +516,7 @@ export async function bwUpdateAdsoSettings(
     }
   }
 
-  // 5. Lock → PUT
+  // 7. Lock → PUT
   const lockHandle = await client.lock('adso', adsoName);
   try {
     await client.put('adso', adsoName, lockHandle, xml, timestamp, settings.transport);
@@ -224,18 +528,32 @@ export async function bwUpdateAdsoSettings(
   const dropped = [
     removedKeyFields.length ? `the key definition (${removedKeyFields.join(', ')})` : '',
     removedPartitions ? 'the partitioning' : '',
-  ].filter(Boolean).join(' and ');
+    removedDynamicPartitioning ? 'the dynamic partitioning' : '',
+    temperatureReset ? `data tiering per partition (now "${temperatureReset}")` : '',
+  ].filter(Boolean).join(', ');
+  // A type with an active table and a key of its own does not activate without one.
+  const needsKey =
+    rootFlagOf(xml, 'activateData') && !rootFlagOf(xml, 'cubeDeltaOnly') && keyFieldsOf(xml).length === 0 &&
+    adsoElements(xml).length > 0;
   return JSON.stringify({
     success: true,
     message:
       `aDSO ${adsoUpper} settings updated. Call bw_activate to activate.` +
-      (dropped ? ` The new type cannot carry ${dropped}, which was removed as the modeling tools do.` : ''),
+      (dropped ? ` The new type cannot carry ${dropped}, which was removed as the modeling tools do.` : '') +
+      (needsKey ? ' This type needs a key definition before it activates: set it with action "manage_keys".' : '') +
+      (adjustedSid.length
+        ? ` SID determination set to "S" for ${adjustedSid.map((a) => a.field).join(', ')}: the new type needs SIDs at load time.`
+        : ''),
     lock_handle: lockHandle,
     adso_name: adsoUpper,
     object_type: 'adso',
     applied: settings,
+    adso_type: adsoTypeCandidates(rootTagOf(xml))[0],
+    type_flags: Object.fromEntries(TYPE_FLAGS.map((f) => [f, rootFlagOf(xml, f)])),
     ...(removedKeyFields.length ? { removed_key_fields: removedKeyFields } : {}),
-    ...(removedPartitions ? { removed_partitioning: true } : {}),
+    ...(removedPartitions || removedDynamicPartitioning ? { removed_partitioning: true } : {}),
+    ...(temperatureReset ? { temperature_schema: temperatureReset } : {}),
+    ...(adjustedSid.length ? { adjusted_sid_modes: adjustedSid } : {}),
   });
 }
 
@@ -336,7 +654,9 @@ function summarizeAdso(
   const tempMap: Record<string, string> = {
     HO:   'Hot',
     HWO:  'Hot, Warm',
+    HWP:  'Hot, Warm (per partition)',
     HWCP: 'Hot, Warm, Cold',
+    HCP:  'Hot, Cold',
     WO:   'Warm only',
     WCP:  'Warm, Cold',
     CO:   'Cold only',
@@ -367,10 +687,30 @@ function summarizeAdso(
   lines.push('── Key Fields ──');
   lines.push(keyElements.length > 0 ? keyElements.join(', ') : '(none)');
 
+  // ── Section 5b: Partitioning ──────────────────────────────────────────────
+  const partitionField = partitionFieldOf(xml);
+  if (partitionField !== undefined) {
+    const attr = (s: string, key: string) => s.match(new RegExp(`\\b${key}="([^"]*)"`))?.[1] ?? '';
+    lines.push('');
+    lines.push('── Partitioning ──');
+    if (boolAttr('dynamicPartitions')) {
+      lines.push(`Dynamic on ${partitionField}, granularity ${strAttr('dynamicPartitionGranularity') || '(default)'}`);
+    } else {
+      lines.push(`Field: ${partitionField}`);
+      for (const m of xml.matchAll(/<partitioningCriteria\b[^>]*>/gi)) {
+        const temperature = attr(m[0], 'temperature');
+        lines.push(
+          `  P${attr(m[0], 'partitionNumber')}: ${attr(m[0], 'rangeLow').trim()} – ${attr(m[0], 'rangeHigh').trim()}` +
+          (temperature ? ` (${temperature})` : ''),
+        );
+      }
+    }
+  }
+
   // ── Section 6: Fields table ───────────────────────────────────────────────
   interface FieldRow {
     name: string; type: string; length: string; agg: string;
-    dim: string; dimRaw: string; isKey: boolean; keyOrder: number; label: string;
+    dim: string; dimRaw: string; isKey: boolean; keyOrder: number; label: string; sid: string;
   }
 
   const fields: FieldRow[] = [];
@@ -414,7 +754,8 @@ function summarizeAdso(
       .replace(/&quot;/g, '"').replace(/&amp;/g, '&')
       .replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&apos;/g, "'");
 
-    fields.push({ name: fieldName, type: fieldType, length: lengthDisp, agg, dim, dimRaw, isKey, keyOrder, label });
+    const sid = getAttr(openAttrs, 'infoObjectName') ? getAttr(openAttrs, 'sidDeterminationMode') : '';
+    fields.push({ name: fieldName, type: fieldType, length: lengthDisp, agg, dim, dimRaw, isKey, keyOrder, label, sid });
   }
 
   fields.sort((a, b) => {
@@ -431,8 +772,8 @@ function summarizeAdso(
   lines.push('');
   lines.push(`── Fields (${fields.length}) ──`);
 
-  const headers = ['NAME', 'TYPE', 'LENGTH', 'AGG', 'DIM', 'KEY', 'LABEL'];
-  const cols = fields.map(f => [f.name, f.type, f.length, f.agg, f.dim, f.isKey ? 'yes' : 'no', f.label]);
+  const headers = ['NAME', 'TYPE', 'LENGTH', 'AGG', 'DIM', 'KEY', 'SID', 'LABEL'];
+  const cols = fields.map(f => [f.name, f.type, f.length, f.agg, f.dim, f.isKey ? 'yes' : 'no', f.sid, f.label]);
   const widths = headers.map((h, i) =>
     Math.max(h.length, ...cols.map(r => r[i].length))
   );
@@ -500,22 +841,25 @@ function buildAdsoElement(
   iObjName: string,
   props: ReturnType<typeof parseInfoObjectProps>,
   dimension = '#///ALL§',
+  sidMode: SidMode = 'S',
+  unitCurrencyField?: string,
 ): string {
   const { conversionRoutine, label, dataType, length } = props;
   const name = iObjName.toUpperCase();
   const convAttr = conversionRoutine ? ` conversionRoutine="${conversionRoutine}"` : '';
+  const unitRef = unitCurrencyField ? `\n    <unitCurrencyElement>#///${unitCurrencyField}</unitCurrencyElement>` : '';
   return `  <element xsi:type="adso:AdsoElement" name="${name}" keep="false"
     aggregationBehavior="NONE" infoObjectName="${name}"${convAttr}
-    dimension="${dimension}" sidDeterminationMode="S">
-    <endUserTexts label="${label}"/>
-    <inlineType name="${dataType}" length="${length}" globalElementName="${name}"/>
+    dimension="${dimension}" sidDeterminationMode="${sidMode}">
+    <endUserTexts label="${label.replace(/"/g, '&quot;')}"/>
+    <inlineType name="${dataType}" length="${length}" globalElementName="${name}"/>${unitRef}
     <associationType>1</associationType>
   </element>`;
 }
 
 /**
- * Remove an <element> block (and any matching <keyElement>) from aDSO XML.
- * The server removes the field when the PUT body no longer contains it.
+ * Remove an <element> block from aDSO XML. The server removes the field when the PUT body no
+ * longer contains it; what else points at the field is cleaned up by removeFieldReferences.
  */
 function removeElement(adsoXml: string, iObjName: string): string {
   const name = iObjName.toUpperCase();
@@ -525,16 +869,7 @@ function removeElement(adsoXml: string, iObjName: string): string {
     `[ \\t]*<element\\b[^>]*\\bname="${name}"[^>]*>[\\s\\S]*?<\\/element>\\n?`,
     'g'
   );
-  let result = adsoXml.replace(elementRegex, '');
-
-  // Remove <keyElement>#///NAME</keyElement> if the field was a key
-  const keyElementRegex = new RegExp(
-    `[ \\t]*<keyElement>[^<]*\\/${name}<\\/keyElement>\\n?`,
-    'g'
-  );
-  result = result.replace(keyElementRegex, '');
-
-  return result;
+  return adsoXml.replace(elementRegex, '');
 }
 
 /**
@@ -580,11 +915,63 @@ export async function bwUpdateAdsoManageKeys(
   const timestamp = adsoResult.headers['timestamp'] ?? adsoResult.headers['TIMESTAMP'];
   let xml = adsoResult.body;
 
-  // 2. Strip all existing <keyElement> entries (with any leading whitespace + trailing newline)
+  // 2. Validate against the rules of the key dialog before anything is written: the server
+  // stores a key entry for a field that does not exist and reports the rest only at activation.
+  const requested = [...new Set(keyFields.map((f) => f.trim().toUpperCase()).filter(Boolean))];
+  const elements = new Map(adsoElements(xml).map((el) => [el.name, el]));
+  if (requested.length > 0 && !canCarryKeys(xml)) {
+    const type = adsoTypeCandidates(rootTagOf(xml))[0];
+    throw new Error(
+      `aDSO ${adsoUpper} is of type "${type}" and has no key definition: ` +
+      (rootFlagOf(xml, 'cubeDeltaOnly')
+        ? 'a data mart treats every characteristic as key.'
+        : 'an aDSO without active data has no active table to key.') +
+      ' Change the type with action "update_settings" first.',
+    );
+  }
+  const missing = requested.filter((f) => !elements.has(f));
+  if (missing.length > 0) {
+    throw new Error(`aDSO ${adsoUpper} has no field ${missing.join(', ')}. Fields: ${[...elements.keys()].join(', ') || '(none)'}.`);
+  }
+  const refused = requested
+    .map((f) => [f, keyObstacle(elements.get(f)!)] as const)
+    .filter(([, why]) => why !== undefined);
+  if (refused.length > 0) {
+    throw new Error(`Not allowed as key field: ${refused.map(([f, why]) => `${f} (${why})`).join('; ')}.`);
+  }
+  // A compounded characteristic brings its compounding parents into the key, right behind it.
+  const normalized: string[] = [];
+  const addedParents: string[] = [];
+  for (const field of requested) {
+    if (!normalized.includes(field)) normalized.push(field);
+    for (const parent of elements.get(field)!.compoundParents) {
+      if (normalized.includes(parent) || !elements.has(parent)) continue;
+      normalized.splice(normalized.indexOf(field) + 1, 0, parent);
+      if (!requested.includes(parent)) addedParents.push(parent);
+    }
+  }
+  if (normalized.length > MAX_KEY_FIELDS) {
+    throw new Error(`A key holds at most ${MAX_KEY_FIELDS} fields; ${normalized.length} were requested.`);
+  }
+
+  // 3. Strip all existing <keyElement> entries (with any leading whitespace + trailing newline)
   xml = xml.replace(/[ \t]*<keyElement>[^<]*<\/keyElement>\n?/g, '');
 
-  // 3. Build new <keyElement> block
-  const normalized = keyFields.map((f) => f.trim().toUpperCase()).filter(Boolean);
+  // The partitioning lives on a key field (on any field in a data mart) and goes with it.
+  const partitionField = partitionFieldOf(xml);
+  const removedPartitioning =
+    partitionField !== undefined && !rootFlagOf(xml, 'cubeDeltaOnly') && !normalized.includes(partitionField);
+  if (removedPartitioning) xml = clearPartitioning(xml);
+  // Validity fields of a non-cumulative aDSO are key fields.
+  const removedValidity: string[] = [];
+  for (const m of [...xml.matchAll(/<validityElements>([^<]*)<\/validityElements>/g)]) {
+    const field = refName(m[1]);
+    if (normalized.includes(field)) continue;
+    xml = xml.replace(new RegExp(`[ \\t]*<validityElements>\\s*#\\/\\/\\/${field}\\s*<\\/validityElements>\\n?`), '');
+    removedValidity.push(field);
+  }
+
+  // 4. Build new <keyElement> block
   if (normalized.length > 0) {
     const keyBlock = normalized.map((f) => `  <keyElement>#///${f}</keyElement>`).join('\n') + '\n';
     // Insert before <tlogoProperties>; fall back to before </adso:dataStore>
@@ -595,7 +982,7 @@ export async function bwUpdateAdsoManageKeys(
     }
   }
 
-  // 4. Lock → PUT
+  // 5. Lock → PUT
   const lockHandle = await client.lock('adso', adsoName);
   try {
     await client.put('adso', adsoName, lockHandle, xml, timestamp, transport);
@@ -606,11 +993,279 @@ export async function bwUpdateAdsoManageKeys(
 
   return JSON.stringify({
     success: true,
-    message: `aDSO ${adsoUpper} key fields updated. Call bw_activate to activate.`,
+    message:
+      `aDSO ${adsoUpper} key fields updated. Call bw_activate to activate.` +
+      (addedParents.length
+        ? ` Added ${addedParents.join(', ')} to the key: a compounded characteristic in the key needs its compounding parents there too.`
+        : '') +
+      (removedPartitioning
+        ? ` The partitioning on ${partitionField} was removed, because the field is no longer part of the key.`
+        : '') +
+      (removedValidity.length ? ` Removed ${removedValidity.join(', ')} from the validity fields.` : ''),
     lock_handle: lockHandle,
     adso_name: adsoUpper,
     object_type: 'adso',
     key_fields: normalized,
+    ...(addedParents.length ? { added_compound_parents: addedParents } : {}),
+    ...(removedPartitioning ? { removed_partitioning: true } : {}),
+  });
+}
+
+export interface PartitionSpec {
+  /** Field the partitions are defined on. Omit together with ranges to remove the partitioning. */
+  field?: string;
+  /** Static range partitions in order; each is a lower and an upper bound in internal format. */
+  ranges?: Array<{ low: string; high: string }>;
+  /** Let the server create partitions as data arrives (time characteristic or date field). */
+  dynamic?: boolean;
+  /** Granularity of dynamic partitions, as a time characteristic name. */
+  granularity?: string;
+  transport?: string;
+}
+
+/** Granularities the modeling tools offer per partitioning field; the first one's default is preselected. */
+const DYNAMIC_GRANULARITIES: Record<string, string[]> = {
+  '0CALDAY': ['0CALDAY', '0CALWEEK', '0CALMONTH', '0CALQUARTER', '0CALYEAR', '0FISCPER', '0FISCYEAR', '0FISCWEEK', '0FISCQRT'],
+  '0CALWEEK': ['0CALWEEK'],
+  '0CALMONTH': ['0CALMONTH', '0CALQUARTER', '0CALYEAR'],
+  '0CALQUARTER': ['0CALQUARTER', '0CALYEAR'],
+  '0CALYEAR': ['0CALYEAR'],
+  '0FISCPER': ['0FISCPER', '0FISCYEAR'],
+  '0FISCYEAR': ['0FISCYEAR'],
+  '0FISCWEEK': ['0FISCWEEK'],
+  '0FISCQRT': ['0FISCQRT', '0FISCYEAR'],
+};
+DYNAMIC_GRANULARITIES['0DATE'] = DYNAMIC_GRANULARITIES['0CALDAY'];
+
+const DEFAULT_GRANULARITY: Record<string, string> = {
+  '0CALDAY': '0CALYEAR', '0CALWEEK': '0CALWEEK', '0CALMONTH': '0CALYEAR', '0CALQUARTER': '0CALYEAR', '0CALYEAR': '0CALYEAR',
+  '0FISCPER': '0FISCYEAR', '0FISCYEAR': '0FISCYEAR', '0FISCWEEK': '0FISCWEEK', '0FISCQRT': '0FISCYEAR',
+};
+
+function dynamicGranularities(el: AdsoElementInfo, elementXml: string): string[] {
+  if (el.infoObjectName) {
+    const base = elementXml.match(/\bbaseInfoObjectName="([^"]+)"/)?.[1];
+    return DYNAMIC_GRANULARITIES[el.infoObjectName] ?? (base ? DYNAMIC_GRANULARITIES[base] : undefined) ?? [];
+  }
+  return el.dataType === 'DATS' || el.dataType === 'DATN' ? DYNAMIC_GRANULARITIES['0CALDAY'] : [];
+}
+
+const VALUE_CONVERSION_PATH = '/sap/bw/modeling/is/values/valueInputConversion';
+
+/**
+ * Turn partition bounds from the internal format into the external one and have the server
+ * check them. The aDSO document carries the bounds as the logon user would type them (a date
+ * in the user's date format, a value after its conversion exit) and the server derives the
+ * internal values from that; a bound sent in internal format where the two differ is refused
+ * on save without a reason. The modeling tools go through the same service, which also
+ * rejects overlapping ranges — a partition is the right-open interval [low, high).
+ *
+ * Returns undefined on a release without the service; the bounds are then written as given.
+ */
+async function convertPartitionBounds(
+  client: BwClient,
+  el: AdsoElementInfo,
+  inline: string,
+  ranges: Array<{ low: string; high: string }>,
+): Promise<Array<{ low: string; high: string }> | undefined> {
+  // A classic release offers the service without publishing a media type for it.
+  const mediaType = MEDIA_TYPES['valueinputconversion'] ?? 'application/vnd.sap.bw.modeling.val_inp_conv-v1_0_0+xml';
+  const attr = (key: string) => inline.match(new RegExp(`\\b${key}="([^"]*)"`))?.[1];
+  const element = el.infoObjectName
+    ? `<element name="${el.name}" infoObjectName="${el.infoObjectName}"/>`
+    : `<element name="${el.name}" type="${el.dataType}"` +
+      (el.conversionRoutine ? ` conversionRoutine="${el.conversionRoutine}"` : '') +
+      ['length', 'precision', 'scale'].map((k) => (attr(k) !== undefined ? ` ${k}="${attr(k)}"` : '')).join('') + '/>';
+  const decode = (s: string) =>
+    s.replace(/&quot;/g, '"').replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&apos;/g, "'").replace(/&amp;/g, '&');
+  let format = 'Bounds are values in internal format (a date as YYYYMMDD)';
+  const refuse = (why: string): never => {
+    throw new Error(
+      `The partition bounds of ${el.name} were refused: ${why} ` +
+      `${format}; a partition covers [low, high), so the next one starts at the previous upper bound.`,
+    );
+  };
+  // direction 2 = internal → external, 1 = external → internal (with the range checks)
+  const call = async (direction: 1 | 2, values: Array<{ low: string; high: string }>): Promise<string | undefined> => {
+    const key = direction === 2 ? 'valueInt' : 'value';
+    const body =
+      '<?xml version="1.0" encoding="UTF-8"?>' +
+      '<vic:valueInputConversion xmlns:vic="http://www.sap.com/bw/modeling/ValueInputConversion.ecore"' +
+      ` checkOverlap="2"${direction === 1 ? ' checkFromTo="true"' : ''} conversionDirection="${direction}">` + element +
+      values.map((r) =>
+        `<range operator="BT"><fromValue ${key}="${escapeXmlAttr(r.low)}"/>` +
+        `<toValue ${key}="${escapeXmlAttr(r.high)}"/></range>`).join('') +
+      '</vic:valueInputConversion>';
+    try {
+      const token = await client.getCsrfToken();
+      const response = (await client.rawPost(VALUE_CONVERSION_PATH, body, {
+        'Content-Type': mediaType, Accept: mediaType, 'x-csrf-token': token,
+      })).body;
+      return /<vic:valueInputConversion\b/.test(response) ? response : undefined;
+    } catch {
+      return undefined;
+    }
+  };
+  const errorsOf = (response: string): string[] => [...new Set(
+    [...response.matchAll(/<message\b[^>]*>/g)]
+      .filter((m) => /\bmessageType="Error"/.test(m[0]))
+      .map((m) => decode(m[0].match(/\btext="([^"]*)"/)?.[1] ?? '')),
+  )];
+  const rangesOf = (response: string, key: 'value' | 'valueInt') =>
+    [...response.matchAll(/<range\b[^>]*>([\s\S]*?)<\/range>/g)].map((m) => ({
+      low: decode(m[1].match(new RegExp(`<fromValue\\b[^>]*\\b${key}="([^"]*)"`))?.[1] ?? ''),
+      high: decode(m[1].match(new RegExp(`<toValue\\b[^>]*\\b${key}="([^"]*)"`))?.[1] ?? ''),
+    }));
+
+  const given = ranges.map((r) => ({ low: String(r.low).trim(), high: String(r.high).trim() }));
+  const toExternal = await call(2, given);
+  if (toExternal === undefined) return undefined;
+  const external = rangesOf(toExternal, 'value');
+  if (external.length !== given.length) return undefined;
+  // A classic release converts in one direction only, from the external format: there the
+  // bounds are taken as typed in the modeling tools and only checked.
+  // It answers the other direction with an empty or initial external value and does not echo
+  // the internal one, which is what tells the two apart.
+  const echoed = rangesOf(toExternal, 'valueInt');
+  if (external.some((r) => r.low === '' || r.high === '') || echoed.some((r) => r.low === '' || r.high === '')) {
+    format = 'This release takes the bounds in external format, as they are typed in the modeling tools (a date in the date format of the logon user)';
+    const checked = await call(1, given);
+    if (checked === undefined) return undefined;
+    if (errorsOf(checked).length > 0) refuse(errorsOf(checked).join(' '));
+    return given;
+  }
+  if (errorsOf(toExternal).length > 0) refuse(errorsOf(toExternal).join(' '));
+
+  // The conversion to the external format takes whatever it is handed; what the server makes
+  // of the result is the test, and it brings the range checks with it.
+  const backToInternal = await call(1, external);
+  if (backToInternal === undefined) return external;
+  if (errorsOf(backToInternal).length > 0) refuse(errorsOf(backToInternal).join(' '));
+  const internal = rangesOf(backToInternal, 'valueInt');
+  const unreadable = given.flatMap((r, i) => [
+    (internal[i]?.low ?? '').trim() !== '' ? undefined : r.low,
+    (internal[i]?.high ?? '').trim() !== '' ? undefined : r.high,
+  ]).filter((v): v is string => v !== undefined);
+  if (unreadable.length > 0) {
+    refuse(`the server does not read ${unreadable.join(', ')} as a value of data type ${el.dataType}.`);
+  }
+  return external;
+}
+/**
+ * bw_update_adso action "manage_partitions" — replace the partitioning of the active table.
+ *
+ * All partitions sit on one field: a key field, or any characteristic field in a data mart.
+ * Static partitioning is a list of ranges, numbered in the order given and passed in internal
+ * format. Dynamic partitioning is one open partition plus a granularity.
+ * An empty specification removes the partitioning.
+ */
+export async function bwUpdateAdsoPartitions(
+  client: BwClient,
+  adsoName: string,
+  spec: PartitionSpec,
+): Promise<string> {
+  const adsoUpper = adsoName.toUpperCase();
+  const adsoResult = await freshRead(`/sap/bw/modeling/adso/${bwSeg(adsoName)}/m`, adsoAccept());
+  const timestamp = adsoResult.headers['timestamp'] ?? adsoResult.headers['TIMESTAMP'];
+  let xml = adsoResult.body;
+
+  let ranges = spec.ranges ?? [];
+  const partitionCount = ranges.length;
+  const field = spec.field?.trim().toUpperCase();
+  const remove = !spec.dynamic && ranges.length === 0;
+  let granularity: string | undefined;
+
+  if (!remove) {
+    if (!field) throw new Error('partitioning.field is required: the field the partitions are defined on.');
+    if (spec.dynamic && ranges.length > 0) {
+      throw new Error('Pass either ranges (static partitioning) or dynamic: true, not both.');
+    }
+    if (isWriteOptimized(xml)) {
+      throw new Error(
+        `aDSO ${adsoUpper} is of type "staging_inbound_only" and has no active table to partition. ` +
+        'Change the type with action "update_settings" first.',
+      );
+    }
+    const el = adsoElements(xml).find((e) => e.name === field);
+    if (!el) throw new Error(`aDSO ${adsoUpper} has no field ${field}.`);
+    const obstacle = keyObstacle(el);
+    if (obstacle) throw new Error(`${field} cannot carry the partitioning: ${obstacle}.`);
+    const cube = rootFlagOf(xml, 'cubeDeltaOnly');
+    if (!cube && !keyFieldsOf(xml).includes(field)) {
+      throw new Error(
+        `${field} is not a key field of aDSO ${adsoUpper}; the partitioning field must be part of the key ` +
+        `(key: ${keyFieldsOf(xml).join(', ') || 'none'}). Add it with action "manage_keys" first.`,
+      );
+    }
+    if (spec.dynamic) {
+      if (rootFlagOf(xml, 'directUpdate')) {
+        throw new Error('Dynamic partitioning is not available for an aDSO with direct update; pass ranges instead.');
+      }
+      if (!(await readAdsoConfiguration(adsoName))['dynamicPartitioning']) {
+        throw new Error('This system does not offer dynamic partitioning for the aDSO; pass ranges instead.');
+      }
+      const elementXml = xml.match(new RegExp(`<element\\b[^>]*\\bname="${field}"[^>]*>`))?.[0] ?? '';
+      const offered = dynamicGranularities(el, elementXml);
+      if (offered.length === 0) {
+        throw new Error(
+          `${field} cannot carry dynamic partitioning: it needs a time characteristic (calendar or fiscal) ` +
+          'or a field of type DATS. Pass ranges for static partitioning instead.',
+        );
+      }
+      granularity = spec.granularity?.trim().toUpperCase() ?? DEFAULT_GRANULARITY[offered[0]];
+      if (!offered.includes(granularity)) {
+        throw new Error(`Granularity "${granularity}" is not offered for ${field}. Offered: ${offered.join(', ')}.`);
+      }
+    } else {
+      ranges.forEach((r, i) => {
+        if (r.low === undefined || r.high === undefined || String(r.low) === '' || String(r.high) === '') {
+          throw new Error(`Partition ${i + 1} needs both a lower and an upper bound.`);
+        }
+      });
+      const inline = xml.match(new RegExp(`<element\\b[^>]*\\bname="${field}"[^>]*>[\\s\\S]*?<inlineType\\b[^>]*`))?.[0]
+        .match(/<inlineType\b[^>]*$/)?.[0] ?? '';
+      ranges = (await convertPartitionBounds(client, el, inline, ranges)) ?? ranges;
+    }
+  }
+
+  const hadPartitioning = partitionFieldOf(xml) !== undefined || rootFlagOf(xml, 'dynamicPartitions');
+  if (remove && !hadPartitioning) {
+    return JSON.stringify({ success: false, message: `aDSO ${adsoUpper} is not partitioned. No changes made.` });
+  }
+  xml = clearPartitioning(xml);
+  if (!remove) {
+    const criteria = spec.dynamic
+      ? [`  <partitioningCriteria field="#///${field}" partitionNumber="1" rangeLow="" rangeHigh=""/>`]
+      : ranges.map((r, i) =>
+          `  <partitioningCriteria field="#///${field}" partitionNumber="${i + 1}"` +
+          ` rangeLow="${escapeXmlAttr(String(r.low))}" rangeHigh="${escapeXmlAttr(String(r.high))}"/>`);
+    xml = xml.replace('</adso:dataStore>', `${criteria.join('\n')}\n</adso:dataStore>`);
+    if (spec.dynamic) {
+      xml = setRootAttr(xml, 'dynamicPartitions', 'true');
+      xml = setRootAttr(xml, 'dynamicPartitionGranularity', granularity!);
+    }
+  }
+
+  const lockHandle = await client.lock('adso', adsoName);
+  try {
+    await client.put('adso', adsoName, lockHandle, xml, timestamp, spec.transport);
+  } catch (err) {
+    await client.unlock('adso', adsoName).catch(() => {/* ignore */});
+    throw err;
+  }
+
+  return JSON.stringify({
+    success: true,
+    message: remove
+      ? `Partitioning removed from aDSO ${adsoUpper}. Call bw_activate to activate.`
+      : spec.dynamic
+        ? `aDSO ${adsoUpper} is partitioned dynamically on ${field} (granularity ${granularity}). Call bw_activate to activate.`
+        : `aDSO ${adsoUpper} has ${partitionCount} partition(s) on ${field}. Call bw_activate to activate.`,
+    lock_handle: lockHandle,
+    adso_name: adsoUpper,
+    object_type: 'adso',
+    ...(remove ? {} : { partition_field: field, partitions: spec.dynamic ? 'dynamic' : partitionCount }),
+    ...(granularity ? { granularity } : {}),
   });
 }
 
@@ -692,27 +1347,76 @@ export async function bwUpdateAdsoFieldProperties(
   }
 
   // ── Apply properties ──────────────────────────────────────────────────────
+  const info = adsoElements(fullXml).find((el) => el.name === nameUpper);
+  const notes: string[] = [];
+
   if (properties.dimension !== undefined) {
     replaceAttr('dimension', resolveFieldGroup(fullXml, properties.dimension, adsoUpper));
   }
 
   if (properties.sidDeterminationMode !== undefined) {
+    if (!isInfoObject) {
+      throw new Error(`${nameUpper} is a plain field; SID determination applies to InfoObject fields only.`);
+    }
+    // The modes offered depend on the InfoObject and on the aDSO type; a mode outside the
+    // list is accepted on save and fails the activation.
+    const facts = await readInfoObjectFacts(createClientFromEnv(), info?.infoObjectName ?? nameUpper);
+    const allowed = allowedSidModes(
+      { ...facts, objectType: info?.objectType ?? facts.objectType, compounded: (info?.compoundParents.length ?? 0) > 0 || facts.compounded },
+      sidContextOf(fullXml),
+    );
+    if (allowed.length > 0 && !allowed.includes(properties.sidDeterminationMode)) {
+      throw new Error(
+        `sid_determination_mode "${properties.sidDeterminationMode}" is not offered for ${nameUpper} ` +
+        `in aDSO ${adsoUpper}. Offered: ${allowed.join(', ')}.`,
+      );
+    }
     replaceAttr('sidDeterminationMode', properties.sidDeterminationMode);
+    // Compounding: a child either materializes its SIDs or determines them no earlier than its parent.
+    const rank: Record<string, number> = { N: 0, R: 1, S: 2, M: 3 };
+    const others = adsoElements(fullXml);
+    const mode = properties.sidDeterminationMode;
+    const clashes = [
+      ...others.filter((el) => info?.compoundParents.includes(el.name) && mode !== 'M' && rank[mode] > rank[el.sidMode ?? 'N']),
+      ...others.filter((el) => el.compoundParents.includes(nameUpper) && el.sidMode !== 'M' && rank[el.sidMode ?? 'N'] > rank[mode]),
+    ].map((el) => `${el.name} (${el.sidMode})`);
+    if (clashes.length) {
+      notes.push(`SID determination "${mode}" does not fit the compounded fields ${clashes.join(', ')}: a compounded field needs "M" or a mode no higher than its compounding parent.`);
+    }
   }
 
   if (properties.aggregationBehavior !== undefined) {
+    const aggregates = properties.aggregationBehavior !== 'NONE';
+    if (aggregates && keyFieldsOf(fullXml).includes(nameUpper)) {
+      throw new Error(
+        `${nameUpper} is a key field of aDSO ${adsoUpper}; a key field cannot aggregate. ` +
+        'Take it out of the key with action "manage_keys" first.',
+      );
+    }
+    if (aggregates && partitionFieldOf(fullXml) === nameUpper) {
+      throw new Error(
+        `${nameUpper} carries the partitioning of aDSO ${adsoUpper}; the partitioning field cannot aggregate. ` +
+        'Remove the partitioning with action "manage_partitions" first.',
+      );
+    }
     replaceAttr('aggregationBehavior', properties.aggregationBehavior);
+    // An aggregating field has no conversion routine.
+    if (aggregates && !isInfoObject && /\bconversionRoutine="[^"]+"/.test(elem.slice(0, elem.indexOf('>')))) {
+      const routine = elem.match(/\bconversionRoutine="([^"]*)"/)?.[1];
+      elem = elem.replace(/\s+conversionRoutine="[^"]*"/, '');
+      notes.push(`Conversion routine ${routine} removed: an aggregating field has none.`);
+    }
   }
 
   if (properties.localDescription !== undefined) {
     const desc = properties.localDescription === null
       ? '<descriptions/>'
-      : `<descriptions label="${properties.localDescription}"/>`;
+      : `<descriptions label="${escapeXmlAttr(properties.localDescription)}"/>`;
     replaceDescriptions(desc);
   }
 
   if (properties.description !== undefined) {
-    replaceDescriptions(`<descriptions label="${properties.description}"/>`);
+    replaceDescriptions(`<descriptions label="${escapeXmlAttr(properties.description)}"/>`);
   }
 
   if (properties.fixedCurrency !== undefined) {
@@ -768,7 +1472,10 @@ export async function bwUpdateAdsoFieldProperties(
 
   return JSON.stringify({
     success: true,
-    message: `Field ${nameUpper} in aDSO ${adsoUpper} updated. Call bw_activate to activate.`,
+    message:
+      `Field ${nameUpper} in aDSO ${adsoUpper} updated. Call bw_activate to activate.` +
+      (notes.length ? ` ${notes.join(' ')}` : ''),
+    ...(notes.length ? { warnings: notes } : {}),
     lock_handle: lockHandle,
     adso_name: adsoUpper,
     object_type: 'adso',
@@ -908,7 +1615,7 @@ function buildPureFieldElement(field: FieldDef, dimension = '#///GROUP1§'): str
     `    dimension="${dimension}" sidDeterminationMode="N">\n` +
     `    <inlineType ${inlineAttrs.join(' ')}/>\n` +
     `    <localProperties xsi:type="${localPropsType}">\n` +
-    `      <descriptions label="${field.label}"/>\n` +
+    `      <descriptions label="${escapeXmlAttr(field.label)}"/>\n` +
     `    </localProperties>${semanticsLine}\n` +
     `  </element>`
   );
@@ -969,7 +1676,7 @@ export async function bwCreateAdso(
       `<adso:dataStore xmlns:adso="http://www.sap.com/bw/modeling/adso.ecore"` +
       ` xmlns:adtcore="http://www.sap.com/adt/core"` +
       ` schemaVersion="1.0" name="${nameUpper}" readOnly="false" ${typeAttrStr}${pushModeAttr}>\n` +
-      `  <endUserTexts label="${label}"/>\n` +
+      `  <endUserTexts label="${escapeXmlAttr(label)}"/>\n` +
       `  <tlogoProperties adtcore:language="${language}" adtcore:name="${nameUpper}"` +
       ` adtcore:type="ADSO" adtcore:masterLanguage="${language}">\n` +
       `    <infoArea>${infoAreaUpper}</infoArea>\n` +
@@ -998,7 +1705,7 @@ export async function bwCreateAdso(
       ` xmlns:adtcore="http://www.sap.com/adt/core"` +
       ` schemaVersion="1.0" name="${nameUpper}" readOnly="false"` +
       ` activateData="true" writeChangelog="true"${pushModeAttr}>\n` +
-      `  <endUserTexts label="${label}"/>\n` +
+      `  <endUserTexts label="${escapeXmlAttr(label)}"/>\n` +
       `  <tlogoProperties adtcore:language="${language}" adtcore:name="${nameUpper}"` +
       ` adtcore:type="ADSO" adtcore:masterLanguage="${language}">\n` +
       `    <infoArea>${infoAreaUpper}</infoArea>\n` +
@@ -1075,13 +1782,34 @@ export async function bwUpdateAdsoAddPureField(
     groups.set(field.name, resolveFieldGroup(xml, field.dimension, adsoUpper));
   }
 
-  for (const field of fields) {
-    const name = field.name.trim().toUpperCase();
+  if (fields.some((f) => f.isKey) && !canCarryKeys(xml)) {
+    throw new Error(
+      `aDSO ${adsoUpper} is of type "${adsoTypeCandidates(rootTagOf(xml))[0]}" and has no key definition; ` +
+      'add the fields without is_key.',
+    );
+  }
+
+  for (const original of fields) {
+    const name = original.name.trim().toUpperCase();
     if (xml.includes(`name="${name}"`)) {
       skipped.push(name);
       continue;
     }
-    const apiType = TYPE_NAME_MAP[field.dataType] ?? field.dataType;
+    const apiType = TYPE_NAME_MAP[original.dataType] ?? original.dataType;
+    let field = original;
+    if (field.isKey) {
+      if (TYPES_INVALID_IN_KEY.has(apiType)) {
+        throw new Error(`Field ${name}: data type ${field.dataType} is not allowed in a key.`);
+      }
+      if (apiType === 'NUMC' && (field.length ?? 0) > 69) {
+        throw new Error(`Field ${name}: NUMC fields longer than 69 are not allowed in a key.`);
+      }
+      if (field.aggregationBehavior !== undefined && field.aggregationBehavior !== 'NONE') {
+        throw new Error(`Field ${name}: a key field cannot aggregate (${field.aggregationBehavior}); pass aggregation_behavior "NONE" or leave is_key out.`);
+      }
+      // A numeric type aggregates by default; in the key it must not.
+      if (KEYFIGURE_TYPES.has(apiType)) field = { ...field, aggregationBehavior: 'NONE' };
+    }
     if (apiType === 'CURR' || apiType === 'QUAN') {
       const decimalPlaces = field.scale ?? field.precision;
       if (decimalPlaces === undefined || decimalPlaces <= 0) {
@@ -1106,11 +1834,25 @@ export async function bwUpdateAdsoAddPureField(
     });
   }
 
-  const insertBlock = [...elementBlocks, ...keyElements].join('\n') + '\n';
+  const insertBlock = elementBlocks.join('\n') + '\n';
   if (xml.includes('</tlogoProperties>')) {
     xml = xml.replace('</tlogoProperties>', '</tlogoProperties>\n' + insertBlock);
   } else {
     xml = xml.replace('</adso:dataStore>', insertBlock + '</adso:dataStore>');
+  }
+  // Key entries go behind the existing ones, never between the field elements: the server
+  // refuses a document whose field elements are interrupted by another element.
+  if (keyElements.length > 0) {
+    const keyBlock = keyElements.join('\n') + '\n';
+    const existing = [...xml.matchAll(/<keyElement>[^<]*<\/keyElement>\n?/g)].pop();
+    if (existing) {
+      const at = existing.index! + existing[0].length;
+      xml = xml.slice(0, at) + keyBlock + xml.slice(at);
+    } else if (xml.includes('<tlogoProperties')) {
+      xml = xml.replace('<tlogoProperties', keyBlock + '  <tlogoProperties');
+    } else {
+      xml = xml.replace('</adso:dataStore>', keyBlock + '</adso:dataStore>');
+    }
   }
 
   const lockHandle = await client.lock('adso', adsoName);
@@ -1167,22 +1909,52 @@ export async function bwUpdateAdso(
   let updatedXml = adsoResult.body;
   const processed: string[] = [];
   const skipped: string[] = [];
+  const notes: string[] = [];
+  const extra: Record<string, unknown> = {};
 
   if (action === 'remove_field') {
-    for (const name of names) {
-      if (!updatedXml.includes(`name="${name}"`)) {
-        skipped.push(name);
-        continue;
-      }
-      updatedXml = removeElement(updatedXml, name);
-      processed.push(name);
-    }
+    const present = new Set(adsoElements(updatedXml).map((el) => el.name));
+    const toRemove = names.filter((n) => present.has(n));
+    skipped.push(...names.filter((n) => !present.has(n)));
 
-    if (processed.length === 0) {
+    if (toRemove.length === 0) {
       return JSON.stringify({
         success: false,
         message: `None of the fields (${names.join(', ')}) found in aDSO ${adsoUpper}. No changes made.`,
       });
+    }
+
+    // A field other fields depend on stays until they are gone: the server answers such a save
+    // with an error that names no reason.
+    const remaining = adsoElements(updatedXml).filter((el) => !toRemove.includes(el.name));
+    const blockers: string[] = [];
+    for (const name of toRemove) {
+      const children = remaining.filter((el) => el.compoundParents.includes(name)).map((el) => el.name);
+      if (children.length) blockers.push(`${name} is the compounding parent of ${children.join(', ')}`);
+      const keyFigures = remaining.filter((el) => el.unitCurrencyElement === name).map((el) => el.name);
+      if (keyFigures.length) blockers.push(`${name} supplies the unit or currency of ${keyFigures.join(', ')}`);
+    }
+    if (blockers.length) {
+      throw new Error(
+        `Cannot remove from aDSO ${adsoUpper}: ${blockers.join('; ')}. ` +
+        'Remove the dependent fields in the same call, or first.',
+      );
+    }
+
+    const cleaned: Record<string, string[]> = {};
+    for (const name of toRemove) {
+      updatedXml = removeElement(updatedXml, name);
+      const refs = removeFieldReferences(updatedXml, name);
+      updatedXml = refs.xml;
+      if (refs.removed.length) cleaned[name] = refs.removed;
+      processed.push(name);
+    }
+    if (Object.keys(cleaned).length) {
+      extra['removed_references'] = cleaned;
+      notes.push(
+        'Also removed: ' +
+        Object.entries(cleaned).map(([field, where]) => `${field} from the ${where.join(', ')}`).join('; ') + '.',
+      );
     }
   } else {
     // add_field — read each InfoObject and inject. One fresh reader session for the
@@ -1193,25 +1965,45 @@ export async function bwUpdateAdso(
     const group =
       dimension !== undefined ? resolveFieldGroup(updatedXml, dimension, adsoUpper) : undefined;
     const iobjReader = createClientFromEnv();
-    for (const name of names) {
-      if (updatedXml.includes(`infoObjectName="${name}"`)) {
-        skipped.push(name);
-        continue;
+    const ctx = sidContextOf(updatedXml);
+    const inAdso = (name: string) => new RegExp(`<element\\b[^>]*\\bname="${name}"`).test(updatedXml);
+    const dependencies: Array<{ field: string; needed_by: string; as: string }> = [];
+
+    // The modeling tools bring along what an InfoObject cannot stand without: the compounding
+    // parents of a characteristic and the unit InfoObject of a key figure. The server does
+    // not — it refuses the save of a compounded characteristic without its parents.
+    const addInfoObject = async (name: string, neededBy?: { field: string; as: string }): Promise<void> => {
+      if (inAdso(name)) {
+        if (!neededBy) skipped.push(name);
+        return;
       }
-      const iObjResult = await iobjReader.get(
-        `/sap/bw/modeling/iobj/${bwSeg(name)}/m?forceCacheUpdate=true`,
-        MEDIA_TYPES['iobj']
+      const facts = await readInfoObjectFacts(iobjReader, name);
+      for (const parent of facts.compoundParents) {
+        await addInfoObject(parent, { field: name, as: 'compounding parent' });
+      }
+      const unit = facts.objectType === 'KYF' ? facts.unitInfoObject : undefined;
+      if (unit) await addInfoObject(unit, { field: name, as: 'unit or currency' });
+      updatedXml = injectElement(
+        updatedXml,
+        buildAdsoElement(name, parseInfoObjectProps(facts.xml), group, defaultSidMode(facts, ctx), unit),
       );
-      const iObjProps = parseInfoObjectProps(iObjResult.body);
-      updatedXml = injectElement(updatedXml, buildAdsoElement(name, iObjProps, group));
-      processed.push(name);
-    }
+      if (neededBy) dependencies.push({ field: name, needed_by: neededBy.field, as: neededBy.as });
+      else processed.push(name);
+    };
+    for (const name of names) await addInfoObject(name);
 
     if (processed.length === 0) {
       return JSON.stringify({
         success: false,
         message: `All fields (${names.join(', ')}) are already present in aDSO ${adsoUpper}. No changes made.`,
       });
+    }
+    if (dependencies.length) {
+      extra['added_dependencies'] = dependencies;
+      notes.push(
+        'Also added: ' +
+        dependencies.map((d) => `${d.field} (${d.as} of ${d.needed_by})`).join(', ') + '.',
+      );
     }
   }
 
@@ -1235,12 +2027,16 @@ export async function bwUpdateAdso(
   const verb = action === 'remove_field' ? 'removed from' : 'added to';
   const result: Record<string, unknown> = {
     success: true,
-    message: `${processed.join(', ')} ${verb} aDSO ${adsoUpper}. Call bw_activate to activate.`,
+    message:
+      `${processed.join(', ')} ${verb} aDSO ${adsoUpper}. Call bw_activate to activate.` +
+      (notes.length ? ` ${notes.join(' ')}` : ''),
     lock_handle: lockHandle,
     adso_name: adsoUpper,
     object_type: 'adso',
     processed,
+    ...extra,
   };
   if (skipped.length > 0) result['skipped'] = skipped;
   return JSON.stringify(result);
 }
+

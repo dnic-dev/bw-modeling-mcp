@@ -602,6 +602,14 @@ export interface SourceFieldMeta {
   conversionType?: string;
   /** A technical element BW maintains itself (metaObject or a request field on the source). */
   isMetaObject: boolean;
+  /** Bare names of the source fields this one is compounded to. */
+  compoundParents: string[];
+}
+
+export interface CompoundingMapping {
+  field: string;
+  parent: string;
+  target: string;
 }
 
 // Pure CUKY/UNIT fields are bound to the standard currency/unit characteristics at
@@ -691,6 +699,8 @@ export async function fetchCompositeSourceFields(
           : undefined,
         outputLength: outputLengthRaw ? parseInt(outputLengthRaw, 10) : 0,
         isMetaObject: isTechnicalSourceElement(body),
+        compoundParents: [...body.matchAll(/<compoundInfoObject>#\/\/\/([^<]+)<\/compoundInfoObject>/g)]
+          .map((c) => (c[1].startsWith(`${fieldNamePrefix}-`) ? c[1].slice(fieldNamePrefix.length + 1) : c[1])),
       });
     }
   }
@@ -823,7 +833,32 @@ function resolveMappings(
   nodeName: string,
   existingXml: string,
   defaults: NewElementDefaults = {}
-): { mappingsXml: string[]; newElementsXml: string[]; groups: Set<string> } {
+): { mappingsXml: string[]; newElementsXml: string[]; groups: Set<string>; compounding: CompoundingMapping[] } {
+  // A compounded field needs its compounding parent as a field of the CompositeProvider
+  // ("compounding parent … is missing for field …"). The modeling tools map the parents of
+  // a compounded source field along with it; a parent the caller maps itself is left alone.
+  const compounding: CompoundingMapping[] = [];
+  const byBare = new Map(fields.map((f) => [f.defaultTargetName, f]));
+  const sourceOf = (m: FieldMapping) => (m.source ?? m.target).trim().toUpperCase();
+  mappings = [...mappings];
+  for (let i = 0; i < mappings.length; i++) {
+    const m = mappings[i];
+    if (m.constantValue !== undefined) continue;
+    const field = byBare.get(sourceOf(m));
+    for (const parent of field?.compoundParents ?? []) {
+      const parentField = byBare.get(parent);
+      if (!parentField || mappings.some((o) => o.constantValue === undefined && sourceOf(o) === parent)) continue;
+      // A field bound to the parent's InfoObject, whichever input feeds it, satisfies the rule.
+      const present = parentField.infoObjectName !== undefined &&
+        [...existingXml.matchAll(/<element\b[^>]*>/g)].some((e) => attr(e[0], 'infoObjectName') === parentField.infoObjectName);
+      if (present) continue;
+      const target = shortenTargetName(parent);
+      mappings.splice(i, 0, { target, source: parent });
+      compounding.push({ field: m.target.trim().toUpperCase(), parent, target });
+      i++;
+    }
+  }
+
   const byBareName = new Map(fields.map((f) => [f.defaultTargetName, f]));
   const cpUpper = existingXml.match(/<Composite:compositeView\b[^>]*\bname="([^"]*)"/)?.[1] ?? '';
   // Two elements using the same InfoObject directly would both answer to its name.
@@ -882,7 +917,7 @@ function resolveMappings(
       );
     }
   }
-  return { mappingsXml, newElementsXml, groups };
+  return { mappingsXml, newElementsXml, groups, compounding };
 }
 
 function declareGroups(xml: string, groups: Iterable<string>): string {
@@ -924,15 +959,25 @@ function dedupeTargetName(desired: string, existingXml: string, usedInBatch: Set
 function buildAutoMappings(
   fields: SourceFieldMeta[],
   existingXml: string,
-  viewNodeType: 'Join' | 'Union' | undefined
+  viewNodeType: 'Join' | 'Union' | undefined,
+  ownAlias?: string
 ): FieldMapping[] {
   const usedInBatch = new Set<string>();
+  // In a join a name counts as taken only while another input feeds it. A field no input
+  // feeds — left behind by a removed input, or fed by the very input being remapped — is
+  // reused; suffixing past it would leave an empty duplicate of the same InfoObject behind.
+  const fedByOthers = new Set(
+    [...existingXml.matchAll(/<input\b[^>]*>[\s\S]*?<\/input>/g)]
+      .filter((m) => attr(m[0].match(/<input\b[^>]*>/)?.[0] ?? '', 'alias') !== ownAlias)
+      .flatMap((m) => [...m[0].matchAll(/<mapping\b[^>]*>/g)].map((mapping) => attr(mapping[0], 'targetName'))),
+  );
+  const taken = [...fedByOthers].map((name) => `<element name="${name}"`).join('');
   return fields.filter((f) => !f.isMetaObject && !AUTO_MAP_EXCLUDED.has(f.defaultTargetName)).map((f) => {
     const desired = shortenTargetName(f.defaultTargetName);
     const target =
       viewNodeType === 'Union'
         ? dedupeTargetName(desired, '', usedInBatch)
-        : dedupeTargetName(desired, existingXml, usedInBatch);
+        : dedupeTargetName(desired, taken, usedInBatch);
     usedInBatch.add(target);
     return { target, source: f.defaultTargetName };
   });
@@ -984,6 +1029,7 @@ export async function bwUpdateCompositeProviderInput(
 
   let message: string;
   let resultAlias: string | undefined;
+  let compoundingAdded: CompoundingMapping[] = [];
 
   if (action === 'remove_input') {
     const alias = (inputAlias ?? '').trim();
@@ -998,9 +1044,16 @@ export async function bwUpdateCompositeProviderInput(
       });
     }
     xml = xml.replace(inputRegex, '');
+    // The join that names the input stays: a join node saved without any join element ends in
+    // a runtime error on the server. It is replaced when the condition is set again.
+    const joins = joinsOfInput(xml, alias);
     message =
-      `Input ${alias} removed from CompositeProvider ${cpUpper}. Join references to it must be ` +
-      `updated separately. Call bw_activate to activate.`;
+      `Input ${alias} removed from CompositeProvider ${cpUpper}.` +
+      (joins > 0
+        ? ` ${joins} join condition(s) still name it: a join node needs two inputs again and its condition set ` +
+          'anew ("add_input", then "update_join") before it activates.'
+        : '') +
+      ' Call bw_activate to activate.';
   } else {
     if (!input) throw new Error('add_input requires an input definition.');
 
@@ -1021,9 +1074,10 @@ export async function bwUpdateCompositeProviderInput(
         : buildAutoMappings(fields, xml, getViewNodeType(xml));
 
     const alias = nextInputAlias(xml, nodeName, input.providerType);
-    const { mappingsXml, newElementsXml, groups } = resolveMappings(
+    const { mappingsXml, newElementsXml, groups, compounding } = resolveMappings(
       requested, fields, input.providerName, nodeName, xml, defaults
     );
+    compoundingAdded = compounding;
     xml = openViewNode(xml);
 
     if (newElementsXml.length > 0) {
@@ -1044,7 +1098,11 @@ export async function bwUpdateCompositeProviderInput(
     resultAlias = alias;
     message =
       `Input ${alias} (${input.providerName.toUpperCase()}) added to CompositeProvider ${cpUpper} ` +
-      `with ${mappingsXml.length} mapping(s). Call bw_activate to activate.`;
+      `with ${mappingsXml.length} mapping(s). Call bw_activate to activate.` +
+      (compounding.length
+        ? ' Also mapped, since a compounded field needs its compounding parent: ' +
+          compounding.map((c) => `${c.parent} -> ${c.target} (parent of ${c.field})`).join(', ') + '.'
+        : '');
   }
 
   const lockHandle = await client.lock('hcpr', compositeProviderName);
@@ -1062,6 +1120,7 @@ export async function bwUpdateCompositeProviderInput(
     composite_provider_name: cpUpper,
     object_type: 'hcpr',
     ...(resultAlias ? { input_alias: resultAlias } : {}),
+    ...(compoundingAdded.length ? { compounding_parents_mapped: compoundingAdded } : {}),
   });
 }
 
@@ -1106,8 +1165,8 @@ export async function bwUpdateCompositeProviderMapping(
   const nodeName = getViewNodeName(xml);
   const { fields } = await fetchCompositeSourceFields(providerName);
 
-  const effective = mappings.length > 0 ? mappings : buildAutoMappings(fields, xml, getViewNodeType(xml));
-  const { mappingsXml, newElementsXml, groups } = resolveMappings(
+  const effective = mappings.length > 0 ? mappings : buildAutoMappings(fields, xml, getViewNodeType(xml), alias);
+  const { mappingsXml, newElementsXml, groups, compounding } = resolveMappings(
     effective, fields, providerName, nodeName, xml, defaults
   );
 
@@ -1126,6 +1185,12 @@ export async function bwUpdateCompositeProviderMapping(
     `$1\n${mappingsXml.join('\n')}\n  $2`
   );
 
+  // Replacing a mapping list can leave fields behind that no input feeds any more.
+  const mappedTargetNames = new Set([...xml.matchAll(/<mapping\b[^>]*>/g)].map((m) => attr(m[0], 'targetName')));
+  const unmapped = [...xml.slice(0, xml.indexOf('<input')).matchAll(/<element\b[^>]*>/g)]
+    .map((e) => attr(e[0], 'name'))
+    .filter((name) => name && !mappedTargetNames.has(name));
+
   const lockHandle = await client.lock('hcpr', compositeProviderName);
   try {
     await client.put('hcpr', compositeProviderName, lockHandle, xml, timestamp, transport);
@@ -1138,11 +1203,20 @@ export async function bwUpdateCompositeProviderMapping(
     success: true,
     message:
       `Mappings for input ${alias} in CompositeProvider ${cpUpper} replaced ` +
-      `(${mappingsXml.length} mapping(s)). Call bw_activate to activate.`,
+      `(${mappingsXml.length} mapping(s)). Call bw_activate to activate.` +
+      (compounding.length
+        ? ' Also mapped, since a compounded field needs its compounding parent: ' +
+          compounding.map((c) => `${c.parent} -> ${c.target} (parent of ${c.field})`).join(', ') + '.'
+        : '') +
+      (unmapped.length
+        ? ` Fields without a mapping from any input now: ${unmapped.join(', ')}; remove them with "remove_field" or map them.`
+        : ''),
     lock_handle: lockHandle,
     composite_provider_name: cpUpper,
     object_type: 'hcpr',
     input_alias: alias,
+    ...(compounding.length ? { compounding_parents_mapped: compounding } : {}),
+    ...(unmapped.length ? { unmapped_fields: unmapped } : {}),
   });
 }
 
@@ -1594,6 +1668,96 @@ function findJoinBetween(xml: string, viewNodeName: string, left: string, right:
   ));
 }
 
+/** The whole `<input>` block of one alias. */
+function inputBlockOf(xml: string, alias: string): string | undefined {
+  return xml.match(new RegExp(`<input\\b[^>]*\\balias="${escapeRegex(alias)}"[^>]*>[\\s\\S]*?<\\/input>`))?.[0];
+}
+
+/** Target elements one source field of an input is mapped onto. */
+export function mappedTargets(xml: string, alias: string, sourceName: string): string[] {
+  const block = inputBlockOf(xml, alias) ?? '';
+  return [...block.matchAll(/<mapping\b[^>]*>/g)]
+    .filter((m) => attr(m[0], 'sourceName') === sourceName)
+    .map((m) => attr(m[0], 'targetName'))
+    .filter(Boolean);
+}
+
+/** Add mappings to an input, behind the ones it has. */
+export function appendMappings(xml: string, alias: string, mappingsXml: string[]): string {
+  const block = inputBlockOf(xml, alias);
+  if (!block || mappingsXml.length === 0) return xml;
+  return xml.replace(block, block.replace(/\s*<\/input>$/, `\n${mappingsXml.join('\n')}\n  </input>`));
+}
+
+export interface JoinKeyTargets {
+  leftAlias: string;
+  rightAlias: string;
+  leftKey: string;
+  rightKey: string;
+  /** Target fields both keys are mapped onto. The server needs at least one. */
+  commonTargets: string[];
+}
+
+/** Every key pair of every join with the target fields its two sides share. */
+export function joinKeyTargets(xml: string): JoinKeyTargets[] {
+  const out: JoinKeyTargets[] = [];
+  for (const m of xml.matchAll(/<join\b([^>]*)>([\s\S]*?)<\/join>/g)) {
+    const leftAlias = attr(m[1], 'leftInput').replace(/^.*\//, '');
+    const rightAlias = attr(m[1], 'rightInput').replace(/^.*\//, '');
+    const lefts = [...m[2].matchAll(/<leftElementName>([^<]*)<\/leftElementName>/g)].map((k) => k[1]);
+    const rights = [...m[2].matchAll(/<rightElementName>([^<]*)<\/rightElementName>/g)].map((k) => k[1]);
+    lefts.forEach((leftKey, i) => {
+      const rightKey = rights[i];
+      if (rightKey === undefined) return;
+      const rightTargets = mappedTargets(xml, rightAlias, rightKey);
+      out.push({
+        leftAlias, rightAlias, leftKey, rightKey,
+        commonTargets: mappedTargets(xml, leftAlias, leftKey).filter((t) => rightTargets.includes(t)),
+      });
+    });
+  }
+  return out;
+}
+
+/** Number of joins that name the input. */
+export function joinsOfInput(xml: string, alias: string): number {
+  return [...xml.matchAll(/<join\b[^>]*>/g)].filter((m) =>
+    [attr(m[0], 'leftInput'), attr(m[0], 'rightInput')].some((ref) => ref.replace(/^.*\//, '') === alias)).length;
+}
+
+/**
+ * Take back the double mapping of key pairs that are no longer part of a join. In a join only
+ * a key field may be fed by both inputs; any other target field with a mapping from each side
+ * is refused ("invalid number of assignments"). The right input's mapping onto the common
+ * target goes, the left one keeps feeding the field.
+ */
+export function releaseJoinKeys(
+  xml: string,
+  leftAlias: string,
+  rightAlias: string,
+  keep: Array<{ leftKey: string; rightKey: string }>,
+): { xml: string; released: Array<{ key: string; target: string }> } {
+  const released: Array<{ key: string; target: string }> = [];
+  let out = xml;
+  for (const pair of joinKeyTargets(xml)) {
+    if (pair.leftAlias !== leftAlias || pair.rightAlias !== rightAlias) continue;
+    if (keep.some((k) => k.leftKey === pair.leftKey && k.rightKey === pair.rightKey)) continue;
+    for (const target of pair.commonTargets) {
+      // A target another kept pair still shares stays double mapped.
+      if (keep.some((k) => mappedTargets(xml, leftAlias, k.leftKey).includes(target) &&
+        mappedTargets(xml, rightAlias, k.rightKey).includes(target))) continue;
+      const block = inputBlockOf(out, rightAlias);
+      if (!block) continue;
+      const mapping = [...block.matchAll(/[ \t]*<mapping\b[^>]*\/>\n?/g)].find((m) =>
+        attr(m[0], 'sourceName') === pair.rightKey && attr(m[0], 'targetName') === target);
+      if (!mapping) continue;
+      out = out.replace(block, block.replace(mapping[0], ''));
+      released.push({ key: pair.rightKey, target });
+    }
+  }
+  return { xml: out, released };
+}
+
 async function resolveInputProviderMeta(
   xml: string,
   alias: string,
@@ -1679,6 +1843,44 @@ export async function bwUpdateCompositeProviderJoin(
     ),
   ].join('\n');
 
+  // The server wants every key pair mapped onto a common target field ("join fields need at
+  // least one common target field"). The modeling tools create that when a condition is
+  // added: the target of the left key is reused or created, and the right key is mapped onto
+  // it as well. A mapping the right key already has onto a field of its own stays.
+  const released = releaseJoinKeys(xml, left, right, keyPairs.map((k) => ({
+    leftKey: resolveSourceFieldName(leftMeta.fields, k.left, leftMeta.providerName),
+    rightKey: resolveSourceFieldName(rightMeta.fields, k.right, rightMeta.providerName),
+  })));
+  xml = released.xml;
+
+  const commonTargets: Array<{ left: string; right: string; target: string; created: boolean }> = [];
+  for (const pair of keyPairs) {
+    const leftSource = resolveSourceFieldName(leftMeta.fields, pair.left, leftMeta.providerName);
+    const rightSource = resolveSourceFieldName(rightMeta.fields, pair.right, rightMeta.providerName);
+    const leftTargets = mappedTargets(xml, left, leftSource);
+    const rightTargets = mappedTargets(xml, right, rightSource);
+    if (leftTargets.some((t) => rightTargets.includes(t))) continue;
+
+    let target = leftTargets[0];
+    let created = false;
+    if (!target) {
+      const bare = pair.left.trim().toUpperCase();
+      target = dedupeTargetName(shortenTargetName(bare), xml, new Set());
+      const resolved = resolveMappings([{ target, source: bare }], leftMeta.fields, leftMeta.providerName, viewNodeName, xml);
+      if (resolved.newElementsXml.length > 0) {
+        xml = injectBeforeAnchor(openViewNode(xml), resolved.newElementsXml.join('\n'), ['<input', '<join'], '</viewNode>');
+      }
+      xml = declareGroups(xml, resolved.groups);
+      xml = ensureNamespace(xml, 'BwCore', 'http://www.sap.com/bw/modeling/BwCore.ecore');
+      xml = ensureNamespace(xml, 'Type', 'http://www.sap.com/ndb/DataModelType.ecore');
+      xml = appendMappings(xml, left, resolved.mappingsXml);
+      created = true;
+    }
+    xml = ensureNamespace(xml, 'Type', 'http://www.sap.com/ndb/DataModelType.ecore');
+    xml = appendMappings(xml, right, [buildTypeMappingXml(target, rightSource)]);
+    commonTargets.push({ left: pair.left.trim().toUpperCase(), right: pair.right.trim().toUpperCase(), target, created });
+  }
+
   const joinXml =
     `  <join leftInput="#///${viewNodeName}/${left}" rightInput="#///${viewNodeName}/${right}"` +
     ` joinType="${joinType}" cardinality="${cardinality}">\n` +
@@ -1703,12 +1905,23 @@ export async function bwUpdateCompositeProviderJoin(
     success: true,
     message:
       `Join condition set in CompositeProvider ${cpUpper} (${left} / ${right}, ` +
-      `${keyPairs.length} key pair(s)). Call bw_activate to activate.`,
+      `${keyPairs.length} key pair(s)). Call bw_activate to activate.` +
+      (commonTargets.length
+        ? ' Both sides of a join key need a common target field: ' +
+          commonTargets.map((c) =>
+            `${c.right} of ${right} is now also mapped onto ${c.target}${c.created ? ' (created)' : ''}`).join('; ') + '.'
+        : '') +
+      (released.released.length
+        ? ` No longer join keys, so ${right} no longer feeds ` +
+          released.released.map((r) => `${r.target} (from ${r.key})`).join(', ') + '.'
+        : ''),
     lock_handle: lockHandle,
     composite_provider_name: cpUpper,
     object_type: 'hcpr',
     join_type: joinType,
     cardinality,
+    ...(commonTargets.length ? { common_target_fields: commonTargets } : {}),
+    ...(released.released.length ? { released_key_mappings: released.released } : {}),
   });
 }
 
@@ -1736,7 +1949,21 @@ export async function bwRemoveCompositeProviderJoin(
       message: `No join found between ${left} and ${right} in CompositeProvider ${cpUpper}. No changes made.`,
     });
   }
-  xml = xml.replace(existing[0], '');
+  // The fields the two sides shared as join keys go back to a single feeding input.
+  const released = releaseJoinKeys(xml, left, right, []);
+  xml = released.xml;
+  // The last join of a node is emptied, not removed: a join node saved without any join
+  // element ends in a runtime error on the server. The condition-less form is the one a new
+  // CompositeProvider starts with.
+  const current = findJoinBetween(xml, viewNodeName, left, right)?.[0] ?? existing[0];
+  const lastJoin = (xml.match(/<join\b/g) ?? []).length <= 1;
+  const joinType = current.match(/\bjoinType="([^"]*)"/)?.[1] ?? 'inner';
+  xml = xml.replace(
+    current,
+    lastJoin
+      ? `  <join joinType="${joinType}" leftInput="#///${viewNodeName}/${left}" rightInput="#///${viewNodeName}/${right}"/>\n`
+      : '',
+  );
 
   const lockHandle = await client.lock('hcpr', compositeProviderName);
   try {
@@ -1748,9 +1975,16 @@ export async function bwRemoveCompositeProviderJoin(
 
   return JSON.stringify({
     success: true,
-    message: `Join between ${left} and ${right} removed from CompositeProvider ${cpUpper}. Call bw_activate to activate.`,
+    message:
+      `Join condition between ${left} and ${right} removed from CompositeProvider ${cpUpper}.` +
+      (lastJoin ? ' The join node needs a new condition ("update_join") before it activates.' : '') +
+      (released.released.length
+        ? ` ${right} no longer feeds ${released.released.map((r) => `${r.target} (from ${r.key})`).join(', ')}, which were join keys.`
+        : '') +
+      ' Call bw_activate to activate.',
     lock_handle: lockHandle,
     composite_provider_name: cpUpper,
     object_type: 'hcpr',
+    ...(released.released.length ? { released_key_mappings: released.released } : {}),
   });
 }

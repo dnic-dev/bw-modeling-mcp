@@ -24,7 +24,7 @@ import {
   platformInstructions,
   unavailableReason,
 } from './platform.js';
-import { bwGetAdso, bwCreateAdso, FieldDef, bwUpdateAdso, bwUpdateAdsoAddPureField, bwUpdateAdsoSettings, AdsoSettings, bwUpdateAdsoManageKeys, bwUpdateAdsoFieldProperties, FieldProperties } from './tools/adso.js';
+import { bwGetAdso, bwCreateAdso, FieldDef, bwUpdateAdso, bwUpdateAdsoAddPureField, bwUpdateAdsoSettings, AdsoSettings, bwUpdateAdsoManageKeys, bwUpdateAdsoFieldProperties, FieldProperties, bwUpdateAdsoPartitions, PartitionSpec } from './tools/adso.js';
 import { bwGetInfoObject, bwCreateInfoObject, bwUpdateInfoObject, AttributeDef } from './tools/infoobject.js';
 import { bwGetTransformation, bwUpdateTransformation, bwCreateTransformation, bwSetTransformationRuntime, bwSetTransformationRoutine, bwDeleteTransformationRoutine, bwSetTransformationRoutineFields, bwSetTransformationExpertRoutine, type RuleConversion } from './tools/transformation.js';
 import { bwActivate } from './tools/activation.js';
@@ -530,10 +530,12 @@ const TOOL_DEFINITIONS = [
       description:
         'Add/remove fields, change aDSO type/settings, manage key fields, or update individual field properties. ' +
         'action "add_field" (default): add one or more InfoObject-backed fields — infoobject_name required. ' +
-        'action "remove_field": removes the field from the aDSO (and from the key if it was a key field). ' +
+        'What an InfoObject cannot stand without comes along and is reported: the compounding parents of a characteristic and the unit InfoObject of a key figure. ' +
+        'action "remove_field": removes the field from the aDSO together with everything that points at it (key, partitioning, hash key, indexes, criteria). A field other fields are compounded to, or take their unit from, is refused until those are removed too. ' +
         'action "add_pure_field": add one or more pure (non-InfoObject) fields — pass fields array with name, label, data_type, optional length/precision/scale/aggregation_behavior/is_key. ' +
-        'action "update_settings": change aDSO type preset and/or individual boolean flags — no infoobject_name needed. ' +
-        'action "manage_keys": replace the complete key field list — pass key_fields array (empty = no key fields). ' +
+        'action "update_settings": change the aDSO type, its sub-options, planning mode, write interface or data tiering — no infoobject_name needed. A type change drops what the new type cannot carry (key definition, partitioning) and says so. ' +
+        'action "manage_keys": replace the complete key field list — pass key_fields array (empty = no key fields). Key fields must exist, must not aggregate and must not be key figures; compounding parents of a key field are added to the key. ' +
+        'action "manage_partitions": replace the partitioning of the active table — pass partitioning with field and either ranges (static) or dynamic: true; an empty partitioning removes it. ' +
         'action "update_field_properties": modify sidDeterminationMode, aggregationBehavior, fixedCurrency/Unit, a unit/currency field reference (unit_currency_field), the field group (dimension), or descriptions of a single field — pass field_name and properties. ' +
         'Field groups: pass "dimension" on add_field/add_pure_field to place new fields in the right group straight away — a field added without it lands in the catch-all group and moving it afterwards costs a second activation. ' +
         'Returns a lock_handle that must be passed to bw_activate to complete the operation. ' +
@@ -551,8 +553,8 @@ const TOOL_DEFINITIONS = [
           },
           action: {
             type: 'string',
-            enum: ['add_field', 'remove_field', 'add_pure_field', 'update_settings', 'manage_keys', 'update_field_properties'],
-            description: '"add_field" (default), "remove_field", "add_pure_field", "update_settings", "manage_keys", or "update_field_properties".',
+            enum: ['add_field', 'remove_field', 'add_pure_field', 'update_settings', 'manage_keys', 'manage_partitions', 'update_field_properties'],
+            description: '"add_field" (default), "remove_field", "add_pure_field", "update_settings", "manage_keys", "manage_partitions", or "update_field_properties".',
           },
           fields: {
             type: 'array',
@@ -567,7 +569,7 @@ const TOOL_DEFINITIONS = [
                 precision: { type: 'number', description: 'Total digits. For DEC (required) and, optionally, for CURR/QUAN (total length, default 17 when only scale is given).' },
                 scale: { type: 'number', description: 'Decimal places. Required for CURR/QUAN (> 0 — BW rejects scale 0) and used for DEC. Emitted as the XML scale attribute.' },
                 aggregation_behavior: { type: 'string', enum: ['SUM', 'MIN', 'MAX', 'AVG', 'LAST', 'NONE'], description: 'Aggregation (default SUM for numeric types). Use NONE for no aggregation.' },
-                is_key: { type: 'boolean', description: 'If true, also injects a <keyElement> entry.' },
+                is_key: { type: 'boolean', description: 'If true, the field also becomes a key field. A key field does not aggregate: a numeric key field is written with aggregation NONE.' },
                 dimension: { type: 'string', description: 'Field group ("Feldgruppe") to place the field in, given as the bare group name — e.g. "__KEYFIGURES" for the key figure group or "ALL" for the catch-all. Must be a group the aDSO declares; an unknown name is rejected with the declared groups listed rather than silently falling back. Read the current assignment from the DIM column of bw_get_adso.' },
               },
               required: ['name', 'label', 'data_type'],
@@ -584,7 +586,7 @@ const TOOL_DEFINITIONS = [
               sid_determination_mode: {
                 type: 'string',
                 enum: ['N', 'R', 'S', 'M'],
-                description: 'Master data check mode (InfoObject-backed fields only). N=none, R=reporting only, S=load/activate, M=load+SID.',
+                description: 'Master data check mode (InfoObject-backed fields only). N=none, R=reporting only, S=load/activate, M=load+SID. New fields get the default of their InfoObject type (S for characteristics, N for key figures and attribute-only characteristics). Which modes are offered depends on the InfoObject and the aDSO type; a mode that is not offered is refused with the offered ones listed.',
               },
               local_description: {
                 description: 'Local description override (InfoObject-backed). String to override, null to clear (revert to InfoObject text).',
@@ -592,7 +594,7 @@ const TOOL_DEFINITIONS = [
               aggregation_behavior: {
                 type: 'string',
                 enum: ['SUM', 'MIN', 'MAX', 'AVG', 'LAST', 'NONE'],
-                description: 'Aggregation behavior (pure fields only). Use NONE for no aggregation.',
+                description: 'Aggregation behavior (pure fields only). Use NONE for no aggregation. A key field or the partitioning field cannot aggregate.',
               },
               fixed_currency: {
                 description: 'Fixed currency code (pure CURR fields). String to set, null to switch to dynamic currency.',
@@ -630,14 +632,50 @@ const TOOL_DEFINITIONS = [
               adso_type: {
                 type: 'string',
                 enum: ['standard', 'staging_inbound_only', 'staging_compress', 'staging_reporting', 'datamart', 'direct_update'],
-                description: 'aDSO type preset. Sets activateData, cubeDeltaOnly, directUpdate, isReportingObject, noAqDeletion.',
+                description: 'aDSO modeling type. Written as a whole: the flags of the previous type are reset. A data mart and the staging types without active data have no key definition, an inbound-only aDSO no partitioning either — both are removed on the change and reported.',
               },
-              write_changelog: { type: 'boolean', description: 'Write change log (Standard type sub-option).' },
-              snap_shot_scenario: { type: 'boolean', description: 'Snapshot support (Standard type sub-option).' },
-              unique_data_records: { type: 'boolean', description: 'Unique records (Standard type sub-option).' },
+              write_changelog: { type: 'boolean', description: 'Write change log (standard type only; default true when the type changes to standard).' },
+              snap_shot_scenario: { type: 'boolean', description: 'Snapshot support (standard type only; needs the change log and excludes unique_data_records).' },
+              unique_data_records: { type: 'boolean', description: 'Unique records (standard type only; excludes snap_shot_scenario).' },
               planning_mode: { type: 'boolean', description: 'Planning enabled.' },
               write_interface: { type: 'boolean', description: 'Enable or disable write interface (pushMode).' },
+              temperature_schema: {
+                type: 'string',
+                enum: ['HO', 'WO', 'HWO', 'HWP'],
+                description: 'Data tiering of the aDSO: "HO" hot only (default), "WO" warm only, "HWO" hot and warm chosen for the whole object, "HWP" hot and warm chosen per partition (needs a partitioning). Warm storage needs an aDSO with active data or direct update and a system with a warm store.',
+              },
               label: { type: 'string', description: 'aDSO description text.' },
+            },
+          },
+          partitioning: {
+            type: 'object',
+            description: 'Partitioning to write (only for action "manage_partitions"). Replaces the existing partitioning; pass an empty object to remove it.',
+            properties: {
+              field: {
+                type: 'string',
+                description: 'Field the partitions are defined on, e.g. "FIELD_NAME". Must be a key field (any characteristic field in a data mart) and must not be a key figure.',
+              },
+              ranges: {
+                type: 'array',
+                description: 'Static range partitions in the order they are numbered. Bounds are values of the field in internal format (a month as "202601", a date as "20260131"); a classic BW release takes them in external format instead and says so when a bound is refused. A partition covers [low, high): the upper bound is exclusive, so the next partition starts at the previous upper bound. Overlapping ranges are refused.',
+                items: {
+                  type: 'object',
+                  properties: {
+                    low: { type: 'string', description: 'Lower bound of the partition.' },
+                    high: { type: 'string', description: 'Upper bound of the partition.' },
+                  },
+                  required: ['low', 'high'],
+                },
+              },
+              dynamic: {
+                type: 'boolean',
+                description: 'true lets the server create partitions as data arrives, instead of ranges. Needs a calendar or fiscal time characteristic or a field of type DATS, and is not available for direct update.',
+              },
+              granularity: {
+                type: 'string',
+                enum: ['0CALDAY', '0CALWEEK', '0CALMONTH', '0CALQUARTER', '0CALYEAR', '0FISCPER', '0FISCYEAR', '0FISCWEEK', '0FISCQRT'],
+                description: 'Granularity of dynamic partitions. Which ones are offered depends on the field (a month field offers month, quarter and year); the default is the year, or the week for week fields.',
+              },
             },
           },
           dimension: {
@@ -948,10 +986,11 @@ const TOOL_DEFINITIONS = [
     {
       name: 'bw_update_infoobject',
       description:
-        'Update a Characteristic InfoObject: change description, the lower case flag, and/or replace the attribute list. ' +
+        'Update a Characteristic InfoObject: description, the lower case flag, master data, text and hierarchy properties, and/or the attribute list. ' +
         'Supplying attributes replaces all existing ones (pass an empty array to remove all); omitting them leaves the list untouched. ' +
+        'An attribute can be any characteristic, time characteristic, unit or key figure; the compounding parents of an attribute and the unit InfoObject of a key figure attribute come along and are reported. ' +
         'Also supports Key Figure (KYF) updates: set fixed_unit or fixed_currency, or unit_currency_infoobject to take the unit/currency from a unit characteristic. ' +
-        'Sequence: lock → GET → PUT → activate → unlock — all in one call.',
+        'Sequence: lock → GET → PUT → activate → unlock — all in one call. When the activation is refused the answer says so with the server messages: the change then sits in the inactive version and the active one is unchanged.',
       inputSchema: {
         type: 'object',
         properties: {
@@ -990,6 +1029,32 @@ const TOOL_DEFINITIONS = [
               'KYF only. Unit characteristic that supplies the unit or currency per record (e.g. "0CURRENCY", "0UNIT"). ' +
               'Replaces a fixed unit/currency; excludes fixed_unit/fixed_currency.',
           },
+          with_master_data: {
+            type: 'boolean',
+            description: 'CHA only. Characteristic has master data (attributes). Switched on automatically with the first attribute; switching it off needs attributes: [] in the same call.',
+          },
+          with_texts: {
+            type: 'boolean',
+            description: 'CHA only. Characteristic has texts. Switching texts on selects the short text unless a text length is given.',
+          },
+          short_text: { type: 'boolean', description: 'CHA only. Short text (20 characters) exists.' },
+          medium_text: { type: 'boolean', description: 'CHA only. Medium text (40 characters) exists.' },
+          long_text: { type: 'boolean', description: 'CHA only. Long text (60 characters) exists.' },
+          extra_long_text: { type: 'boolean', description: 'CHA only. Long text is extra long (1333 characters); needs long_text.' },
+          texts_language_dependent: { type: 'boolean', description: 'CHA only. Texts are language-dependent.' },
+          texts_time_dependent: { type: 'boolean', description: 'CHA only. Texts are time-dependent.' },
+          with_hierarchies: {
+            type: 'boolean',
+            description: 'CHA only. Characteristic can have hierarchies. Needed before a hierarchy can be created for it.',
+          },
+          hierarchy_version_dependent: { type: 'boolean', description: 'CHA only. Hierarchies are version-dependent.' },
+          hierarchy_time_dependency: {
+            type: 'string',
+            enum: ['none', 'entire_hierarchy', 'structure'],
+            description: 'CHA only. Time dependency of the hierarchies: "none", "entire_hierarchy" (each hierarchy has a validity period) or "structure" (the nodes have validity periods).',
+          },
+          hierarchy_intervals: { type: 'boolean', description: 'CHA only. Intervals are permitted in hierarchies.' },
+          hierarchy_reverse_sign: { type: 'boolean', description: 'CHA only. The sign of nodes can be reversed.' },
           attributes: {
             type: 'array',
             description: 'New attribute list, replacing all existing ones. Pass [] to remove all attributes; omit to leave them unchanged.',
@@ -997,10 +1062,10 @@ const TOOL_DEFINITIONS = [
               type: 'object',
               properties: {
                 name: { type: 'string', description: 'Technical name of the referenced InfoObject (e.g. "ATTR_IOBJ_NAME").' },
-                type: { type: 'string', enum: ['DIS', 'NAV'], description: 'Attribute type: DIS (Display) or NAV (Navigation).' },
-                time_dependent: { type: 'boolean', description: 'Time-dependent attribute (NAV only, default false).' },
+                type: { type: 'string', enum: ['DIS', 'NAV'], description: 'Attribute type: DIS (Display) or NAV (Navigation). Only a characteristic or time characteristic that is not attribute-only can navigate; key figures and units are display attributes.' },
+                time_dependent: { type: 'boolean', description: 'Time-dependent attribute, display or navigation (default false).' },
                 display_in_query: { type: 'boolean', description: 'Display in query (default true).' },
-                use_text_of_original_characteristic: { type: 'boolean', description: 'Use text of original characteristic (default true).' },
+                use_text_of_original_characteristic: { type: 'boolean', description: 'Navigation attributes: use the text of the original characteristic (default true).' },
               },
               required: ['name', 'type'],
             },
@@ -3649,10 +3714,10 @@ const TOOL_DEFINITIONS = [
       description:
         'Change a CompositeProvider (HCPR): its fields, its source providers, their field mappings, the join condition, or root settings. ' +
         'Every action returns a lock_handle that must be passed to bw_activate (object type hcpr) — an HCPR cannot be activated without it. ' +
-        'Fields: "add_field" (default) adds an element plus a mapping in every part provider supplying it, taking the field metadata from there; "remove_field" removes the element and all mappings referencing it. ' +
-        'Sources: "add_input" attaches a source provider, creates the target elements it needs and returns the generated alias; "remove_input" strips one by alias, leaving its elements and any join reference behind. ' +
-        'Mappings: "update_mapping" replaces the complete mapping list of one input; pass no mappings to map every field of its source one to one. This is also how an input attached at creation time gets its mappings. ' +
-        'Joins: "update_join" sets the condition between one pair of inputs — call it once per pair to build an N-way join — and "remove_join" drops one pair. Note that both sides of a join key must be mapped onto the SAME target field, otherwise activation fails with "join fields need at least one common target field"; auto-mapping does not do this, so map the second side\'s key fields explicitly. ' +
+        'Fields: "add_field" (default) adds an element plus a mapping in every part provider supplying it, taking the field metadata from there; "remove_field" removes the element and all mappings referencing it, and refuses a field that is the common target of a join condition or the compounding parent of another field. A compounded field brings its compounding parent along wherever it is added or mapped. ' +
+        'Sources: "add_input" attaches a source provider, creates the target elements it needs and returns the generated alias; "remove_input" strips one by alias and leaves its fields in place, so a replacement input can feed them (auto-mapping reuses fields no input feeds). On a join node the condition has to be set again afterwards. ' +
+        'Mappings: "update_mapping" replaces the complete mapping list of one input; pass no mappings to map every field of its source one to one. This is also how an input attached at creation time gets its mappings. The result names fields that no input feeds any more. ' +
+        'Joins: "update_join" sets the condition between one pair of inputs — call it once per pair to build an N-way join — and "remove_join" drops one pair. Both sides of a join key need a common target field: update_join maps the right key onto the field the left key feeds (creating it if needed) and reports it; a key that leaves the condition goes back to being fed by the left input only, since in a join only a key field may be fed by both sides. ' +
         'Field groups and name usage: every field the tool creates goes into a field group (CHARACTERISTICS or KEYFIGURES unless dimension names another) and, when it is named after its InfoObject, uses that InfoObject directly by name — the form a query needs to find it. "update_fields" moves existing fields into a group and/or switches their name usage; "update_group" creates a group, changes its label or renames it. ' +
         'Navigation attributes: "update_navigation_attributes" switches navigation attributes of one InfoObject-bound field on or off. In a union every part provider that supplies the field must deliver the attribute too: an aDSO does, an aggregation level or another CompositeProvider only when it lists the attribute as a field; the result warns about parts that cannot. ' +
         'Settings: "update_settings" edits label, stackable, default node and aggregation behaviour.',
@@ -6873,6 +6938,7 @@ async function handleToolCall(
             uniqueDataRecords: s['unique_data_records'] as boolean | undefined,
             planningMode: s['planning_mode'] as boolean | undefined,
             writeInterface: s['write_interface'] as boolean | undefined,
+            temperatureSchema: s['temperature_schema'] as AdsoSettings['temperatureSchema'],
             label: s['label'] as string | undefined,
           };
           // Remove undefined keys so applied output is clean
@@ -6888,6 +6954,15 @@ async function handleToolCall(
             (args?.key_fields as string[]) ?? [],
             args?.transport as string | undefined
           );
+        } else if (args?.action === 'manage_partitions') {
+          const p = (args?.partitioning ?? {}) as Record<string, unknown>;
+          text = await bwUpdateAdsoPartitions(client, args?.adso_name as string, {
+            field: p['field'] as string | undefined,
+            ranges: p['ranges'] as PartitionSpec['ranges'],
+            dynamic: p['dynamic'] as boolean | undefined,
+            granularity: p['granularity'] as string | undefined,
+            transport: args?.transport as string | undefined,
+          });
         } else if (args?.action === 'add_pure_field') {
           const rawFields = (args?.fields as Array<Record<string, unknown>>) ?? [];
           const fieldDefs: FieldDef[] = rawFields.map((f) => ({
@@ -7029,6 +7104,19 @@ async function handleToolCall(
           fixed_unit: args?.fixed_unit as string | undefined,
           fixed_currency: args?.fixed_currency as string | undefined,
           unit_currency_infoobject: args?.unit_currency_infoobject as string | undefined,
+          with_master_data: args?.with_master_data as boolean | undefined,
+          with_texts: args?.with_texts as boolean | undefined,
+          short_text: args?.short_text as boolean | undefined,
+          medium_text: args?.medium_text as boolean | undefined,
+          long_text: args?.long_text as boolean | undefined,
+          extra_long_text: args?.extra_long_text as boolean | undefined,
+          texts_language_dependent: args?.texts_language_dependent as boolean | undefined,
+          texts_time_dependent: args?.texts_time_dependent as boolean | undefined,
+          with_hierarchies: args?.with_hierarchies as boolean | undefined,
+          hierarchy_version_dependent: args?.hierarchy_version_dependent as boolean | undefined,
+          hierarchy_time_dependency: args?.hierarchy_time_dependency as 'none' | 'entire_hierarchy' | 'structure' | undefined,
+          hierarchy_intervals: args?.hierarchy_intervals as boolean | undefined,
+          hierarchy_reverse_sign: args?.hierarchy_reverse_sign as boolean | undefined,
           transport: args?.transport as string | undefined,
         });
         break;

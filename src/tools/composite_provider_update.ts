@@ -13,6 +13,7 @@ import {
   directlyUsedNames,
   ensureGroupDeclared,
   groupRef,
+  joinKeyTargets,
   resolveGroup,
   resolveNameUsage,
   withGlobalElementName,
@@ -217,6 +218,7 @@ export async function bwUpdateCompositeProvider(
   const processed: string[] = [];
   const skipped: Array<{ field: string; reason: string }> = [];
   const mapped: Array<{ field: string; part_providers: string[] }> = [];
+  const compoundingParents: Array<{ field: string; parent: string }> = [];
 
   if (action === 'remove_field') {
     for (const field of fieldNames) {
@@ -224,6 +226,27 @@ export async function bwUpdateCompositeProvider(
       if (!findElement(head, field)) {
         skipped.push({ field, reason: `not present in CompositeProvider ${cpUpper}` });
         continue;
+      }
+      // A compounded field needs its compounding parent as a field of the CompositeProvider.
+      const children = [...head.matchAll(/<element\b[^>]*>[\s\S]*?<\/element>/g)]
+        .filter((e) => new RegExp(`<compoundInfoObject>#\\/\\/\\/[^<]*\\/${field}<\\/compoundInfoObject>`).test(e[0]))
+        .map((e) => attr(e[0].match(/<element\b[^>]*>/)?.[0] ?? '', 'name'))
+        .filter((name) => name && !fieldNames.includes(name));
+      if (children.length > 0) {
+        throw new Error(
+          `${field} is the compounding parent of ${children.join(', ')}; a compounded field needs it. ` +
+          'Remove the compounded fields in the same call, or first.',
+        );
+      }
+      // A join key pair needs a target field both sides are mapped onto; without it the
+      // CompositeProvider does not activate.
+      const carried = joinKeyTargets(xml).filter((k) => k.commonTargets.length === 1 && k.commonTargets[0] === field);
+      if (carried.length > 0) {
+        throw new Error(
+          `${field} is the common target field of the join condition ` +
+          carried.map((k) => `${k.leftKey} (${k.leftAlias}) = ${k.rightKey} (${k.rightAlias})`).join(', ') +
+          `; the join needs it. Remove or change the join condition first ("remove_join" or "update_join").`,
+        );
       }
       xml = removeCompositeElement(xml, field);
       processed.push(field);
@@ -261,10 +284,15 @@ export async function bwUpdateCompositeProvider(
       return result.body;
     };
 
-    for (const field of fieldNames) {
+    // A compounded field needs its compounding parent as a field of the CompositeProvider;
+    // the modeling tools add the parents along with it.
+    const queue = [...fieldNames];
+    const queuedParents = new Set<string>();
+    while (queue.length > 0) {
+      const field = queue.shift()!;
       const { head } = splitAtFirstInput(xml);
       if (findElement(head, field)) {
-        skipped.push({ field, reason: `already present in CompositeProvider ${cpUpper}` });
+        if (!queuedParents.has(field)) skipped.push({ field, reason: `already present in CompositeProvider ${cpUpper}` });
         continue;
       }
 
@@ -272,6 +300,19 @@ export async function bwUpdateCompositeProvider(
       for (const input of candidates) {
         const providerElement = findElement(await readProvider(input.providerName), field);
         if (providerElement) hits.push({ input, element: providerElement });
+      }
+
+      const missingParents = hits.length === 0 ? [] :
+        [...hits[0].element.matchAll(/<compoundInfoObject>#\/\/\/([^<]+)<\/compoundInfoObject>/g)]
+          .map((c) => c[1])
+          .filter((parent) => !findElement(head, parent) && !queuedParents.has(parent));
+      if (missingParents.length > 0) {
+        for (const parent of missingParents) {
+          queuedParents.add(parent);
+          compoundingParents.push({ field, parent });
+        }
+        queue.unshift(...missingParents, field);
+        continue;
       }
 
       if (hits.length === 0) {
@@ -320,13 +361,19 @@ export async function bwUpdateCompositeProvider(
   const verb = action === 'remove_field' ? 'removed from' : 'added to';
   const result: Record<string, unknown> = {
     success: true,
-    message: `${processed.join(', ')} ${verb} CompositeProvider ${cpUpper}. Call bw_activate to activate.`,
+    message:
+      `${processed.join(', ')} ${verb} CompositeProvider ${cpUpper}. Call bw_activate to activate.` +
+      (compoundingParents.length
+        ? ' Added along, since a compounded field needs its compounding parent: ' +
+          compoundingParents.map((c) => `${c.parent} (parent of ${c.field})`).join(', ') + '.'
+        : ''),
     lock_handle: lockHandle,
     composite_provider_name: cpUpper,
     object_type: 'hcpr',
     processed,
   };
   if (mapped.length > 0) result['mapped'] = mapped;
+  if (compoundingParents.length > 0) result['compounding_parents_added'] = compoundingParents;
   if (skipped.length > 0) result['skipped'] = skipped;
   return JSON.stringify(result);
 }

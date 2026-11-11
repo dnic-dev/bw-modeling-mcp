@@ -488,6 +488,42 @@ export function parseInfoObjectProps(xml: string): InfoObjectProps {
   };
 }
 
+/** What the editors need to know about an InfoObject before they use it as a field or an attribute. */
+export interface InfoObjectFacts {
+  name: string;
+  /** CHA, KYF, TIM, UNI or XXL. */
+  objectType: string;
+  /** Compounding parents of the InfoObject itself, in compounding order. */
+  compoundParents: string[];
+  compounded: boolean;
+  attributeOnly: boolean;
+  highCardinality: boolean;
+  /** Unit InfoObject of a key figure that takes its unit or currency per record. */
+  unitInfoObject?: string;
+  /** InfoObject this one references, if any; its attributes are then inherited and fixed. */
+  referencedInfoObject?: string;
+  xml: string;
+}
+
+export function parseInfoObjectFacts(name: string, xml: string): InfoObjectFacts {
+  const root = xml.match(/<\w+:infoObject\b[^>]*>/)?.[0] ?? '';
+  // An attribute carries the compounding parents of its own InfoObject; only the ones
+  // outside the attribute elements belong to this InfoObject.
+  const own = xml.replace(/<attributeN\b[^>]*[^/]>[\s\S]*?<\/attributeN>/g, '');
+  const compoundParents = [...own.matchAll(/<compoundParent\b[^>]*\bname="([^"]+)"/g)].map((m) => m[1].toUpperCase());
+  return {
+    name: name.toUpperCase(),
+    objectType: xml.match(/<infoObjectType>([^<]+)<\/infoObjectType>/)?.[1] ?? 'CHA',
+    compoundParents,
+    compounded: compoundParents.length > 0,
+    attributeOnly: /\battributeOnly="true"/.test(root),
+    highCardinality: /<highCardinality>true<\/highCardinality>/.test(xml),
+    unitInfoObject: xml.match(/<unitCurrencyInfoObjectRef\b[^>]*\bname="([^"]+)"/)?.[1]?.toUpperCase(),
+    referencedInfoObject: xml.match(/<referencedInfoObject\b[^>]*\bname="([^"]+)"/)?.[1]?.toUpperCase(),
+    xml,
+  };
+}
+
 // ── bwUpdateInfoObject ────────────────────────────────────────────────────────
 
 export interface AttributeDef {
@@ -507,23 +543,22 @@ export interface UpdateInfoObjectArgs {
   fixed_unit?: string;
   fixed_currency?: string;
   unit_currency_infoobject?: string;
+  with_master_data?: boolean;
+  with_texts?: boolean;
+  short_text?: boolean;
+  medium_text?: boolean;
+  long_text?: boolean;
+  extra_long_text?: boolean;
+  texts_language_dependent?: boolean;
+  texts_time_dependent?: boolean;
+  with_hierarchies?: boolean;
+  hierarchy_version_dependent?: boolean;
+  hierarchy_time_dependency?: 'none' | 'entire_hierarchy' | 'structure';
+  hierarchy_intervals?: boolean;
+  hierarchy_reverse_sign?: boolean;
   transport?: string;
 }
 
-/**
- * bw_update_infoobject — replace the attribute list of a Characteristic InfoObject.
- *
- * Flow:
- * 1. Lock (update — no activity_context)
- * 2. GET /iobj/{name}/m → current XML + timestamp
- * 3. Keep unchanged attributes; for new or retyped ones GET /iobj/{attr}/a → description,
- *    shortDescription, dataType, length
- * 4. Remove all existing <attributeN .../> elements
- * 5. Remove the <hanaAttributeMapping type="02"> blocks of dropped attributes
- * 6. Insert the <attributeN> elements before <runtimeProperties>
- * 8. PUT full XML with timestamp
- * 9. Activate + Unlock (unlock in finally)
- */
 /**
  * Set the description in the logon language only. The server serves one <texts> element per
  * maintained language (D, E, …); writing into the first one, as this tool used to, overwrote the
@@ -565,6 +600,175 @@ export function patchDescriptionInLogonLanguage(xml: string, description: string
   return xml;
 }
 
+/** Value of an attribute on the opening tag of the first element of that name. */
+function openTagAttr(xml: string, element: string, attr: string): string | undefined {
+  const open = xml.match(new RegExp(`<${element}\\b[^>]*>`))?.[0];
+  return open?.match(new RegExp(`\\b${attr}="([^"]*)"`))?.[1];
+}
+
+/** Set attributes on the opening tag of the first element of that name; the rest of it stays. */
+export function patchOpenTag(xml: string, element: string, attrs: Record<string, string | undefined>): string {
+  const re = new RegExp(`<${element}\\b[^>]*>`);
+  const open = xml.match(re)?.[0];
+  if (!open) return xml;
+  let patched = open;
+  for (const [attr, value] of Object.entries(attrs)) {
+    if (value === undefined) continue;
+    const existing = new RegExp(`\\b${attr}="[^"]*"`);
+    patched = existing.test(patched)
+      ? patched.replace(existing, `${attr}="${value}"`)
+      : patched.replace(/\s*(\/?>)$/, ` ${attr}="${value}"$1`);
+  }
+  return xml.replace(open, patched);
+}
+
+const HIERARCHY_TIME_DEPENDENCY: Record<string, string> = {
+  none: 'NONE',
+  entire_hierarchy: 'TIME_DEPENDENT',
+  structure: 'TIME_DEPENDENT_STRUCTURE',
+};
+
+/**
+ * Master data, text and hierarchy properties of a characteristic, with the rules of the
+ * modeling tools: switching texts on selects the short text when no text length is chosen,
+ * the extra long text goes with the long text, a hierarchy that is not time-dependent has
+ * no temporal join.
+ */
+export function applyCharacteristicProperties(xml: string, args: UpdateInfoObjectArgs): { xml: string; notes: string[] } {
+  const notes: string[] = [];
+  const bool = (v: boolean | undefined) => (v === undefined ? undefined : String(v));
+  const flag = (element: string, attr: string) => openTagAttr(xml, element, attr) === 'true';
+
+  if (args.with_master_data !== undefined) {
+    xml = patchOpenTag(xml, 'masterDataProperties', { withMasterData: String(args.with_master_data) });
+  }
+
+  const textArgs = [args.with_texts, args.short_text, args.medium_text, args.long_text, args.extra_long_text,
+    args.texts_language_dependent, args.texts_time_dependent];
+  if (textArgs.some((v) => v !== undefined)) {
+    const withTexts = args.with_texts ?? flag('textProperties', 'withTexts');
+    const lengths = {
+      shortTextAvailable: args.short_text ?? flag('textProperties', 'shortTextAvailable'),
+      mediumTextAvailable: args.medium_text ?? flag('textProperties', 'mediumTextAvailable'),
+      longTextAvailable: args.long_text ?? flag('textProperties', 'longTextAvailable'),
+    };
+    let extraLong = args.extra_long_text ?? flag('textProperties', 'longTextXLAvailable');
+    if (extraLong && !lengths.longTextAvailable) {
+      if (args.extra_long_text) {
+        throw new Error('extra_long_text needs the long text: pass long_text true as well.');
+      }
+      extraLong = false;
+      notes.push('The extra long text was switched off with the long text.');
+    }
+    const anyLength = lengths.shortTextAvailable || lengths.mediumTextAvailable || lengths.longTextAvailable;
+    if (!withTexts && [args.short_text, args.medium_text, args.long_text, args.extra_long_text,
+      args.texts_language_dependent, args.texts_time_dependent].some((v) => v === true)) {
+      throw new Error('The text settings need texts: pass with_texts true as well.');
+    }
+    if (withTexts && !anyLength) {
+      if ([args.short_text, args.medium_text, args.long_text].some((v) => v === false) && args.with_texts !== true) {
+        throw new Error('A characteristic with texts needs at least one text length (short_text, medium_text or long_text).');
+      }
+      lengths.shortTextAvailable = true;
+      notes.push('The short text was selected, since a characteristic with texts needs a text length.');
+    }
+    xml = patchOpenTag(xml, 'textProperties', {
+      withTexts: String(withTexts),
+      shortTextAvailable: String(withTexts && lengths.shortTextAvailable),
+      mediumTextAvailable: String(withTexts && lengths.mediumTextAvailable),
+      longTextAvailable: String(withTexts && lengths.longTextAvailable),
+      longTextXLAvailable: String(withTexts && extraLong),
+      languageDependentTextAvailable: withTexts ? bool(args.texts_language_dependent) : 'false',
+      timeDependentTextAvailable: withTexts ? bool(args.texts_time_dependent) : 'false',
+    });
+  }
+
+  const hierarchyArgs = [args.with_hierarchies, args.hierarchy_version_dependent, args.hierarchy_time_dependency,
+    args.hierarchy_intervals, args.hierarchy_reverse_sign];
+  if (hierarchyArgs.some((v) => v !== undefined)) {
+    const withHierarchies = args.with_hierarchies ?? flag('hierarchyProperties', 'withHierarchies');
+    if (!withHierarchies && (args.hierarchy_version_dependent || args.hierarchy_intervals || args.hierarchy_reverse_sign ||
+      (args.hierarchy_time_dependency !== undefined && args.hierarchy_time_dependency !== 'none'))) {
+      throw new Error('The hierarchy settings need hierarchies: pass with_hierarchies true as well.');
+    }
+    const timeDependency = args.hierarchy_time_dependency !== undefined
+      ? HIERARCHY_TIME_DEPENDENCY[args.hierarchy_time_dependency]
+      : undefined;
+    const structure = (timeDependency ?? openTagAttr(xml, 'hierarchyProperties', 'timeDependency')) === 'TIME_DEPENDENT_STRUCTURE';
+    xml = patchOpenTag(xml, 'hierarchyProperties', {
+      withHierarchies: String(withHierarchies),
+      versionDependent: withHierarchies ? bool(args.hierarchy_version_dependent) : 'false',
+      timeDependency: withHierarchies ? timeDependency : 'NONE',
+      invervalsPermitted: withHierarchies ? bool(args.hierarchy_intervals) : 'false',
+      reverseSignForNodes: withHierarchies ? bool(args.hierarchy_reverse_sign) : 'false',
+      // The temporal join exists for a time-dependent structure only.
+      temporalHierarchyJoin: !withHierarchies || !structure
+        ? (openTagAttr(xml, 'hierarchyProperties', 'temporalHierarchyJoin') !== undefined ? 'false' : undefined)
+        : undefined,
+    });
+  }
+  return { xml, notes };
+}
+
+/**
+ * One attribute element, self-closing or with child elements. The attribute part must not run
+ * over the slash of a self-closing tag, or that element swallows everything up to the closing
+ * tag of the next attribute that has children.
+ */
+const ATTRIBUTE_ELEMENT = /<attributeN\b(?:[^>/]|\/(?!>))*(?:\/>|>[\s\S]*?<\/attributeN>)/g;
+
+interface ActivationOutcome {
+  ok: boolean;
+  messages: string[];
+}
+
+/** Activate and say what the server said: an activation that fails returns a feed, not an HTTP error. */
+async function activateInfoObject(nameLower: string, lockHandle: string): Promise<ActivationOutcome> {
+  const feed = await createClientFromEnv().activate('iobj', nameLower, lockHandle);
+  const decode = (s: string) =>
+    s.replace(/&quot;/g, '"').replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&apos;/g, "'").replace(/&amp;/g, '&');
+  const entries = [...feed.matchAll(/<atom:entry>([\s\S]*?)<\/atom:entry>/g)].map((m) => ({
+    error: /messageType=["']Error["']/.test(m[1]),
+    text: decode(m[1].match(/<atom:title>([^<]*)<\/atom:title>/)?.[1] ?? ''),
+  }));
+  const failed = entries.some((e) => e.error) || /messageType=["']Error["']/.test(feed);
+  return {
+    ok: !failed,
+    messages: [...new Set((failed ? entries.filter((e) => e.error) : entries).map((e) => e.text).filter(Boolean))],
+  };
+}
+
+function notActivated(nameUpper: string, outcome: ActivationOutcome): string {
+  return JSON.stringify({
+    success: false,
+    name: nameUpper,
+    saved: true,
+    activated: false,
+    messages: outcome.messages,
+    message:
+      `InfoObject '${nameUpper}' was saved but not activated: ${outcome.messages.join(' ') || 'the activation reported an error.'} ` +
+      'The active version is unchanged; the inactive version holds the change. Correct it with another call.',
+  });
+}
+
+/**
+ * bw_update_infoobject — change a characteristic (attributes, master data, texts, hierarchies,
+ * description, lower case) or a key figure (unit, currency, description), then activate.
+ *
+ * Flow: lock → GET /m → apply → PUT → activate → unlock (in finally). The activation result is
+ * read: a refused activation leaves the change in the inactive version and is reported as such.
+ *
+ * Attributes follow the modeling tools:
+ * - an attribute that stays with the same type is kept as the server serves it; a new one, or
+ *   one whose type changes, is written as a new attribute and the server derives the rest;
+ * - the InfoObject type of the attribute comes from the attribute InfoObject (a key figure, a
+ *   unit or a time characteristic can be a display attribute);
+ * - a navigation attribute must be a characteristic or time characteristic that is not
+ *   attribute-only;
+ * - the compounding parents of an attribute and the unit InfoObject of a key figure attribute
+ *   come along as display attributes;
+ * - attributes need master data, which is switched on with the first attribute.
+ */
 export async function bwUpdateInfoObject(
   client: BwClient,
   args: UpdateInfoObjectArgs
@@ -574,10 +778,30 @@ export async function bwUpdateInfoObject(
   // Omitting attributes leaves the existing list untouched — otherwise a change to any
   // other property (description, lower_case) would silently drop every attribute.
   const replaceAttributes = args.attributes !== undefined;
-  const attributes = args.attributes ?? [];
+  const requested = (args.attributes ?? []).map((a) => ({ ...a, name: a.name.trim().toUpperCase() }));
+  const characteristicOnly: Array<[keyof UpdateInfoObjectArgs, string]> = [
+    ['lower_case', 'lower_case'], ['attributes', 'attributes'], ['with_master_data', 'with_master_data'],
+    ['with_texts', 'with_texts'], ['short_text', 'short_text'], ['medium_text', 'medium_text'], ['long_text', 'long_text'],
+    ['extra_long_text', 'extra_long_text'], ['texts_language_dependent', 'texts_language_dependent'],
+    ['texts_time_dependent', 'texts_time_dependent'], ['with_hierarchies', 'with_hierarchies'],
+    ['hierarchy_version_dependent', 'hierarchy_version_dependent'], ['hierarchy_time_dependency', 'hierarchy_time_dependency'],
+    ['hierarchy_intervals', 'hierarchy_intervals'], ['hierarchy_reverse_sign', 'hierarchy_reverse_sign'],
+  ];
+
+  if (replaceAttributes) {
+    const seen = new Set<string>();
+    for (const attr of requested) {
+      if (attr.name === nameUpper) throw new Error(`InfoObject '${nameUpper}' cannot be its own attribute.`);
+      if (seen.has(attr.name)) throw new Error(`Attribute ${attr.name} is listed twice.`);
+      seen.add(attr.name);
+    }
+  }
 
   // Step 1: Lock with the original client (holds the lock session)
   const lockHandle = await client.lock('iobj', nameLower, undefined, 'stateful_enqueue');
+  const notes: string[] = [];
+  const addedDependencies: Array<{ attribute: string; needed_by: string; as: string }> = [];
+  let attributes: AttributeDef[] = requested;
 
   try {
     // Step 2: GET current XML — fresh session to avoid SAP session state pollution
@@ -590,8 +814,9 @@ export async function bwUpdateInfoObject(
     const isKyf = /<infoObjectType>KYF<\/infoObjectType>/.test(xml);
     validateUnitCurrencyArgs(args, isKyf);
     if (isKyf) {
-      if (args.lower_case !== undefined) {
-        throw new Error(`InfoObject '${nameUpper}' is a Key Figure — lower_case applies to Characteristics (CHA) only.`);
+      const given = characteristicOnly.filter(([key]) => args[key] !== undefined).map(([, param]) => param);
+      if (given.length > 0) {
+        throw new Error(`InfoObject '${nameUpper}' is a Key Figure — ${given.join(', ')} appl${given.length === 1 ? 'ies' : 'y'} to Characteristics (CHA) only.`);
       }
       if (args.description) {
         xml = patchDescriptionInLogonLanguage(xml, args.description);
@@ -616,8 +841,8 @@ export async function bwUpdateInfoObject(
         xml = setUnitCurrencyReference(xml, args.unit_currency_infoobject);
       }
       await freshClient.put('iobj', nameLower, lockHandle, xml, timestamp, args.transport);
-      const activationClient = createClientFromEnv();
-      await activationClient.activate('iobj', nameLower, lockHandle);
+      const outcome = await activateInfoObject(nameLower, lockHandle);
+      if (!outcome.ok) return notActivated(nameUpper, outcome);
       return JSON.stringify({
         success: true,
         name: nameUpper,
@@ -625,74 +850,177 @@ export async function bwUpdateInfoObject(
       });
     }
 
-    // Step 3: Build the attribute elements. An attribute that stays with the same type is kept
-    // as the server serves it (BWMT does the same); a new one, or one whose type changes, is
-    // written in the form BWMT uses for a new attribute — for NAV too, the server derives the
-    // navigation properties itself on activation.
-    const existingAttributes = new Map(
-      [...xml.matchAll(/<attributeN\b[^>]*\/>/g)].map((m) => [m[0].match(/\bname="([^"]+)"/)?.[1] ?? '', m[0]])
-    );
-    const attrXmlParts: string[] = [];
-
-    for (const attr of attributes) {
-      const attrUpper = attr.name.toUpperCase();
-      const attrLower = attr.name.toLowerCase();
-
-      const existing = existingAttributes.get(attrUpper);
-      const overridden =
-        attr.displayInQuery !== undefined ||
-        attr.useTextOfOriginalCharacteristic !== undefined ||
-        attr.timeDependent !== undefined;
-      if (existing && existing.match(/\btype="([^"]+)"/)?.[1] === attr.type && !overridden) {
-        attrXmlParts.push(existing.replace(/\bref="[^"]*"/, `ref="${attrUpper}.iobj#//"`));
-        continue;
-      }
-
-      const attrGet = await freshClient.get(`/sap/bw/modeling/iobj/${bwSeg(attrLower)}/a`, MEDIA_TYPES['iobj']);
-      const attrXml = attrGet.body;
-      const props = parseInfoObjectProps(attrXml);
-      const longDescMatch = attrXml.match(/<longDescription>([^<]+)<\/longDescription>/);
-      const description = longDescMatch?.[1] ?? props.label;
-      const shortDescription = props.label;
-
-      const displayInQuery = attr.displayInQuery ?? true;
-      const useTextOfOrig = attr.useTextOfOriginalCharacteristic ?? true;
-      const timeDependent = attr.type === 'NAV' && (attr.timeDependent ?? false);
-      attrXmlParts.push(
-        `<attributeN` +
-        ` description="${description}"` +
-        ` infoObjectType="CHA"` +
-        ` name="${attrUpper}"` +
-        ` ref="../../${attrLower}/a/model.iobj#//"` +
-        ` shortDescription="${shortDescription}"` +
-        ` dataType="${props.dataType}"` +
-        ` displayInQuery="${displayInQuery}"` +
-        ` f4HelpOrder="0"` +
-        ` hasAttributes="false"` +
-        ` length="${props.length}"` +
-        ` partOfIndex="false"` +
-        ` sidKeyFigure="false"` +
-        (timeDependent ? ` timeDependent="true"` : '') +
-        ` type="${attr.type}"` +
-        ` useTextOfOriginalCharacteristic="${useTextOfOrig}"/>`
-      );
+    const own = parseInfoObjectFacts(nameUpper, xml);
+    // The server serves a compounded attribute with its compounding parents as child elements.
+    // Those are derived and are not accepted back, so an attribute is kept as its opening tag
+    // only; the parents are remembered for the dependency rules below.
+    const existingAttributes = new Map<string, string>();
+    const existingParents = new Map<string, string[]>();
+    for (const m of xml.matchAll(ATTRIBUTE_ELEMENT)) {
+      const open = m[0].match(/^<attributeN\b[^>]*>/)?.[0] ?? m[0];
+      const name = open.match(/\bname="([^"]+)"/)?.[1] ?? '';
+      existingAttributes.set(name, open.endsWith('/>') ? open : open.replace(/>$/, '/>'));
+      existingParents.set(name, [...m[0].matchAll(/<compoundParent\b[^>]*\bname="([^"]+)"/g)].map((p) => p[1].toUpperCase()));
     }
 
-    if (replaceAttributes) {
-      // Step 4: Remove all existing <attributeN .../> self-closing elements
-      xml = xml.replace(/\s*<attributeN\b[^>]*\/>/g, '');
+    // Step 3: Master data, texts, hierarchies
+    const withMasterDataNow = openTagAttr(xml, 'masterDataProperties', 'withMasterData') === 'true';
+    if (args.with_master_data === false) {
+      const remaining = replaceAttributes ? requested.length : existingAttributes.size;
+      if (remaining > 0) {
+        throw new Error(
+          `InfoObject '${nameUpper}' has ${remaining} attribute(s), which need master data. ` +
+          'Pass attributes: [] in the same call to remove them with the master data.',
+        );
+      }
+    }
+    const props = applyCharacteristicProperties(xml, args);
+    xml = props.xml;
+    notes.push(...props.notes);
 
-      // Step 5: The server keeps one hanaAttributeMapping type="02" block per attribute and
+    // Step 4: Build the attribute elements.
+    const attrXmlParts: string[] = [];
+    if (replaceAttributes) {
+      const changesList =
+        requested.length !== existingAttributes.size || requested.some((a) => !existingAttributes.has(a.name));
+      if (own.referencedInfoObject && changesList) {
+        throw new Error(
+          `InfoObject '${nameUpper}' references ${own.referencedInfoObject} and takes its attributes from there; ` +
+          'attributes cannot be added or removed here. Change them on the referenced InfoObject.',
+        );
+      }
+
+      // The modeling tools bring along what an attribute cannot stand without.
+      const facts = new Map<string, InfoObjectFacts>();
+      const readFacts = async (name: string): Promise<InfoObjectFacts> => {
+        let f = facts.get(name);
+        if (!f) {
+          const got = await freshClient.get(`/sap/bw/modeling/iobj/${bwSeg(name.toLowerCase())}/a`, MEDIA_TYPES['iobj']);
+          f = parseInfoObjectFacts(name, got.body);
+          facts.set(name, f);
+        }
+        return f;
+      };
+      const listed = new Set(requested.map((a) => a.name));
+      const complete: AttributeDef[] = [];
+      const parentsOf = async (name: string): Promise<string[]> =>
+        existingParents.get(name) ?? (await readFacts(name)).compoundParents;
+      for (const attr of requested) {
+        const dependencies: Array<[string, string]> =
+          (await parentsOf(attr.name)).map((p) => [p, 'compounding parent'] as [string, string]);
+        if (!existingAttributes.has(attr.name)) {
+          const f = await readFacts(attr.name);
+          if (f.objectType === 'KYF' && f.unitInfoObject) dependencies.push([f.unitInfoObject, 'unit or currency']);
+        }
+        for (const [dependency, as] of dependencies) {
+          if (listed.has(dependency) || dependency === nameUpper) continue;
+          // The compounding parent of a navigation attribute has to navigate as well.
+          complete.push({ name: dependency, type: as === 'compounding parent' && attr.type === 'NAV' ? 'NAV' : 'DIS' });
+          listed.add(dependency);
+          addedDependencies.push({ attribute: dependency, needed_by: attr.name, as });
+        }
+        complete.push(attr);
+      }
+      attributes = complete;
+      for (const attr of attributes.filter((a) => a.type === 'NAV')) {
+        const displayParents = (await parentsOf(attr.name)).filter((p) =>
+          p !== nameUpper && attributes.find((a) => a.name === p)?.type !== 'NAV');
+        if (displayParents.length > 0) {
+          throw new Error(
+            `${attr.name} is compounded to ${displayParents.join(', ')}: a navigation attribute needs its compounding ` +
+            `parent as navigation attribute too. List ${displayParents.join(', ')} with type "NAV" as well.`,
+          );
+        }
+      }
+
+      for (const attr of attributes) {
+        const attrLower = attr.name.toLowerCase();
+        const existing = existingAttributes.get(attr.name);
+        const existingType = existing?.match(/\btype="([^"]+)"/)?.[1] ?? (existing ? 'DIS' : undefined);
+
+        if (attr.type === 'NAV' && existingType !== 'NAV') {
+          const f = await readFacts(attr.name);
+          if (f.objectType !== 'CHA' && f.objectType !== 'TIM') {
+            throw new Error(
+              `${attr.name} cannot be a navigation attribute: it is a ${f.objectType} InfoObject, and only ` +
+              'characteristics and time characteristics navigate. Use type "DIS".',
+            );
+          }
+          if (f.attributeOnly) {
+            throw new Error(
+              `${attr.name} cannot be a navigation attribute: the InfoObject is defined as attribute only. Use type "DIS".`,
+            );
+          }
+        }
+
+        const overridden =
+          attr.displayInQuery !== undefined ||
+          attr.useTextOfOriginalCharacteristic !== undefined ||
+          attr.timeDependent !== undefined;
+        if (existing && existingType === attr.type && !overridden) {
+          attrXmlParts.push(existing.replace(/\bref="[^"]*"/, `ref="${attr.name}.iobj#//"`));
+          continue;
+        }
+        if (existing && existingType === attr.type) {
+          // Same attribute, same type: only the properties named change.
+          let patched = existing.replace(/\bref="[^"]*"/, `ref="${attr.name}.iobj#//"`);
+          const set = (key: string, value: boolean | undefined) => {
+            if (value === undefined) return;
+            patched = new RegExp(`\\b${key}="[^"]*"`).test(patched)
+              ? patched.replace(new RegExp(`\\b${key}="[^"]*"`), `${key}="${value}"`)
+              : patched.replace(/^<attributeN\b/, `<attributeN ${key}="${value}"`);
+          };
+          set('timeDependent', attr.timeDependent);
+          set('displayInQuery', attr.displayInQuery);
+          if (attr.type === 'NAV') set('useTextOfOriginalCharacteristic', attr.useTextOfOriginalCharacteristic);
+          attrXmlParts.push(patched);
+          continue;
+        }
+
+        const f = await readFacts(attr.name);
+        const propsOfAttr = parseInfoObjectProps(f.xml);
+        const esc = (s: string) => s.replace(/"/g, '&quot;');
+        const description = f.xml.match(/<longDescription>([^<]+)<\/longDescription>/)?.[1] ?? propsOfAttr.label;
+        const lengthAttr = /<length>[^<]+<\/length>/.test(f.xml) ? ` length="${propsOfAttr.length}"` : '';
+        attrXmlParts.push(
+          `<attributeN` +
+          ` description="${esc(description)}"` +
+          ` infoObjectType="${f.objectType}"` +
+          ` name="${attr.name}"` +
+          ` ref="../../${attrLower}/a/model.iobj#//"` +
+          ` shortDescription="${esc(propsOfAttr.label)}"` +
+          ` dataType="${propsOfAttr.dataType}"` +
+          ` displayInQuery="${attr.displayInQuery ?? true}"` +
+          ` f4HelpOrder="0"` +
+          ` hasAttributes="false"` +
+          lengthAttr +
+          ` partOfIndex="false"` +
+          ` sidKeyFigure="false"` +
+          (attr.timeDependent ? ` timeDependent="true"` : '') +
+          ` type="${attr.type}"` +
+          ` useTextOfOriginalCharacteristic="${attr.useTextOfOriginalCharacteristic ?? true}"/>`
+        );
+      }
+
+      if (attributes.length > 0 && args.with_master_data === undefined && !withMasterDataNow) {
+        xml = patchOpenTag(xml, 'masterDataProperties', { withMasterData: 'true' });
+        notes.push('Master data was switched on, since attributes need it.');
+      }
+
+      // Step 5: Remove all existing attribute elements
+      xml = xml.replace(new RegExp(`\\s*${ATTRIBUTE_ELEMENT.source}`, 'g'), '');
+
+      // Step 6: The server keeps one hanaAttributeMapping type="02" block per attribute and
       // adds the blocks of new attributes itself on activation, as BWMT relies on. A single
       // block listing several attributes, as this tool used to write, fails the save; only
       // the blocks of dropped attributes are removed here.
-      const kept = new Set(attributes.map((a) => a.name.toUpperCase()));
+      const kept = new Set(attributes.map((a) => a.name));
       xml = xml.replace(/\s*<hanaAttributeMapping type="02">([\s\S]*?)<\/hanaAttributeMapping>/g, (block, body: string) => {
         const name = body.match(/<sourceField\b[^>]*\bname="([^"]+)"/)?.[1];
         return name && kept.has(name) ? block : '';
       });
 
-      // Step 6: Insert new attributeN elements before <runtimeProperties
+      // Step 7: Insert new attributeN elements before <runtimeProperties
       if (attrXmlParts.length > 0) {
         const attrBlock = attrXmlParts.join('\n') + '\n';
         xml = xml.replace(/(<runtimeProperties)/, attrBlock + '$1');
@@ -712,8 +1040,8 @@ export async function bwUpdateInfoObject(
     await freshClient.put('iobj', nameLower, lockHandle, xml, timestamp, args.transport);
 
     // Step 9: Activate — another fresh session (mirrors TRFN pattern)
-    const activationClient = createClientFromEnv();
-    await activationClient.activate('iobj', nameLower, lockHandle);
+    const outcome = await activateInfoObject(nameLower, lockHandle);
+    if (!outcome.ok) return notActivated(nameUpper, outcome);
   } finally {
     // Unlock with the original lock-session client
     await client.unlock('iobj', nameLower).catch(() => undefined);
@@ -723,16 +1051,29 @@ export async function bwUpdateInfoObject(
   if (replaceAttributes) changes.push(`${attributes.length} attribute(s)`);
   if (args.lower_case !== undefined) changes.push(`lowerCase=${args.lower_case}`);
   if (args.description) changes.push('description');
+  if (args.with_master_data !== undefined) changes.push(`master data ${args.with_master_data ? 'on' : 'off'}`);
+  if ([args.with_texts, args.short_text, args.medium_text, args.long_text, args.extra_long_text,
+    args.texts_language_dependent, args.texts_time_dependent].some((v) => v !== undefined)) changes.push('text properties');
+  if ([args.with_hierarchies, args.hierarchy_version_dependent, args.hierarchy_time_dependency,
+    args.hierarchy_intervals, args.hierarchy_reverse_sign].some((v) => v !== undefined)) changes.push('hierarchy properties');
 
   const result: Record<string, unknown> = { success: true, name: nameUpper };
   if (replaceAttributes) {
     result['attributeCount'] = attributes.length;
-    result['attributes'] = attributes.map((a) => ({ name: a.name.toUpperCase(), type: a.type }));
+    result['attributes'] = attributes.map((a) => ({ name: a.name, type: a.type }));
+  }
+  if (addedDependencies.length > 0) {
+    result['added_dependencies'] = addedDependencies;
+    notes.push(
+      'Also added as attributes: ' +
+      addedDependencies.map((d) => `${d.attribute} (${d.as} of ${d.needed_by})`).join(', ') + '.',
+    );
   }
   if (args.lower_case !== undefined) result['lowerCase'] = args.lower_case;
   result['message'] =
     `InfoObject '${nameUpper}' updated and activated` +
-    (changes.length > 0 ? ` (${changes.join(', ')}).` : '.');
+    (changes.length > 0 ? ` (${changes.join(', ')}).` : '.') +
+    (notes.length > 0 ? ` ${notes.join(' ')}` : '');
 
   return JSON.stringify(result);
 }
