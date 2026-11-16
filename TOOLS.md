@@ -41,7 +41,7 @@ full list keeps working.
 | `bw_write_infoobject` | `operation` | `create` (create_infoobject), `update` (update_infoobject), `create_hierarchy` (create_hierarchy), `update_hierarchy` (update_hierarchy), `delete_hierarchy` (delete_hierarchy) |
 | `bw_write_infosource` | `operation` | `create` (create_infosource), `update` (update_infosource) |
 | `bw_write_composite_provider` | `operation` | `create` (create_composite_provider), `update` (update_composite_provider) |
-| `bw_write_transformation` | `operation` | `create` (create_transformation), `update_rule` (update_transformation), `set_routine` (set_transformation_routine), `set_expert_routine` (set_transformation_expert_routine), `set_routine_fields` (set_transformation_routine_fields), `delete_routine` (delete_transformation_routine), `set_runtime` (set_transformation_runtime) |
+| `bw_write_transformation` | `operation` | `create` (create_transformation), `update_rule` (update_transformation), `set_routine` (set_transformation_routine), `set_expert_routine` (set_transformation_expert_routine), `set_routine_fields` (set_transformation_routine_fields), `delete_routine` (delete_transformation_routine), `set_runtime` (set_transformation_runtime), `update_settings` (update_transformation_settings), `rule_group` (update_transformation_rule_group) |
 | `bw_write_dtp` | `operation` | `create` (create_dtp), `update` (update_dtp), `set_filter_routine` (set_dtp_filter_routine) |
 | `bw_write_datasource` | `operation` | `create` (create_datasource), `set_fields` (set_datasource_fields), `change_delta` (change_datasource_delta) |
 | `bw_write_open_hub` | `operation` | `create` (create_open_hub), `update` (update_open_hub) |
@@ -60,7 +60,7 @@ full list keeps working.
 - [InfoObject & Hierarchies](#infoobject--hierarchies) — 7 tools
 - [InfoArea, Packages & Transports](#infoarea-packages--transports) — 6 tools
 - [InfoSource](#infosource) — 3 tools
-- [Transformation](#transformation) — 8 tools
+- [Transformation](#transformation) — 10 tools
 - [DTP (Data Transfer Process)](#dtp-data-transfer-process) — 6 tools
 - [DataSource & Source Systems](#datasource--source-systems) — 9 tools
 - [CompositeProvider](#compositeprovider) — 3 tools
@@ -151,6 +151,8 @@ Read an InfoObject definition (Characteristic or Key Figure).
 Create a new InfoObject. Supports:
 - **Characteristic (CHA):** all data types (CHAR, NUMC, DATS, TIMS, SNUMC), with or without master data and texts, with compound parent InfoObjects, with referenced InfoObject, and the lower case flag (`lower_case`)
 - **Key Figure (KYF):** all types (NUM, AMT, QTY, DAT, INT), all aggregations (SUM, MAX, MIN)
+- **Unit (UNI):** a currency or a unit of measure InfoObject (`unit_type`), which a key figure takes its unit or currency from
+- **XXL:** an InfoObject for long text or binary content (`xxl_data_type` STRG, SSTR or RSTR, `mime_type`), used as XXL attribute of a characteristic
 
 Created as inactive — activate with `bw_activate`.
 
@@ -179,6 +181,12 @@ InfoObject of a key figure attribute come along and are reported. Master data (`
 (`with_texts`, `short_text`, `medium_text`, `long_text`, `extra_long_text`, `texts_language_dependent`,
 `texts_time_dependent`) and hierarchies (`with_hierarchies`, `hierarchy_version_dependent`,
 `hierarchy_time_dependency`, `hierarchy_intervals`, `hierarchy_reverse_sign`) are switched per parameter.
+
+Further settings of a **characteristic**: `data_type`, `length`, `output_length` and `conversion_routine`; `compound_infoobjects`, the complete list of compounding parents; the switches `high_cardinality`, `authorization_relevant` and `attribute_only`; `display` and the three filter value settings of a query (`filter_values_query_definition`, `filter_values_query_execution`, `filter_value_display`); `xxl_attributes`, the complete list of XXL attributes. A navigation attribute takes texts of its own (`navigation_description`, `navigation_short_description`), `authorization_relevant` and its position in the value help (`f4_help_order`).
+
+Further settings of a **key figure**: `aggregation` (SUM, MIN, MAX, NO2), `exception_aggregation` with `exception_aggregation_reference`, `data_type`, `high_precision`, `decimal_places` and `display_scaling`. The rules of the modeling tools apply before anything is written: a date or time key figure only takes the minimum or the maximum, an exception aggregation differs from the standard aggregation and needs its reference characteristic, a key figure without aggregation has none, and each key figure type has its two data types.
+
+Whether a change of data type, length or compounding is possible with the data that exists is decided by the activation; a refused activation is reported with the server's messages.
 
 The call saves and activates. When BW refuses the activation, the answer says so with the server's
 messages: the change is then saved in the inactive version and the active version is unchanged.
@@ -255,11 +263,14 @@ Modify field mappings in an existing Transformation, changing the type of the ru
 - Map a source field to a target field (StepDirect). A target that is a time characteristic gets a time conversion (StepTime) instead — the only assignment the modeling tools offer there; `rule_type: "time"` asks for one explicitly and is refused for any other target. Whether the two time characteristics convert into each other (a month from a day, a year from a month) is checked by the server on activation
 - Convert a rule to an AMDP field routine (StepRoutine) from any type. Every source field the rule has stays and is wired into the routine; `source_field` and `additional_source_fields` add further ones, and a rule without any source needs `source_field`. A rule that already is a routine keeps its class and method, which is how source fields are added to an existing routine
 - Set a constant (StepConstant) on a target field from any rule type
+- Derive the record mode from an ODP delta with `rule_type: "odq_mode"` (StepODQMode): the record mode target is filled from the change mode and the entity counter fields the DataSource delivers. This is the rule the server proposes for such a source; the rule type puts it back after the record mode was set to something else, and a rule of this type can be changed to any other. Refused for any other target and for a source that lacks one of the two fields
 - Read a value from an InfoObject or a DataStore object (StepRead, lookup). The read step gets one input per key field of the lookup object, each bound to a source field, as the read dialog of the modeling tools does: a key field takes the source field of its own name, `lookup_key_mapping` names the others, and `source_field` alone feeds the InfoObject itself or the one key still open. A key without a source is refused before anything is written, because the activation check would refuse it. A DataStore object can be read from only with direct update, or with activation and a change log (a staging aDSO without change log cannot); the tool refuses any other before anything is written, with the reason
+- Options of a lookup: for an InfoObject with time-dependent attributes `lookup_time_dependency` chooses the key date — the date of the load (`current_date`, the default), a fixed date (`constant_date` with `lookup_time_value` as YYYYMMDD), or a date from the record (`start` / `end` with `lookup_time_value` naming the source field, which becomes a further input of the rule). For a DataStore object `lookup_error_handling` chooses what happens when nothing is found: an error message, or a constant given in `lookup_error_constant`. An option that does not apply to the lookup object is refused
 - Remove a mapping with `rule_type: "no_update"`: a key field becomes StepInitial (filled with its initial value), any other field StepNoUpdate — the only reset the modeling tools offer for either kind
 - A rule that maps a key figure together with its unit or currency keeps the unit half when the key figure's type changes — BW couples the two as soon as the transformation allows currency and unit handling; the unit half itself is changed through the key figure, or given a rule of its own by mapping the key figure without `unit_source_field`. A rule with a currency or unit conversion step is refused until the conversion is removed. A field that had no mapping and gets one is added to the field list of the END routine, when there is one
 - Set or change the formula rule of a target field (StepFormula) — every operand of the expression is registered as a source of the rule, so a formula over several source fields works, and the formula text of an existing formula rule can be replaced
 - On a key figure with a currency or unit, a direct, formula or constant rule takes the value over unconverted. With `conversion` a direct rule converts it instead — `type` `"currency"` with a currency translation type or `"unit"` with a unit conversion type, given as `name`. The name is checked against the conversion types defined on the system; the source currency or unit comes from `source_unit_field`, else from the source key figure's own unit reference, and a conversion type with a fixed source needs neither
+- `conversion` also goes with `rule_type: "formula"` and `"routine"`: the value is converted behind the formula or routine, and a converting rule that becomes a formula or routine keeps its conversion. A source key figure with a fixed currency or unit supplies it itself. A conversion type that ends in another currency or unit than the fixed one of the target is refused, and a conversion the server does not keep is reported as a failure, not as a success
 - Set the aggregation type of a rule into a target key figure with `aggregation`: `SUM` (summation), `MOV` (overwrite), `MIN`, `MAX` or `NOP` (no aggregation). It decides what happens when several source records end up in one target record — in an aggregating transformation a key figure on `MOV` keeps one record per group without any error. Given with only `transformation_name` and `target_infoobject`, it changes the aggregation and leaves the rule as it is; given with a rule change, both are saved together. Possible values are `MOV`, `NOP` and the key figure's own aggregation (`SUM` for a key figure without one): `MIN` or `MAX` only for a key figure that aggregates that way, and `MOV` not into a data mart DataStore object; BW would otherwise keep a different value without a message, so anything else is refused with the possible values. A characteristic, an unknown field and a target field whose aggregation the target fixes are refused
 
 ### `bw_set_transformation_routine`
@@ -269,13 +280,31 @@ Set a field routine, start routine, or end routine on a Transformation. Supports
 Write the code of an existing Start/End/Expert routine into the Transformation master so it survives activation and transport. Unlike a raw `WriteSource` on the generated class, this re-saves the master and keeps the routine code transport-stable.
 
 ### `bw_set_transformation_routine_fields`
-Edit the list of target fields the global END routine writes ("Felder setzen" in the SAP GUI). Requires an existing END routine. Pass exactly one of `fields` (the complete set the routine should write) or `exclude_fields` (all target fields except these); neither, both, an unknown field name, or an empty resolved set is rejected. Does not activate — returns a `lock_handle` for `bw_activate`.
+Edit the list of target fields the global END routine writes. Requires an existing END routine. Pass exactly one of `fields` (the complete set the routine should write) or `exclude_fields` (all target fields except these); neither, both, an unknown field name, or an empty resolved set is rejected. Does not activate — returns a `lock_handle` for `bw_activate`. With `routine_type: "start"` the list is the source fields the START routine reads; BW keeps every source field a rule reads in that list, and the answer names the ones it kept.
 
 ### `bw_delete_transformation_routine`
 Remove an existing routine from a Transformation field.
 
 ### `bw_set_transformation_runtime`
 Switch the Transformation runtime between ABAP and HANA (AMDP). The current runtime is read from the active version, the change is activated automatically, and the result is verified against the active version — no separate `bw_activate` call is needed. If the switch does not persist (e.g. the server refuses HANA runtime for this transformation), the tool returns an error instead of a false-positive success.
+
+### `bw_update_transformation_settings`
+Change the settings of a Transformation that are not rules. Only what is passed changes, and nothing is saved when every value is already in place:
+- The switches of the transformation: `initialize_null_values` (null values of the source arrive as initial values), `enable_inverse_routines`, `error_handling_in_routines`
+- `allow_currency_unit_conversion`, the currency and unit handling. BW keeps a key figure and its unit or currency field in one rule while it is on and in two while it is off, and resets every rule that is in the other form when the switch alone is flipped. The tool therefore reshapes the rules in the same save: switching on merges the rule of the unit into the rule of its key figure, switching off gives the unit a rule of its own from the field it was filled from and drops conversions. The answer lists each of these changes
+- `target_options` per target field: `perform_conversion_exit` — for a field with a conversion routine, and not while its rule leaves it without update — and `master_data_check`, for a field BW names a master data object for; `rule_description` sets the description of the rule that fills the field
+- `semantic_group_fields`: the complete list of source fields the extraction is grouped by, so records with the same values in them stay in one package; an empty list removes the grouping
+
+Returns `lock_handle` for `bw_activate`.
+
+### `bw_update_transformation_rule_group`
+Add, rename or remove a rule group of a Transformation, or list its groups. A rule group is a further set of rules on the same source and target; every group writes its own records, which is how one source record becomes several target records.
+- `action: "add"` with `description`: the key fields of the new group follow the rules of the standard group, every other field starts without a mapping
+- The rules of a group are set with `bw_update_transformation` and its `rule_group` parameter; a field that still follows the standard group gets a rule of its own by the change, and `action: "use_standard_rule"` with `target` makes it follow the standard group again
+- `action: "rename"` and `action: "remove"` take `group`, the description or the id of the group. The standard group, the technical group and the group of the global routines are not removed
+- `bw_get_transformation` names the groups and marks each of their rules
+
+Returns `lock_handle` for `bw_activate`.
 
 ---
 
