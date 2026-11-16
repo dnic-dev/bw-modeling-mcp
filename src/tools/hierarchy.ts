@@ -1,4 +1,5 @@
-import { BwClient, createClientFromEnv } from '../bw-client.js';
+import { BwClient, createClientFromEnv, MEDIA_TYPES, bwSeg } from '../bw-client.js';
+import { parseInfoObjectProps } from './infoobject.js';
 
 /**
  * Characteristic hierarchies through the BW/4HANA data API (/sap/bc/http/sap/bw4/v1/data),
@@ -260,12 +261,52 @@ export interface ChangeRecord {
  * then every node with a child or a next sibling changed to its final links. Node ids start at
  * `firstId`, so a replacement tree does not reuse the ids of the nodes it removes.
  */
+/** How the values of a characteristic are keyed: conversion routine, data type and length. */
+export interface NodeKeyFormat {
+  conversionRoutine: string;
+  dataType: string;
+  length: number;
+}
+
+// Text nodes are values of 0HIER_NODE, which converts with ALPHA at 32 characters.
+const TEXT_NODE_FORMAT: NodeKeyFormat = { conversionRoutine: 'ALPHA', dataType: 'CHAR', length: 32 };
+
+/**
+ * A node name in the internal form the hierarchy stores. A name of digits only is filled with
+ * leading zeros under ALPHA (and for NUMC); the activation refuses it otherwise. Any other
+ * name, and a name already at full length, is kept.
+ */
+export function internalNodeName(name: string, format?: NodeKeyFormat): string {
+  if (!format || !/^\d+$/.test(name) || name.length >= format.length) return name;
+  return format.conversionRoutine === 'ALPHA' || format.dataType === 'NUMC' ? name.padStart(format.length, '0') : name;
+}
+
+async function readNodeKeyFormat(client: BwClient, characteristic: string): Promise<NodeKeyFormat | undefined> {
+  try {
+    const { body } = await client.get(`/sap/bw/modeling/iobj/${bwSeg(characteristic.toLowerCase())}/a`, MEDIA_TYPES['iobj']);
+    const props = parseInfoObjectProps(body);
+    const length = Number(props.length);
+    return Number.isFinite(length) && length > 0
+      ? { conversionRoutine: props.conversionRoutine.toUpperCase(), dataType: props.dataType.toUpperCase(), length }
+      : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
 export function buildChangeLog(
   hieid: string,
   characteristic: string,
   roots: HierarchyNodeInput[],
   firstId = 1,
+  valueFormat?: NodeKeyFormat,
 ): ChangeRecord[] {
+  const nameOf = (input: HierarchyNodeInput): string => {
+    const raw = String(input.text_node !== undefined ? input.text_node : input.value).trim();
+    return input.text_node !== undefined
+      ? internalNodeName(raw.toUpperCase(), TEXT_NODE_FORMAT)
+      : internalNodeName(raw, valueFormat);
+  };
   interface Flat { id: number; input: HierarchyNodeInput; level: number; parent: number; child: number; next: number }
   const flat: Flat[] = [];
   const names = new Set<string>();
@@ -277,7 +318,7 @@ export function buildChangeLog(
       if (isText === (input.value !== undefined)) {
         throw new Error('Each node needs exactly one of text_node or value.');
       }
-      const name = String(isText ? input.text_node : input.value).trim();
+      const name = nameOf(input);
       if (!name) throw new Error('A node name or value may not be empty.');
       const key = `${isText ? TEXT_NODE : characteristic}/${name.toUpperCase()}`;
       if (names.has(key)) throw new Error(`Node ${name} occurs twice; a node may appear only once in a hierarchy.`);
@@ -295,14 +336,14 @@ export function buildChangeLog(
 
   const record = (f: Flat, action: 'I' | 'C'): ChangeRecord => {
     const isText = f.input.text_node !== undefined;
-    const name = String(isText ? f.input.text_node : f.input.value).trim();
-    const text = isText ? (f.input.text ?? name.toUpperCase()) : '';
+    const name = nameOf(f.input);
+    const text = isText ? (f.input.text ?? String(f.input.text_node).trim().toUpperCase()) : '';
     return {
       ACTION: action,
       HIEID: hieid,
       OBJVERS: 'M',
       NODEID: String(f.id),
-      NODENAME: isText ? name.toUpperCase() : name,
+      NODENAME: name,
       IOBJNM: isText ? TEXT_NODE : characteristic,
       NODEDESCRIPTION: text,
       TXTSH: text.slice(0, 20),
@@ -324,7 +365,20 @@ export function buildChangeLog(
 
 /** Delete records for the nodes a hierarchy has now, as the app writes them when a node is cut. */
 export function deleteRecords(hieid: string, rows: HierarchyNodeRow[]): ChangeRecord[] {
-  return rows.map((r) => ({
+  // The server repairs the sibling chain around every node it removes and dumps when a link
+  // leads to a node that is already gone, so nodes go bottom-up: children before their parent,
+  // the last sibling first.
+  const { roots, children } = buildTree(rows);
+  const ordered: HierarchyNodeRow[] = [];
+  const visit = (nodes: HierarchyNodeRow[]) => {
+    for (const n of [...nodes].reverse()) {
+      visit(children.get(String(Number(n.NODEID))) ?? []);
+      ordered.push(n);
+    }
+  };
+  visit(roots);
+  const reached = new Set(ordered);
+  return [...rows.filter((r) => !reached.has(r)), ...ordered].map((r) => ({
     ACTION: 'D' as const,
     HIEID: hieid,
     OBJVERS: 'M' as const,
@@ -392,7 +446,7 @@ export async function bwCreateHierarchy(client: BwClient, args: CreateHierarchyA
     // A failed node write leaves an empty revised hierarchy behind; it is removed again.
     const discard = () => session.rawDelete(base, write).catch(() => {/* best effort */});
 
-    const log = buildChangeLog(hieid, cha, args.nodes);
+    const log = buildChangeLog(hieid, cha, args.nodes, 1, await readNodeKeyFormat(session, cha));
     let saved;
     try {
       saved = await session.rawPut(`${base}/content`, JSON.stringify(log), write);
@@ -494,7 +548,8 @@ export async function bwUpdateHierarchy(client: BwClient, args: UpdateHierarchyA
       const { data: rows } = await getJson<HierarchyNodeRow[]>(session, `/data/hierarchies/${id}/versions/M/content?depth=99`);
       const old = rows ?? [];
       const firstId = old.reduce((m, r) => Math.max(m, Number(r.NODEID)), 0) + 1;
-      const log = [...deleteRecords(hieid, old), ...buildChangeLog(hieid, cha, args.nodes, firstId)];
+      const format = await readNodeKeyFormat(session, cha);
+      const log = [...deleteRecords(hieid, old), ...buildChangeLog(hieid, cha, args.nodes, firstId, format)];
       const { etag } = await headerOf('M');
       const put = await session.rawPut(`${BASE}/data/hierarchies/${id}/versions/M/content`, JSON.stringify(log),
         etag ? { ...write, 'If-Match': etag } : write);
