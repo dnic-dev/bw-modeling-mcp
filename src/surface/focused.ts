@@ -232,6 +232,8 @@ export const FOCUSED_TOOLS: FocusedToolSpec[] = [
       op('set_routine_fields', 'bw_set_transformation_routine_fields'),
       op('delete_routine', 'bw_delete_transformation_routine'),
       op('set_runtime', 'bw_set_transformation_runtime'),
+      op('update_settings', 'bw_update_transformation_settings'),
+      op('rule_group', 'bw_update_transformation_rule_group'),
     ],
   },
   {
@@ -351,9 +353,12 @@ export function coveredTools(): string[] {
   return FOCUSED_TOOLS.flatMap((t) => t.members.map((m) => m.tool));
 }
 
+// The period of "e.g." and "i.e." is followed by a space without ending a sentence.
+const SENTENCE_END = '(?<!\\b(?:e\\.g|i\\.e))[.!?](?=\\s|$)';
+
 function firstSentence(text: string, max = 160): string {
   const cut = text.replace(/\s+/g, ' ').trim();
-  const end = cut.search(/[.!?](\s|$)/);
+  const end = cut.search(new RegExp(SENTENCE_END));
   const sentence = end > 0 ? cut.slice(0, end + 1) : cut;
   return sentence.length > max ? `${sentence.slice(0, max - 1).trimEnd()}…` : sentence;
 }
@@ -363,7 +368,7 @@ function leadingSentences(text: string, max: number): string {
   const cut = text.replace(/\s+/g, ' ').trim();
   if (cut.length <= max) return cut;
   let out = '';
-  for (const m of cut.matchAll(/[^.!?]+[.!?](?=\s|$)/g)) {
+  for (const m of cut.matchAll(new RegExp(`.+?${SENTENCE_END}`, 'g'))) {
     if (out.length + m[0].length > max) break;
     out += m[0];
   }

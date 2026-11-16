@@ -233,6 +233,8 @@ const COLLECTION_NEEDS: Record<string, string[]> = {
   bw_create_transformation: ['trfn'],
   bw_update_transformation: ['trfn'],
   bw_set_transformation_runtime: ['trfn'],
+  bw_update_transformation_settings: ['trfn'],
+  bw_update_transformation_rule_group: ['trfn'],
   bw_set_transformation_routine: ['trfn'],
   bw_set_transformation_routine_fields: ['trfn'],
   bw_set_transformation_expert_routine: ['trfn'],

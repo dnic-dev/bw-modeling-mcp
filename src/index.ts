@@ -26,7 +26,7 @@ import {
 } from './platform.js';
 import { bwGetAdso, bwCreateAdso, FieldDef, bwUpdateAdso, bwUpdateAdsoAddPureField, bwUpdateAdsoSettings, AdsoSettings, bwUpdateAdsoManageKeys, bwUpdateAdsoFieldProperties, FieldProperties, bwUpdateAdsoPartitions, PartitionSpec } from './tools/adso.js';
 import { bwGetInfoObject, bwCreateInfoObject, bwUpdateInfoObject, AttributeDef } from './tools/infoobject.js';
-import { bwGetTransformation, bwUpdateTransformation, bwCreateTransformation, bwSetTransformationRuntime, bwSetTransformationRoutine, bwDeleteTransformationRoutine, bwSetTransformationRoutineFields, bwSetTransformationExpertRoutine, type RuleConversion } from './tools/transformation.js';
+import { bwGetTransformation, bwUpdateTransformation, bwCreateTransformation, bwSetTransformationRuntime, bwSetTransformationRoutine, bwDeleteTransformationRoutine, bwSetTransformationRoutineFields, bwSetTransformationExpertRoutine, bwUpdateTransformationSettings, bwManageTransformationRuleGroup, type RuleConversion, type LookupOptions, type TransformationSettingsArgs, type RuleGroupArgs } from './tools/transformation.js';
 import { bwActivate, bwCheck } from './tools/activation.js';
 import { bwSystemProfile } from './tools/system_profile.js';
 import { bwReadMetadataTables } from './tools/metadata_tables.js';
@@ -488,7 +488,7 @@ const TOOL_DEFINITIONS = [
           },
           info_area: {
             type: 'string',
-            description: 'InfoArea to create the aDSO in (e.g. "NEXTJUICE").',
+            description: 'InfoArea to create the aDSO in (e.g. "AREA_NAME").',
           },
           action: {
             type: 'string',
@@ -805,7 +805,7 @@ const TOOL_DEFINITIONS = [
         properties: {
           name: {
             type: 'string',
-            description: 'InfoArea name, max 12 characters (e.g. "NEXTJUICE").',
+            description: 'InfoArea name, max 12 characters (e.g. "AREA_NAME").',
           },
           parent_info_area: {
             type: 'string',
@@ -900,7 +900,7 @@ const TOOL_DEFINITIONS = [
           },
           target_info_area: {
             type: 'string',
-            description: 'Technical name of the target InfoArea (e.g. "MCPBW").',
+            description: 'Technical name of the target InfoArea (e.g. "AREA_NAME").',
           },
           position: {
             type: 'string',
@@ -1105,6 +1105,7 @@ const TOOL_DEFINITIONS = [
         'rule_type="routine": converts the rule to a StepRoutine (AMDP field routine) from any type. Every source field the rule has stays and is wired into the routine; source_field and additional_source_fields add further ones. A rule without any source needs source_field. A rule that already is a routine keeps its class and method, so this also adds source fields to an existing routine. ' +
         'rule_type="formula": writes the rule as StepFormula whatever step type it has now, including an existing formula rule whose text is to be changed — no ABAP class generated, BW evaluates the formula natively. ' +
         'Every operand of the expression is registered as a source of the rule, so a formula over several source fields works; the operands are read out of the formula and need not be listed. ' +
+        'rule_type="odq_mode": derives the record mode from the change mode and entity counter fields an ODP DataSource delivers (StepODQMode), the rule the server proposes for such a source; for the record mode target only, and refused when the source lacks one of the two fields. ' +
         'rule_type="constant": sets a fixed constant value on the target field from any rule type — no source field needed, source_field is ignored. ' +
         'rule_type="no_update": removes the mapping. A key field becomes StepInitial (filled with its initial value), any other field StepNoUpdate — the only reset the modeling tools offer for either kind. ' +
         'A rule that maps a key figure together with its unit or currency keeps the unit half when the type of the key figure changes; the unit half itself is changed through the key figure. A rule with a currency or unit conversion step is refused until the conversion is removed. ' +
@@ -1136,7 +1137,7 @@ const TOOL_DEFINITIONS = [
           },
           rule_type: {
             type: 'string',
-            enum: ['direct', 'time', 'routine', 'formula', 'constant', 'lookup', 'no_update'],
+            enum: ['direct', 'time', 'routine', 'formula', 'constant', 'lookup', 'no_update', 'odq_mode'],
             description:
               'Rule type to assign. "direct" (default): maps the source field directly (StepDirect); a time characteristic target gets StepTime instead. ' +
               '"time": time conversion into a time characteristic (StepTime). ' +
@@ -1145,6 +1146,7 @@ const TOOL_DEFINITIONS = [
               '"constant": sets a fixed constant value (StepConstant) from any type — requires the constant_value parameter, source_field is ignored. ' +
               '"lookup": converts the rule to a StepRead (Lookup) rule — requires lookup_object and lookup_object_type. ' +
               '"no_update": removes the mapping — StepInitial for a key field, StepNoUpdate for any other. ' +
+              '"odq_mode": derives the record mode target from the ODP change mode and entity counter fields of the source (StepODQMode) — no source_field needed. ' +
               'IMPORTANT: AMDP SQLSCRIPT methods only allow ASCII 7-bit characters — no German umlauts or special symbols in code or comments.',
           },
           formula: {
@@ -1167,7 +1169,7 @@ const TOOL_DEFINITIONS = [
           },
           lookup_object: {
             type: 'string',
-            description: 'Name of the InfoObject or aDSO to read from (Nachlese-Objekt). Required for rule_type="lookup".',
+            description: 'Name of the InfoObject or aDSO to read from. Required for rule_type="lookup".',
           },
           lookup_object_type: {
             type: 'string',
@@ -1184,6 +1186,37 @@ const TOOL_DEFINITIONS = [
               'e.g. {"KEY_FIELD": "SOURCE_FIELD"}. A key field whose name exists in the source segment takes that field on its own; ' +
               'source_field alone feeds the InfoObject itself or the one key that is still open. Every key field must end up with a source, ' +
               'or the rule does not activate.',
+          },
+          rule_group: {
+            type: 'string',
+            description:
+              'The rule group whose rule is changed, by its description or id; omitted: the standard group. Rule groups are added with bw_update_transformation_rule_group. ' +
+              'A field that still follows the standard group in that group gets a rule of its own by this change.',
+          },
+          lookup_time_dependency: {
+            type: 'string',
+            enum: ['current_date', 'constant_date', 'start', 'end'],
+            description:
+              'For rule_type="lookup" into an InfoObject with time-dependent attributes: the key date the attribute is read for. ' +
+              '"current_date" (default for such an InfoObject): the date of the load. "constant_date": a fixed date, given in lookup_time_value. ' +
+              '"start" / "end": the date comes from the record — lookup_time_value names the source field that holds it, which becomes a further input of the rule. ' +
+              'Refused for a lookup object without time-dependent attributes.',
+          },
+          lookup_time_value: {
+            type: 'string',
+            description:
+              'For lookup_time_dependency "constant_date": the date as YYYYMMDD. For "start" and "end": the source field that holds the date (e.g. "DATE_FIELD").',
+          },
+          lookup_error_handling: {
+            type: 'string',
+            enum: ['error_message', 'constant'],
+            description:
+              'For rule_type="lookup" into a DataStore object: what happens when no record is found. "error_message": the record fails with a message. ' +
+              '"constant": the target gets the value of lookup_error_constant. Refused for a lookup into an InfoObject, where BW offers no choice.',
+          },
+          lookup_error_constant: {
+            type: 'string',
+            description: 'The value the target gets when the lookup finds nothing; needs lookup_error_handling "constant".',
           },
           additional_source_fields: {
             type: 'array',
@@ -1206,7 +1239,7 @@ const TOOL_DEFINITIONS = [
           conversion: {
             type: 'object',
             description:
-              'Currency or unit conversion for a direct rule on a key figure with a currency or unit (rule_type="direct"). ' +
+              'Currency or unit conversion for a rule on a key figure with a currency or unit; goes with rule_type="direct", "formula" and "routine" — the value is converted behind the assignment, formula or routine. ' +
               'Omitted or type "none": no conversion — the value is taken over as it is, which is also what direct, formula ' +
               'and constant rules on such a key figure get by default. Type "currency": convert with a currency translation ' +
               'type; type "unit": convert with a unit conversion type. The name is checked against the types defined on the ' +
@@ -1351,8 +1384,8 @@ const TOOL_DEFINITIONS = [
     {
       name: 'bw_set_transformation_routine_fields',
       description:
-        'Edit the list of target fields the global END routine writes ("Felder setzen" in SAP GUI). ' +
-        'Requires an existing END routine — use bw_set_transformation_routine to create one first. ' +
+        'Edit the field list of a global routine: the target fields the END routine writes (default), or with routine_type "start" the source fields the START routine reads. ' +
+        'Requires the routine to exist — use bw_set_transformation_routine to create it first. ' +
         'Provide exactly one of: fields (explicit complete set of target fields the END routine should write) ' +
         'or exclude_fields (all target fields minus these). ' +
         'Rejected if neither or both are given, if any field name does not exist in the target segment, ' +
@@ -1372,6 +1405,11 @@ const TOOL_DEFINITIONS = [
               'Explicit complete set of target field names the END routine should write ' +
               '(e.g. ["FIELD_A", "FIELD_B"]). Case-insensitive. ' +
               'Mutually exclusive with exclude_fields.',
+          },
+          routine_type: {
+            type: 'string',
+            enum: ['end', 'start'],
+            description: '"end" (default): fields and exclude_fields name target fields the END routine writes. "start": they name source fields the START routine reads.',
           },
           exclude_fields: {
             type: 'array',
@@ -1444,6 +1482,116 @@ const TOOL_DEFINITIONS = [
           },
         },
         required: ['object_type', 'object_name'],
+      },
+    },
+    {
+      name: 'bw_update_transformation_settings',
+      description:
+        'Change the settings of a Transformation that are not rules: its switches, the options of single target fields, and the fields the extraction is grouped by. ' +
+        'Switches: initialize_null_values (null values of the source arrive as initial values), enable_inverse_routines, error_handling_in_routines, and allow_currency_unit_conversion (the currency and unit handling, which also reshapes the rules of key figures with a unit or currency field). ' +
+        'target_options sets, per target field, whether its conversion exit is performed (only for a field with a conversion routine, and not while its rule leaves it without update) ' +
+        'and whether the value is checked against master data (only for a field BW names a master data object for). ' +
+        'semantic_group_fields is the complete list of source fields the extraction is grouped by — records with the same values in them stay in one package; an empty list removes the grouping. ' +
+        'Only what is passed changes; nothing is saved when every value is already in place. Returns lock_handle for bw_activate. ' +
+        'Rules, routines and the runtime have their own tools (bw_update_transformation, bw_set_transformation_routine, bw_set_transformation_runtime).',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          transformation_name: {
+            type: 'string',
+            description: 'Transformation name (UUID-like key).',
+          },
+          initialize_null_values: {
+            type: 'boolean',
+            description: 'Turn null values of the source into initial values.',
+          },
+          enable_inverse_routines: {
+            type: 'boolean',
+            description: 'Allow inverse routines for the routines of this transformation.',
+          },
+          error_handling_in_routines: {
+            type: 'boolean',
+            description: 'Allow routines to report erroneous records to the error handling of the DTP.',
+          },
+          allow_currency_unit_conversion: {
+            type: 'boolean',
+            description:
+              'Currency and unit handling of the transformation. On: a key figure and its unit or currency field are filled by one rule, and the value can be converted. ' +
+              'Off: each has a rule of its own and nothing is converted. The rules are brought into the form of the new state in the same save — a unit keeps the source field it was filled from — and the answer lists what changed; conversions are dropped when it is switched off.',
+          },
+          target_options: {
+            type: 'array',
+            description: 'Options of single target fields; only the properties given for a field change.',
+            items: {
+              type: 'object',
+              properties: {
+                target: { type: 'string', description: 'Target field name (e.g. "FIELD_NAME").' },
+                perform_conversion_exit: {
+                  type: 'boolean',
+                  description: 'Perform the conversion exit of the field when it is filled.',
+                },
+                master_data_check: {
+                  type: 'boolean',
+                  description: 'Check the value against the master data of the object BW names for the field.',
+                },
+                rule_description: {
+                  type: 'string',
+                  description: 'Description of the rule that fills the field (standard rule group); an empty text removes it.',
+                },
+              },
+              required: ['target'],
+            },
+          },
+          semantic_group_fields: {
+            type: 'array',
+            items: { type: 'string' },
+            description: 'Complete list of source fields the extraction is grouped by (e.g. ["FIELD_A", "FIELD_B"]); [] removes the grouping.',
+          },
+          transport: {
+            type: 'string',
+            description: 'Transport request number. Required on systems with transport obligation.',
+          },
+        },
+        required: ['transformation_name'],
+      },
+    },
+    {
+      name: 'bw_update_transformation_rule_group',
+      description:
+        'Add, rename or remove a rule group of a Transformation, or list its groups. A rule group is a further set of rules on the same source and target: every group writes its own records into the target, which is how one source record becomes several target records. ' +
+        'action "add" creates a group named by description: its key fields follow the rules of the standard group, every other field starts without a mapping. Set the rules of the group with bw_update_transformation and rule_group. ' +
+        'action "use_standard_rule" makes the rule of target in the group follow the standard group again. action "rename" gives the group a new description; action "remove" deletes it with its rules. ' +
+        'The standard group, the technical group and the group of the global routines belong to the transformation and are not removed. action "list" changes nothing. Returns lock_handle for bw_activate.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          transformation_name: {
+            type: 'string',
+            description: 'Transformation name (UUID-like key).',
+          },
+          action: {
+            type: 'string',
+            enum: ['list', 'add', 'rename', 'remove', 'use_standard_rule'],
+            description: 'What to do with the rule group.',
+          },
+          group: {
+            type: 'string',
+            description: 'The rule group to rename, remove or change a rule in: its description or its id.',
+          },
+          description: {
+            type: 'string',
+            description: 'The name of the new rule group (add), or the new name of the group (rename).',
+          },
+          target: {
+            type: 'string',
+            description: 'For use_standard_rule: the target field whose rule follows the standard group again (e.g. "FIELD_NAME").',
+          },
+          transport: {
+            type: 'string',
+            description: 'Transport request number. Required on systems with transport obligation.',
+          },
+        },
+        required: ['transformation_name', 'action'],
       },
     },
     {
@@ -1560,7 +1708,7 @@ const TOOL_DEFINITIONS = [
         properties: {
           name: {
             type: 'string',
-            description: 'InfoArea name (e.g. "NEXTJUICE").',
+            description: 'InfoArea name (e.g. "AREA_NAME").',
           },
         },
         required: ['name'],
@@ -1586,7 +1734,7 @@ const TOOL_DEFINITIONS = [
           },
           info_area: {
             type: 'string',
-            description: 'InfoArea to create the InfoSource in (e.g. "MCPBW").',
+            description: 'InfoArea to create the InfoSource in (e.g. "AREA_NAME").',
           },
           package: {
             type: 'string',
@@ -7249,7 +7397,7 @@ async function handleToolCall(
           args?.transformation_name as string,
           args?.source_field as string | undefined,
           args?.target_infoobject as string,
-          (args?.rule_type as 'direct' | 'time' | 'routine' | 'formula' | 'constant' | 'lookup' | 'no_update' | undefined) ?? 'direct',
+          (args?.rule_type as 'direct' | 'time' | 'routine' | 'formula' | 'constant' | 'lookup' | 'no_update' | 'odq_mode' | undefined) ?? 'direct',
           args?.formula as string | undefined,
           args?.constant_value as string | undefined,
           args?.lookup_object as string | undefined,
@@ -7261,7 +7409,22 @@ async function handleToolCall(
           args?.aggregation as string | undefined,
           args?.rule_type !== undefined,
           args?.lookup_key_mapping as Record<string, string> | undefined,
+          {
+            time_dependency: args?.lookup_time_dependency as LookupOptions['time_dependency'],
+            time_value: args?.lookup_time_value as string | undefined,
+            error_handling: args?.lookup_error_handling as LookupOptions['error_handling'],
+            error_constant: args?.lookup_error_constant as string | undefined,
+          },
+          args?.rule_group as string | undefined,
         );
+        break;
+
+      case 'bw_update_transformation_rule_group':
+        text = await bwManageTransformationRuleGroup(client, args as unknown as RuleGroupArgs);
+        break;
+
+      case 'bw_update_transformation_settings':
+        text = await bwUpdateTransformationSettings(client, args as unknown as TransformationSettingsArgs);
         break;
 
       case 'bw_delete_transformation_routine':
@@ -7299,7 +7462,8 @@ async function handleToolCall(
           args?.transformation_name as string,
           args?.fields as string[] | undefined,
           args?.exclude_fields as string[] | undefined,
-          args?.transport as string | undefined
+          args?.transport as string | undefined,
+          (args?.routine_type as 'start' | 'end' | undefined) ?? 'end',
         );
         break;
 

@@ -367,6 +367,17 @@ function summarizeTransformation(
   if (description)  lines.push(`Description: ${description}`);
   if (abapProgram)  lines.push(`ABAP Program: ${abapProgram}`);
   if (hanaExec)     lines.push(`HANA Execution: ${hanaExec}`);
+  const switchesOn = [
+    ['initializeNullValues', 'null values initialized'],
+    ['enableInverseRoutines', 'inverse routines'],
+    ['enableErrorHandlingInRoutines', 'error handling in routines'],
+  ].filter(([name]) => attr(name) === 'true').map(([, text]) => text);
+  if (switchesOn.length > 0) lines.push(`Settings: ${switchesOn.join(', ')}`);
+  const sourceSegment = xml.match(/<source\b[^>]*>[\s\S]*?<segment[^>]*>([\s\S]*?)<\/segment>/)?.[1] ?? '';
+  const groupedBy = [...sourceSegment.matchAll(/<element\b[^>]*>/g)]
+    .filter((m) => /\bgroupedExtraction="true"/.test(m[0]))
+    .map((m) => m[0].match(/\bname="([^"]+)"/)?.[1] ?? '');
+  if (groupedBy.length > 0) lines.push(`Extraction grouped by: ${groupedBy.join(', ')}`);
 
   // ── Source / Target ───────────────────────────────────────────────────────
   const srcMatch = xml.match(/<source\b[^>]*id="0"[^>]*name="([^"]+)"[^>]*(?:description="([^"]*)")?[^>]*type="([^"]+)"/);
@@ -413,12 +424,33 @@ function summarizeTransformation(
 
   const aggregations = targetAggregations(xml);
 
+  // A rule group of its own is named at each of its rules; standard and technical rules are not.
+  const ownGroups = listRuleGroups(xml).filter((g) => g.type !== 'S' && g.type !== 'T' && g.type !== 'G');
+  const groupOfRule = new Map<string, string>();
+  for (const g of ownGroups) {
+    const body = xml.match(new RegExp(`<group\\s+id="${g.id}"[^>]*>([\\s\\S]*?)<\\/group>`))?.[1] ?? '';
+    for (const r of body.matchAll(/<rule\b[^>]*>[\s\S]*?<\/rule>/g)) groupOfRule.set(r[0], g.description);
+  }
+  if (ownGroups.length > 0) {
+    lines.push('');
+    lines.push(`── Rule Groups ──`);
+    lines.push(`  ${ownGroups.map((g) => `${g.description} (${g.rules} rules)`).join(', ')}, besides the standard group`);
+  }
+
   if (ruleMatches.length > 0) {
     lines.push('');
     lines.push('── Field Mappings ──');
     for (const rm of ruleMatches) {
       const ruleAttrs   = rm[1];
       const ruleBody    = rm[2];
+      const ownGroup    = groupOfRule.get(rm[0]);
+      const followed    = ruleBody.match(/<refRule>#\/\/\/group(\d+)\/rule(\d+)<\/refRule>/);
+      if (followed) {
+        const original = xml.match(new RegExp(`<rule\\b[^>]*\\bid="${followed[2]}"[^>]*>[\\s\\S]*?<\\/rule>`))?.[0] ?? '';
+        const fields = [...original.matchAll(/elementRef>#\/\/\/target\/[^/]+\/([^<]+)<\/elementRef>/g)].map((m) => m[1]).join(', ');
+        lines.push(`  [${ownGroup ?? 'group'}: follows the standard group]  →  ${fields || '?'}`);
+        continue;
+      }
       const routinetype = ruleAttrs.match(/routinetype="([^"]*)"/)?.[1] ?? '';
 
       // Step attributes — use [^>]* so slashes in classNameM paths don't break capture
@@ -441,12 +473,25 @@ function summarizeTransformation(
       const tgt = tgtFields.length > 0 ? tgtFields.join(', ') : '(none)';
 
       let label = stepType || xsiType || '?';
+      if (ownGroup) label = `${ownGroup}: ${label}`;
       // Show routinetype when it adds info not already in the label
       if (routinetype && !label.toUpperCase().includes(routinetype.toUpperCase())) {
         label += ` [${routinetype}]`;
       }
       if (classNameM)  label += ` | ${classNameM}.${methodNameM}`;
-      if (constant)    label += ` = "${constant}"`;
+      const lookupObject = stepAttrs.match(/\bobjectName="([^"]*)"/)?.[1] ?? '';
+      if (lookupObject) {
+        label += ` | from ${stepAttrs.match(/\bobjectType="([^"]*)"/)?.[1] ?? ''} ${lookupObject}`;
+        const keyDate = stepAttrs.match(/\btimeDependencyType="([^"]*)"/)?.[1];
+        const keyDateValue = stepAttrs.match(/\btimeDependencyValue="([^"]*)"/)?.[1]?.trim();
+        if (keyDate) label += `, key date ${keyDate}${keyDateValue ? ` ${keyDateValue}` : ''}`;
+        const onMiss = stepAttrs.match(/\berrorHandling="([^"]*)"/)?.[1];
+        if (onMiss) label += `, nothing found: ${onMiss === 'CONSTANT' ? `constant "${constant}"` : 'error message'}`;
+      } else if (constant) {
+        label += ` = "${constant}"`;
+      }
+      const ruleTargetTags = (ruleBody.match(/<target\b[^>]*>/g) ?? []).join('');
+      if (/\bperformConversionExit="YES"/.test(ruleTargetTags)) label += ' | conversion exit';
 
       // Extract filter conditions on this rule
       const filterParts: string[] = [];
@@ -625,7 +670,7 @@ function extractTargetFieldProps(
   };
 }
 
-type StepType = 'DIRECT' | 'INITIAL' | 'NO_UPDATE' | 'ROUTINE' | 'FORMULA' | 'CONSTANT' | 'READ' | 'TIME';
+type StepType = 'DIRECT' | 'INITIAL' | 'NO_UPDATE' | 'ROUTINE' | 'FORMULA' | 'CONSTANT' | 'READ' | 'TIME' | 'ODQ_MODE';
 
 /**
  * Find any rule that targets the given InfoObject (any known step type).
@@ -633,7 +678,8 @@ type StepType = 'DIRECT' | 'INITIAL' | 'NO_UPDATE' | 'ROUTINE' | 'FORMULA' | 'CO
  */
 function findRuleForTarget(
   xml: string,
-  targetInfoObject: string
+  targetInfoObject: string,
+  onlyGroupId?: string,
 ): { ruleId: string; groupId: string; oldRuleXml: string; stepType: StepType } | null {
   const target = targetInfoObject.toUpperCase();
 
@@ -646,6 +692,7 @@ function findRuleForTarget(
 
   while ((groupMatch = groupRegex.exec(xml)) !== null) {
     const groupId = groupMatch[1];
+    if (onlyGroupId && groupId !== onlyGroupId) continue;
     const groupContent = groupMatch[0];
 
     const ruleRegex = /<rule(\s[^>]*)>([\s\S]*?)<\/rule>/g;
@@ -672,6 +719,7 @@ function findRuleForTarget(
       else if (body.includes('StepConstant') || body.includes('type="CONSTANT"')) stepType = 'CONSTANT';
       else if (body.includes('StepRead') || body.includes('type="READ"')) stepType = 'READ';
       else if (body.includes('StepTime') || body.includes('type="TIME"')) stepType = 'TIME';
+      else if (body.includes('StepODQMode') || body.includes('type="ODQ_MODE"')) stepType = 'ODQ_MODE';
 
       if (stepType) {
         return {
@@ -923,7 +971,8 @@ function segmentElementToStepElement(segmentElementXml: string): string {
  */
 function findStandaloneRuleForTarget(
   xml: string,
-  targetInfoObject: string
+  targetInfoObject: string,
+  onlyGroupId?: string,
 ): { ruleId: string; groupId: string; oldRuleXml: string; stepType: StepType } | null {
   const target = targetInfoObject.toUpperCase();
   const groupRegex = /<group\s+id="(\d+)"[^>]*>([\s\S]*?)<\/group>/g;
@@ -931,6 +980,7 @@ function findStandaloneRuleForTarget(
 
   while ((groupMatch = groupRegex.exec(xml)) !== null) {
     const groupId = groupMatch[1];
+    if (onlyGroupId && groupId !== onlyGroupId) continue;
     const ruleRegex = /<rule(\s[^>]*)>([\s\S]*?)<\/rule>/g;
     let match: RegExpExecArray | null;
 
@@ -953,6 +1003,7 @@ function findStandaloneRuleForTarget(
       else if (body.includes('StepConstant') || body.includes('type="CONSTANT"')) stepType = 'CONSTANT';
       else if (body.includes('StepRead') || body.includes('type="READ"')) stepType = 'READ';
       else if (body.includes('StepTime') || body.includes('type="TIME"')) stepType = 'TIME';
+      else if (body.includes('StepODQMode') || body.includes('type="ODQ_MODE"')) stepType = 'ODQ_MODE';
       if (!stepType) continue;
 
       return { ruleId: ruleIdMatch?.[1] ?? '', groupId, oldRuleXml: match[0], stepType };
@@ -1016,6 +1067,11 @@ function buildCombinedDirectRule(params: {
     </rule>`;
 }
 
+/** The fixed currency or unit of a key figure element, or '' when it has none. */
+export function fixedUnitOf(elementXml: string): string {
+  return elementXml.match(/<(?:fixedCurrency|fixedUnit)\b[^>]*>([^<]*)</)?.[1]?.trim() ?? '';
+}
+
 /**
  * True when a target segment element is a key figure bound to a currency or unit — either a
  * fixed one or a reference to a unit/currency field.
@@ -1031,6 +1087,8 @@ export function targetHasUnitOrCurrency(targetElementXml: string): boolean {
  * the transformation fails to activate.
  */
 export function setRuleConversionType(ruleXml: string, conversionType: string): string {
+  // A rule that still runs through a conversion step is never marked as unconverted.
+  if (conversionType === 'NO_CONVERSION' && /xsi:type="trfn:StepConversion"/.test(ruleXml)) conversionType = 'FROM_CONVERSION';
   return ruleXml.replace(/^<rule\b[^>]*>/, (open) =>
     /\bconversiontype="/.test(open)
       ? open.replace(/\bconversiontype="[^"]*"/, `conversiontype="${conversionType}"`)
@@ -1216,7 +1274,8 @@ export function rebuildRule(params: {
   const mainId = mainStep?.[1].match(/\bid="(\d+)"/)?.[1] ?? '1';
   const minorSteps = steps.filter((m) => m !== mainStep);
   if (minorSteps.some((m) => /\btype="CONVERSION"/.test(m[1]))) {
-    throw new ConversionRuleError();
+    if (!CONVERSION_KEEPING_STEP_TYPES.includes(params.stepType) || !mainStep) throw new ConversionRuleError();
+    return rebuildMainStepOnly({ ...params, mainStepXml: mainStep[0], mainId });
   }
   if (minorSteps.length > 0 && !targetMatch[2].includes(`/step${mainId}/output`)) {
     const mainTarget = targets.find((m) => m[2].includes(`/step${mainId}/output`))?.[2].match(/\/target\/segment1\/([^<]+)</)?.[1];
@@ -1253,6 +1312,56 @@ export function rebuildRule(params: {
     `<step xsi:type="${params.stepXsiType}" id="${mainId}" rank="MAIN" type="${params.stepType}"${params.stepAttributes ?? ''}>` +
     `${inputs}<output id="1"><input>#///group${g}/rule${rv}/target${targetId}</input>${outputElement}</output></step>` +
     `${minorSteps.map((m) => m[0]).join('')}</rule>`;
+}
+
+/** The main step types behind which the editor puts a conversion step back after a type change. */
+const CONVERSION_KEEPING_STEP_TYPES: ReadonlyArray<string> = ['DIRECT', 'FORMULA', 'ROUTINE'];
+
+/**
+ * Replace the main step of a rule whose value runs through a conversion step: the conversion
+ * step, the unit or currency it reads and writes, the targets and every wire between them stay
+ * as they are. Only the main step changes — its type, its inputs and the sources feeding them —
+ * and it keeps its outputs, which lead into the conversion step.
+ */
+function rebuildMainStepOnly(params: {
+  oldRuleXml: string;
+  groupId: string;
+  ruleId: string;
+  stepXsiType: string;
+  stepType: string;
+  stepAttributes?: string;
+  sourceFields: Array<{ name: string; elementXml: string }>;
+  mainStepXml: string;
+  mainId: string;
+}): string {
+  const { oldRuleXml, groupId: g, ruleId: rv, mainId } = params;
+  const allSources = [...oldRuleXml.matchAll(/<source\b[^>]*>[\s\S]*?<\/source>/g)].map((m) => m[0]);
+  const keptSources = allSources.filter((x) => !x.includes(`/step${mainId}/input`));
+  // The unit or currency the conversion reads is a source of the rule, not an operand of the main step.
+  const conversionFields = new Set(keptSources.map((x) => x.match(/\/source\/segment1\/([^<]+)</)?.[1]?.toUpperCase()));
+  const sourceFields = params.sourceFields.filter((sf) => !conversionFields.has(sf.name.toUpperCase()));
+  const keptIds = keptSources.map((x) => Number(x.match(/\bid="(\d+)"/)?.[1] ?? 0));
+  const firstSourceId = (keptIds.length ? Math.max(...keptIds) : 0) + 1;
+
+  const sources = sourceFields
+    .map((sf, i) =>
+      `<source id="${firstSourceId + i}"><input>#///group${g}/rule${rv}/step${mainId}/input${i + 1}</input>` +
+      `<elementRef>#///source/segment1/${sf.name.toUpperCase()}</elementRef></source>`)
+    .join('');
+  const inputs = sourceFields
+    .map((sf, i) =>
+      `<input id="${i + 1}"><output>#///group${g}/rule${rv}/source${firstSourceId + i}</output>` +
+      `${segmentElementToStepElement(sf.elementXml)}</input>`)
+    .join('');
+  const outputs = (params.mainStepXml.match(/<output\b[^>]*\bid="[^"]*"[^>]*>[\s\S]*?<\/output>/g) ?? []).join('');
+  const newMainStep =
+    `<step xsi:type="${params.stepXsiType}" id="${mainId}" rank="MAIN" type="${params.stepType}"${params.stepAttributes ?? ''}>` +
+    `${inputs}${outputs}</step>`;
+
+  let rule = oldRuleXml.replace(params.mainStepXml, newMainStep);
+  for (const source of allSources) rule = rule.replace(source, '');
+  rule = rule.replace(/^(<rule\b[^>]*>)/, `$1${keptSources.join('')}${sources}`);
+  return setRuleConversionType(rule, 'FROM_CONVERSION');
 }
 
 /** Thrown when a rule with a currency or unit conversion step is asked to change its type. */
@@ -1332,7 +1441,7 @@ async function lookupObjectKeyFields(
   client: BwClient,
   objectType: string,
   objectName: string,
-): Promise<{ keyFields: string[]; readable: boolean; reason?: string }> {
+): Promise<{ keyFields: string[]; readable: boolean; reason?: string; timeDependent: boolean }> {
   const nameLower = objectName.toLowerCase();
   if (objectType === 'ADSO') {
     const xml = (await freshRead(`/sap/bw/modeling/adso/${bwSeg(nameLower)}/a`, MEDIA_TYPES['adso'])).body;
@@ -1343,6 +1452,7 @@ async function lookupObjectKeyFields(
     return {
       keyFields,
       readable,
+      timeDependent: false,
       reason: readable
         ? undefined
         : `only a DataStore object with direct update, or with activation and a change log, can be read from; ` +
@@ -1351,7 +1461,8 @@ async function lookupObjectKeyFields(
   }
   const xml = (await client.get(`/sap/bw/modeling/iobj/${bwSeg(nameLower)}/a`, MEDIA_TYPES['iobj'])).body;
   const parents = [...xml.matchAll(/<compoundParent\b[^>]*\bname="([^"]+)"/g)].map((m) => m[1].toUpperCase());
-  return { keyFields: [objectName.toUpperCase(), ...parents], readable: true };
+  const timeDependent = /<attributeN\b[^>]*\btimeDependent="true"/.test(xml);
+  return { keyFields: [objectName.toUpperCase(), ...parents], readable: true, timeDependent };
 }
 
 type RuleChange = { xml: string; keptTargets: string[]; endRoutineExtended: boolean };
@@ -1375,8 +1486,9 @@ function rebuildRefusal(err: unknown, targetField: string, transformationName: s
     return JSON.stringify({
       success: false,
       message:
-        `The rule for ${targetField} in transformation ${transformationName.toUpperCase()} converts a currency or unit. ` +
-        `Set it to a direct rule without conversion first (rule_type="direct"), then change its type. The rule was not changed.`,
+        `The rule for ${targetField} in transformation ${transformationName.toUpperCase()} converts a currency or unit, ` +
+        `which only a direct, formula or routine rule can do. Set it to a direct rule without conversion first ` +
+        `(rule_type="direct"), then change its type. The rule was not changed.`,
     });
   }
   if (err instanceof MinorTargetError) {
@@ -1431,7 +1543,98 @@ function rebuildRefusal(err: unknown, targetField: string, transformationName: s
  * Workflow: read InfoObject → GET Transformation → Lock → replace rule → PUT
  * Returns lockHandle for bw_activate.
  */
-type RuleType = 'direct' | 'time' | 'routine' | 'formula' | 'constant' | 'lookup' | 'no_update';
+/** How a lookup picks the validity of time-dependent data, and what it does when nothing is found. */
+export interface LookupOptions {
+  time_dependency?: 'current_date' | 'constant_date' | 'start' | 'end';
+  /** The date for constant_date (YYYYMMDD), the source field holding the date for start and end. */
+  time_value?: string;
+  error_handling?: 'error_message' | 'constant';
+  error_constant?: string;
+}
+
+const LOOKUP_TIME_DEPENDENCY = { current_date: 'CURRENT', constant_date: 'CONSTANT', start: 'START', end: 'END' } as const;
+const LOOKUP_ERROR_HANDLING = { error_message: 'ERROR_MESSAGE', constant: 'CONSTANT' } as const;
+
+/**
+ * The attributes a read step carries for its options, and the source field that becomes a
+ * further input when the key date comes from the record. The editor's rules: only a lookup object
+ * with time-dependent attributes has a key date, and it reads by the current date unless told
+ * otherwise; what happens when nothing is found can be chosen for a DataStore object only, and
+ * a constant in place of an error message needs its value.
+ */
+export function lookupStepOptions(
+  options: LookupOptions | undefined,
+  lookup: { type: string; name: string; timeDependent: boolean },
+  segmentFields: string[],
+): { attributes: string; dateField?: string; described: Record<string, string> } | { error: string } {
+  const o = options ?? {};
+  const described: Record<string, string> = {};
+  let attributes = '';
+  let dateField: string | undefined;
+
+  if (o.time_value && !o.time_dependency) {
+    return { error: 'lookup_time_value needs lookup_time_dependency ("constant_date", "start" or "end").' };
+  }
+  const dependency = o.time_dependency ?? (lookup.timeDependent ? 'current_date' : undefined);
+  if (dependency) {
+    if (!(dependency in LOOKUP_TIME_DEPENDENCY)) {
+      return { error: `Unknown lookup_time_dependency "${dependency}". Valid values: ${Object.keys(LOOKUP_TIME_DEPENDENCY).join(', ')}.` };
+    }
+    if (!lookup.timeDependent) {
+      return {
+        error:
+          `${lookup.type} ${lookup.name} has no time-dependent attributes, so a lookup into it has no key date ` +
+          `and lookup_time_dependency does not apply.`,
+      };
+    }
+    attributes += ` timeDependencyType="${LOOKUP_TIME_DEPENDENCY[dependency]}"`;
+    described.time_dependency = dependency;
+    const value = o.time_value?.trim() ?? '';
+    if (dependency === 'constant_date') {
+      if (!/^\d{8}$/.test(value)) return { error: 'lookup_time_dependency "constant_date" needs lookup_time_value as a date in the form YYYYMMDD.' };
+      attributes += ` timeDependencyValue="${value}"`;
+      described.time_value = value;
+    } else if (dependency === 'start' || dependency === 'end') {
+      const field = value.toUpperCase();
+      if (!field) return { error: `lookup_time_dependency "${dependency}" needs lookup_time_value: the source field that holds the date.` };
+      if (!segmentFields.includes(field)) return { error: `Source field ${field} (lookup_time_value) is not in the source segment.` };
+      attributes += ` timeDependencyValue="${escapeXmlAttr(field)}"`;
+      dateField = field;
+      described.time_value = field;
+    } else if (value) {
+      return { error: 'lookup_time_dependency "current_date" takes no lookup_time_value.' };
+    }
+  }
+
+  if (o.error_constant !== undefined && o.error_handling !== 'constant') {
+    return { error: 'lookup_error_constant needs lookup_error_handling "constant".' };
+  }
+  if (o.error_handling) {
+    if (lookup.type !== 'ADSO') {
+      return {
+        error:
+          `lookup_error_handling applies to a lookup into a DataStore object only; a lookup into ` +
+          `${lookup.type} ${lookup.name} leaves the target initial when nothing is found.`,
+      };
+    }
+    if (!(o.error_handling in LOOKUP_ERROR_HANDLING)) {
+      return { error: `Unknown lookup_error_handling "${o.error_handling}". Valid values: ${Object.keys(LOOKUP_ERROR_HANDLING).join(', ')}.` };
+    }
+    attributes += ` errorHandling="${LOOKUP_ERROR_HANDLING[o.error_handling]}"`;
+    described.error_handling = o.error_handling;
+    if (o.error_handling === 'constant') {
+      attributes += ` constant="${escapeXmlAttr(o.error_constant ?? '')}"`;
+      described.error_constant = o.error_constant ?? '';
+    }
+  }
+  return { attributes, dateField, described };
+}
+
+const RECORD_MODE_TARGET = '0RECORDMODE';
+/** The two source fields the record mode step reads, in the order of its inputs. */
+const ODQ_MODE_SOURCE_FIELDS = ['ODQ_CHANGEMODE', 'ODQ_ENTITYCNTR'] as const;
+
+type RuleType = 'direct' | 'time' | 'routine' | 'formula' | 'constant' | 'lookup' | 'no_update' | 'odq_mode';
 
 export async function bwUpdateTransformation(
   client: BwClient,
@@ -1450,12 +1653,14 @@ export async function bwUpdateTransformation(
   aggregation?: string,
   ruleTypeGiven = true,
   lookupKeyMapping?: Record<string, string>,
+  lookupOptions?: LookupOptions,
+  ruleGroup?: string,
 ): Promise<string> {
   if (aggregation === undefined) {
     return updateRule(
       client, transformationName, sourceField, targetInfoObject, ruleType, formula, constantValue,
       lookupObject, lookupObjectType, transport, additionalSourceFields, unitSourceField, conversion,
-      undefined, lookupKeyMapping,
+      undefined, lookupKeyMapping, lookupOptions, ruleGroup,
     );
   }
 
@@ -1534,6 +1739,8 @@ export async function bwUpdateTransformation(
       return set.xml;
     },
     lookupKeyMapping,
+    lookupOptions,
+    ruleGroup,
   );
   const result = JSON.parse(text) as Record<string, unknown>;
   if (result.success !== true) return text;
@@ -1642,17 +1849,58 @@ async function updateRule(
   conversion?: RuleConversion,
   adjustXml: (xml: string) => string = (xml) => xml,
   lookupKeyMapping?: Record<string, string>,
+  lookupOptions?: LookupOptions,
+  ruleGroup?: string,
 ): Promise<string> {
   const tgtUpper = targetInfoObject.toUpperCase();
   let srcUpper = sourceField?.toUpperCase() ?? '';
 
   const conversionKind = conversion?.type ?? 'none';
+  if (conversionKind !== 'none' && (ruleType === 'formula' || ruleType === 'routine') && !unitSourceField) {
+    // BW converts behind a direct assignment, a formula or a routine. The conversion is set up on a
+    // direct assignment of the value, then the assignment in front of it becomes the formula or
+    // routine, which leaves the conversion in place.
+    const segmentFields = listSourceSegmentFields((await freshReadInactive(transformationName.toLowerCase())).body);
+    const valueField =
+      sourceField?.toUpperCase() ?? (formula ? deriveFormulaSourceFields(formula, segmentFields)[0] : undefined);
+    if (!valueField) {
+      return JSON.stringify({
+        success: false,
+        message:
+          `A ${ruleType} with a conversion needs the source field that holds the value: pass source_field` +
+          `${ruleType === 'formula' ? ', or use a source field in the formula' : ''}. The rule was not changed.`,
+      });
+    }
+    const converting = await updateRule(
+      client, transformationName, valueField, targetInfoObject, 'direct', undefined, undefined, undefined, undefined,
+      transport, undefined, undefined, conversion, undefined, undefined, undefined, ruleGroup,
+    );
+    const convertingResult = JSON.parse(converting) as Record<string, unknown>;
+    if (convertingResult.success !== true) return converting;
+    const typed = await updateRule(
+      client, transformationName, sourceField, targetInfoObject, ruleType, formula, constantValue, undefined, undefined,
+      transport, additionalSourceFields, undefined, undefined, adjustXml, undefined, undefined, ruleGroup,
+    );
+    const typedResult = JSON.parse(typed) as Record<string, unknown>;
+    if (typedResult.success !== true) {
+      typedResult.message =
+        `${String(typedResult.message)} The conversion itself was set: the rule for ${tgtUpper} is now a direct ` +
+        `assignment of ${valueField} with the ${conversionKind} conversion ${conversion?.name?.toUpperCase() ?? ''}.`;
+      typedResult.lock_handle = convertingResult.lock_handle;
+      return JSON.stringify(typedResult);
+    }
+    typedResult.message =
+      `${String(typedResult.message)} The value is converted with the ${conversionKind} conversion ` +
+      `${conversion?.name?.toUpperCase() ?? ''} behind the ${ruleType}.`;
+    typedResult.conversion = { type: conversionKind, name: conversion?.name?.toUpperCase() };
+    return JSON.stringify(typedResult);
+  }
   if (conversionKind !== 'none' && (ruleType !== 'direct' || unitSourceField)) {
     return JSON.stringify({
       success: false,
       message:
-        'A currency or unit conversion is set on a direct rule only (rule_type="direct" without ' +
-        'unit_source_field). The rule was not changed.',
+        'A currency or unit conversion goes with a direct rule, a formula or a routine (rule_type="direct", ' +
+        '"formula" or "routine", without unit_source_field). The rule was not changed.',
     });
   }
   if (ruleType === 'time' && unitSourceField) {
@@ -1665,13 +1913,95 @@ async function updateRule(
   // Step 1: Read current Transformation (get full XML + timestamp)
   const trfnResult = await freshReadInactive(transformationName.toLowerCase());
   const timestamp = trfnResult.headers['timestamp'] ?? trfnResult.headers['TIMESTAMP'];
-  const originalXml = trfnResult.body;
+  let originalXml = trfnResult.body;
+
+  // A rule group other than the standard one: its rules are addressed by the group, and a field
+  // that still follows the standard group by reference first gets that rule as its own.
+  let ruleGroupId: string | undefined;
+  if (ruleGroup?.trim()) {
+    const group = findRuleGroup(originalXml, ruleGroup);
+    if (!group) {
+      return JSON.stringify({
+        success: false,
+        message: `No rule group "${ruleGroup}" in transformation ${transformationName.toUpperCase()}, or the name is not unique. The rule was not changed.`,
+        rule_groups: listRuleGroups(originalXml),
+      });
+    }
+    ruleGroupId = group.id;
+    originalXml = materializeReferencedRule(originalXml, group.id, tgtUpper);
+  }
 
   let updatedXml: string;
 
+  if (ruleType === 'odq_mode') {
+    // The record mode of an ODP delta: the step takes the change mode and the entity counter
+    // of the source, in this order, and exists for the record mode target only.
+    const fail = (message: string, extra: Record<string, unknown> = {}) =>
+      JSON.stringify({ success: false, message: `${message} The rule was not changed.`, ...extra });
+    if (tgtUpper !== RECORD_MODE_TARGET) {
+      return fail(`rule_type="odq_mode" derives the record mode and exists for the target ${RECORD_MODE_TARGET} only, not for ${tgtUpper}.`);
+    }
+    const odqSources = ODQ_MODE_SOURCE_FIELDS.map((name) => ({
+      name,
+      elementXml: extractSourceFieldProps(originalXml, name).elementXml,
+    }));
+    const missing = odqSources.filter((f) => !f.elementXml).map((f) => f.name);
+    if (missing.length > 0) {
+      return fail(
+        `The source of transformation ${transformationName.toUpperCase()} has no field ${missing.join(' and no field ')}. ` +
+          `The record mode can only be derived from a source that delivers ${ODQ_MODE_SOURCE_FIELDS.join(' and ')}, ` +
+          `which is an ODP DataSource with both fields transferred.`,
+        { source_segment_fields: listSourceSegmentFields(originalXml) },
+      );
+    }
+    const ruleInfo = findRuleForTarget(originalXml, tgtUpper, ruleGroupId);
+    if (!ruleInfo) {
+      return fail(`No rule found for target ${tgtUpper} in transformation ${transformationName.toUpperCase()}.`);
+    }
+    let odqRule: string;
+    try {
+      odqRule = rebuildRule({
+        oldRuleXml: ruleInfo.oldRuleXml,
+        groupId: ruleInfo.groupId,
+        ruleId: ruleInfo.ruleId,
+        targetField: tgtUpper,
+        stepXsiType: 'trfn:StepODQMode',
+        stepType: 'ODQ_MODE',
+        sourceFields: odqSources,
+      });
+    } catch (err) {
+      const refusal = rebuildRefusal(err, tgtUpper, transformationName);
+      if (refusal) return refusal;
+      throw err;
+    }
+    const change = applyRuleChange(originalXml, ruleInfo, odqRule, tgtUpper, 'ODQ_MODE');
+
+    const lockHandle = await client.lock('trfn', transformationName);
+    try {
+      await putTransformation(client, transformationName, lockHandle, adjustXml(change.xml), timestamp, transport);
+    } catch (err) {
+      await client.unlock('trfn', transformationName).catch(() => {/* ignore */});
+      throw err;
+    }
+
+    return JSON.stringify({
+      success: true,
+      message:
+        `${tgtUpper} in transformation ${transformationName.toUpperCase()} is derived from ` +
+        `${ODQ_MODE_SOURCE_FIELDS.join(' and ')} of the source (StepODQMode). ` +
+        `${ruleChangeNote(change)}Call bw_activate to activate.`,
+      step_type: 'ODQ_MODE',
+      lock_handle: lockHandle,
+      transformation_name: transformationName.toUpperCase(),
+      object_type: 'trfn',
+      converted_from: ruleInfo.stepType,
+      ...ruleChangeDetails(change),
+    });
+  }
+
   if (ruleType === 'routine') {
     // ── Routine path ────────────────────────────────────────────────────────
-    const ruleInfo = findRuleForTarget(originalXml, tgtUpper);
+    const ruleInfo = findRuleForTarget(originalXml, tgtUpper, ruleGroupId);
     if (!ruleInfo) {
       return JSON.stringify({
         success: false,
@@ -1776,7 +2106,7 @@ async function updateRule(
       });
     }
 
-    const ruleInfo = findRuleForTarget(originalXml, tgtUpper);
+    const ruleInfo = findRuleForTarget(originalXml, tgtUpper, ruleGroupId);
     if (!ruleInfo) {
       return JSON.stringify({
         success: false,
@@ -1878,7 +2208,7 @@ async function updateRule(
       });
     }
 
-    const ruleInfo = findRuleForTarget(originalXml, tgtUpper);
+    const ruleInfo = findRuleForTarget(originalXml, tgtUpper, ruleGroupId);
     if (!ruleInfo) {
       return JSON.stringify({
         success: false,
@@ -1952,7 +2282,7 @@ async function updateRule(
     const lookupName = lookupObject.toUpperCase();
     const lookupType = lookupObjectType.toUpperCase();
 
-    const ruleInfo = findRuleForTarget(originalXml, tgtUpper);
+    const ruleInfo = findRuleForTarget(originalXml, tgtUpper, ruleGroupId);
     if (!ruleInfo) {
       return JSON.stringify({
         success: false,
@@ -2019,7 +2349,18 @@ async function updateRule(
       });
     }
 
-    const sourceFields = keyFields.map((k) => ({ name: mapping.get(k) as string, elementXml: extractSourceFieldProps(originalXml, mapping.get(k) as string).elementXml }));
+    const stepOptions = lookupStepOptions(
+      lookupOptions,
+      { type: lookupType, name: lookupName, timeDependent: lookupObjectInfo.timeDependent },
+      segmentFields,
+    );
+    if ('error' in stepOptions) {
+      return JSON.stringify({ success: false, message: `${stepOptions.error} The rule was not changed.` });
+    }
+    // The key date taken from the record is one more input of the read step, after the keys.
+    const inputFields = keyFields.map((k) => mapping.get(k) as string);
+    if (stepOptions.dateField) inputFields.push(stepOptions.dateField);
+    const sourceFields = inputFields.map((name) => ({ name, elementXml: extractSourceFieldProps(originalXml, name).elementXml }));
     let newRule: string;
     try {
       newRule = rebuildRule({
@@ -2029,7 +2370,7 @@ async function updateRule(
       targetField: tgtUpper,
       stepXsiType: 'trfn:StepRead',
       stepType: 'READ',
-      stepAttributes: ` objectName="${escapeXmlAttr(lookupName)}" objectType="${lookupType}"`,
+      stepAttributes: ` objectName="${escapeXmlAttr(lookupName)}" objectType="${lookupType}"${stepOptions.attributes}`,
       sourceFields,
     });
     } catch (err) {
@@ -2059,6 +2400,7 @@ async function updateRule(
       lookup_object: lookupName,
       lookup_object_type: lookupType,
       lookup_key_mapping: Object.fromEntries(mapping),
+      ...(Object.keys(stepOptions.described).length > 0 ? { lookup_options: stepOptions.described } : {}),
       lock_handle: lockHandle,
       transformation_name: transformationName.toUpperCase(),
       object_type: 'trfn',
@@ -2069,7 +2411,7 @@ async function updateRule(
 
   if (ruleType === 'no_update') {
     // ── Reset path — drop the mapping: StepInitial for a key field, StepNoUpdate otherwise ──
-    const ruleInfo = findRuleForTarget(originalXml, tgtUpper);
+    const ruleInfo = findRuleForTarget(originalXml, tgtUpper, ruleGroupId);
     if (!ruleInfo) {
       return JSON.stringify({
         success: false,
@@ -2142,7 +2484,7 @@ async function updateRule(
   if (unitSourceField) {
     const unitSrcUpper = unitSourceField.toUpperCase();
 
-    const kfRule = findRuleForTarget(originalXml, tgtUpper);
+    const kfRule = findRuleForTarget(originalXml, tgtUpper, ruleGroupId);
     if (!kfRule) {
       return JSON.stringify({
         success: false,
@@ -2196,7 +2538,7 @@ async function updateRule(
     // transformation that already carries combined key-figure+currency rules, the first
     // rule targeting 0CURRENCY is some other amount's combined rule — deleting it silently
     // destroys that amount's mapping (seen 2026-09-17: two neighbouring ZKB_* rules lost per call).
-    const unitRule = findStandaloneRuleForTarget(originalXml, unitTgtField);
+    const unitRule = findStandaloneRuleForTarget(originalXml, unitTgtField, ruleGroupId);
     if (unitRule && unitRule.oldRuleXml !== kfRule.oldRuleXml) {
       updatedXml = updatedXml.replace(unitRule.oldRuleXml, '');
     }
@@ -2237,7 +2579,7 @@ async function updateRule(
   const tgtFieldProps = extractTargetFieldProps(originalXml, tgtUpper);
 
   // Find any existing rule for the target
-  const ruleInfo = findRuleForTarget(originalXml, tgtUpper);
+  const ruleInfo = findRuleForTarget(originalXml, tgtUpper, ruleGroupId);
   if (!ruleInfo) {
     return JSON.stringify({
       success: false,
@@ -2367,12 +2709,23 @@ async function updateRule(
       if (!unitSrcElementXml) {
         return fail(`Source unit/currency field ${unitSrc} is not in the source segment.`);
       }
-    } else if (!typeInfo.fixedSource) {
+    } else if (!typeInfo.fixedSource && !fixedUnitOf(srcProps.elementXml)) {
+      // A source key figure with a fixed currency or unit brings its own; BW takes it from there.
       return fail(
-        `${typeName} has no fixed source ${conversionKind}, so the rule needs one from the source: ` +
-          `pass conversion.source_unit_field.`,
+        `${typeName} has no fixed source ${conversionKind} and source field ${srcUpper} has none either, so the rule ` +
+          `needs one from the source: pass conversion.source_unit_field.`,
       );
     }
+
+    // A target key figure with a fixed currency or unit only takes a conversion that ends in it:
+    // the server saves any other one as a plain assignment without a word.
+    const targetFixed = fixedUnitOf(tgtFieldProps.elementXml);
+    if (targetFixed && typeInfo.fixedTarget && typeInfo.fixedTarget.toUpperCase() !== targetFixed.toUpperCase()) {
+      return fail(
+        `${typeName} converts into ${typeInfo.fixedTarget}, but target ${tgtUpper} has the fixed ${conversionKind} ${targetFixed}.`,
+      );
+    }
+    const sourceFixed = unitSrc ? '' : typeInfo.fixedSource || fixedUnitOf(srcProps.elementXml);
 
     const convRule = buildConversionRule({
       groupId: ruleInfo.groupId,
@@ -2402,11 +2755,28 @@ async function updateRule(
       throw err;
     }
 
+    // The server drops a conversion it cannot place and keeps the plain assignment, so the saved
+    // rule is read back before the conversion is reported.
+    const saved = (await freshReadInactive(transformationName.toLowerCase())).body;
+    const savedRule = findRuleForTarget(saved, tgtUpper, ruleGroupId)?.oldRuleXml ?? '';
+    if (!/xsi:type="trfn:StepConversion"/.test(savedRule)) {
+      return JSON.stringify({
+        success: false,
+        message:
+          `The server saved the rule for ${tgtUpper} without the ${conversionKind} conversion ${typeInfo.name}: it is now a ` +
+          `plain assignment of ${srcUpper}. BW does this when the conversion type does not fit the ${conversionKind} of ` +
+          `the source or the target. Check the rule with bw_get_transformation before activating.`,
+        lock_handle: lockHandle,
+        transformation_name: transformationName.toUpperCase(),
+        object_type: 'trfn',
+      });
+    }
+
     return JSON.stringify({
       success: true,
       message:
         `Source field ${srcUpper} mapped to ${tgtUpper} with ${conversionKind} conversion ${typeInfo.name}` +
-        `${unitSrc ? ` (source ${conversionKind} from ${unitSrc})` : ` (fixed source ${typeInfo.fixedSource})`} in ` +
+        `${unitSrc ? ` (source ${conversionKind} from ${unitSrc})` : ` (fixed source ${conversionKind} ${sourceFixed})`} in ` +
         `transformation ${transformationName.toUpperCase()}. Call bw_activate to activate.`,
       conversion: {
         type: conversionKind,
@@ -3032,13 +3402,98 @@ async function verifyEndRoutineTargets(
   return { ok: true, detail: '', storedCount: stored.targetCount, endRoutinePresent: true };
 }
 
+/**
+ * The START rule with a new list of source fields: the routine reads exactly these fields of
+ * the source. Kept free of I/O so the rebuild can be tested without a backend.
+ */
+export function setStartRoutineSourceFields(
+  xml: string,
+  fields: string[] | undefined,
+  excludeFields: string[] | undefined,
+): { xml: string; selected: string[]; total: number } | { error: string } {
+  const rule = xml.match(/(<rule\b[^>]*\broutinetype="START"[^>]*>)([\s\S]*?)(<step\b[\s\S]*?\/>)(\s*<\/rule>)/);
+  if (!rule) return { error: 'The transformation has no START routine. Use bw_set_transformation_routine to create one first.' };
+  const all = listSourceSegmentFields(xml);
+  const byUpper = new Map(all.map((f) => [f.toUpperCase(), f]));
+  const named = (fields ?? excludeFields ?? []).map((f) => f.trim().toUpperCase());
+  const unknown = named.filter((f) => !byUpper.has(f));
+  if (unknown.length > 0) return { error: `Unknown source fields: ${unknown.join(', ')}. They must be fields of the source structure.` };
+  const selected = fields ? named.map((f) => byUpper.get(f) as string) : all.filter((f) => !named.includes(f.toUpperCase()));
+  if (selected.length === 0) return { error: 'The resolved field set is empty. The START routine must read at least one field.' };
+  const sources = selected
+    .map((f, i) => `<source id="${i + 1}"><elementRef>#///source/segment1/${f}</elementRef></source>`)
+    .join('');
+  return { xml: xml.replace(rule[0], rule[1] + sources + rule[3] + rule[4]), selected, total: all.length };
+}
+
+async function setStartRoutineFields(
+  client: BwClient,
+  transformationName: string,
+  fields: string[] | undefined,
+  excludeFields: string[] | undefined,
+  transport: string | undefined,
+): Promise<string> {
+  const lower = transformationName.toLowerCase();
+  const upper = transformationName.toUpperCase();
+  const { body: xml, headers } = await freshReadInactive(lower);
+  const rebuilt = setStartRoutineSourceFields(xml, fields, excludeFields);
+  if ('error' in rebuilt) return JSON.stringify({ success: false, message: `${rebuilt.error} Transformation ${upper} was not changed.` });
+  const lockHandle = await client.lock('trfn', lower);
+  try {
+    await putTransformation(createClientFromEnv(), lower, lockHandle, rebuilt.xml, headers['timestamp'] ?? '', transport);
+  } catch (err) {
+    await client.unlock('trfn', lower).catch(() => {/* ignore */});
+    throw err;
+  }
+  // The backend can accept the write and still drop the rule, so the stored list decides.
+  const saved = (await freshReadInactive(lower)).body;
+  const storedRule = saved.match(/<rule\b[^>]*\broutinetype="START"[^>]*>([\s\S]*?)<\/rule>/)?.[1];
+  const stored = storedRule === undefined ? [] : [...storedRule.matchAll(/#\/\/\/source\/segment1\/([^<]+)</g)].map((m) => m[1]);
+  // The server puts every source field a rule reads back into the list, so more fields than
+  // requested is its doing; a requested field that is missing is a failed write.
+  const asRequested = storedRule !== undefined && rebuilt.selected.every((f) => stored.includes(f));
+  const addedByServer = stored.filter((f) => !rebuilt.selected.includes(f));
+  if (!asRequested) {
+    return JSON.stringify({
+      success: false,
+      message:
+        `The START routine field list of transformation ${upper} was not stored as requested ` +
+        `(${storedRule === undefined ? 'the START routine is gone' : `${stored.length} fields stored`}). Inspect it with ` +
+        `bw_get_transformation before activating.`,
+      stored_fields: stored,
+      lock_handle: lockHandle,
+      transformation_name: upper,
+      object_type: 'trfn',
+    });
+  }
+  return JSON.stringify({
+    success: true,
+    message:
+      `START routine field list updated for transformation ${upper}: ${stored.length} of ${rebuilt.total} ` +
+      `source fields, read back from the transformation.` +
+      `${addedByServer.length > 0 ? ` BW keeps ${addedByServer.join(', ')} in the list because rules read them.` : ''}` +
+      ` Call bw_activate to activate.`,
+    selected_fields: stored,
+    selected_count: stored.length,
+    ...(addedByServer.length > 0 ? { kept_by_server: addedByServer } : {}),
+    total_source_fields: rebuilt.total,
+    lock_handle: lockHandle,
+    transformation_name: upper,
+    object_type: 'trfn',
+  });
+}
+
 export async function bwSetTransformationRoutineFields(
   client: BwClient,
   transformationName: string,
   fields?: string[],
   excludeFields?: string[],
-  transport?: string
+  transport?: string,
+  routineType: 'start' | 'end' = 'end',
 ): Promise<string> {
+  if (routineType === 'start' && Boolean(fields) !== Boolean(excludeFields)) {
+    return setStartRoutineFields(client, transformationName, fields, excludeFields, transport);
+  }
   if (!fields && !excludeFields) {
     return JSON.stringify({
       success: false,
@@ -3441,5 +3896,648 @@ export async function bwSetTransformationRuntime(
       dtps_deactivated_by_impact_analysis: deactivatedDtps,
       next_step: 'Re-activate the deactivated DTP(s) with bw_activate (object_type="dtpa", lock_handle="").',
     } : {}),
+  });
+}
+
+// ── Currency and unit handling of the whole transformation ──────────────────
+//
+// BW keeps a key figure and its unit or currency field in one rule while the handling is on,
+// and in two rules while it is off. Flipping the switch alone makes the server reset every
+// rule that is in the other form to "no update", so the rules are brought into the form the
+// new state expects in the same save.
+
+interface ParsedRule {
+  xml: string;
+  open: string;
+  id: string;
+  groupId: string;
+  sources: Array<{ xml: string; id: string; field: string; feeds: string }>;
+  targets: Array<{ xml: string; id: string; field: string; from: string; attrs: string }>;
+  steps: Array<{ xml: string; open: string; id: string; rank: string; type: string }>;
+}
+
+function parseRules(xml: string): ParsedRule[] {
+  const rules: ParsedRule[] = [];
+  for (const group of xml.matchAll(/<group\s+id="(\d+)"[^>]*>([\s\S]*?)<\/group>/g)) {
+    for (const m of group[2].matchAll(/<rule\b([^>]*)>([\s\S]*?)<\/rule>/g)) {
+      if (/\broutinetype="(?:START|END|EXPERT)"/.test(m[1])) continue;
+      const body = m[2];
+      rules.push({
+        xml: m[0],
+        open: `<rule${m[1]}>`,
+        id: m[1].match(/\bid="(\d+)"/)?.[1] ?? '',
+        groupId: group[1],
+        sources: [...body.matchAll(/<source\b[^>]*\bid="(\d+)"[^>]*>([\s\S]*?)<\/source>/g)].map((x) => ({
+          xml: x[0],
+          id: x[1],
+          field: x[2].match(/\/source\/segment1\/([^<]+)</)?.[1] ?? '',
+          feeds: [...x[2].matchAll(/<input>([^<]+)<\/input>/g)].map((i) => i[1]).join(' '),
+        })),
+        targets: [...body.matchAll(/<target\b([^>]*)>([\s\S]*?)<\/target>/g)].map((x) => ({
+          xml: x[0],
+          attrs: x[1].replace(/\s+id="[^"]*"/, ''),
+          id: x[1].match(/\bid="(\d+)"/)?.[1] ?? '',
+          field: x[2].match(/\/target\/segment1\/([^<]+)</)?.[1] ?? '',
+          from: x[2].match(/<output>([^<]+)<\/output>/)?.[1] ?? '',
+        })),
+        steps: [...body.matchAll(/<step\b([^>]*)>([\s\S]*?)<\/step>/g)].map((x) => ({
+          xml: x[0],
+          open: x[1],
+          id: x[1].match(/\bid="(\d+)"/)?.[1] ?? '',
+          rank: x[1].match(/\brank="([^"]*)"/)?.[1] ?? 'MAIN',
+          type: x[1].match(/\btype="([A-Z_]+)"/)?.[1] ?? '',
+        })),
+      });
+    }
+  }
+  return rules;
+}
+
+/** The unit or currency field each key figure of the target structure refers to. */
+function targetUnitFields(xml: string): Map<string, string> {
+  const segment = xml.match(/<target\b[^>]*>[\s\S]*?<segment[^>]*>([\s\S]*?)<\/segment>/)?.[1] ?? '';
+  const out = new Map<string, string>();
+  for (const m of segment.matchAll(/<element\b[^>]*\bname="([^"]+)"[^>]*>([\s\S]*?)<\/element>/g)) {
+    const unit = m[2].match(/<unitCurrencyElement>#\/\/\/target\/segment1\/([^<]+)<\/unitCurrencyElement>/)?.[1];
+    if (unit) out.set(m[1].toUpperCase(), unit.toUpperCase());
+  }
+  return out;
+}
+
+function plainDirectRule(g: string, id: string, sourceField: string, sourceElementXml: string, targetField: string, targetElementXml: string): string {
+  return `<rule id="${id}" description="">` +
+    `<source id="1"><input>#///group${g}/rule${id}/step1/input1</input><elementRef>#///source/segment1/${sourceField}</elementRef></source>` +
+    `<target id="1"><output>#///group${g}/rule${id}/step1/output1</output><elementRef>#///target/segment1/${targetField}</elementRef></target>` +
+    `<step xsi:type="trfn:StepDirect" id="1" rank="MAIN" type="DIRECT">` +
+    `<input id="1"><output>#///group${g}/rule${id}/source1</output>${segmentElementToStepElement(sourceElementXml)}</input>` +
+    `<output id="1"><input>#///group${g}/rule${id}/target1</input>${segmentElementToStepElement(targetElementXml)}</output></step></rule>`;
+}
+
+function resetRule(g: string, id: string, targetField: string, targetElementXml: string): string {
+  const reset = resetStepFor(targetElementXml);
+  return `<rule id="${id}" description="">` +
+    `<target id="1"><output>#///group${g}/rule${id}/step1/output1</output><elementRef>#///target/segment1/${targetField}</elementRef></target>` +
+    `<step xsi:type="${reset.xsiType}" id="1" rank="MAIN" type="${reset.stepType}">` +
+    `<output id="1"><input>#///group${g}/rule${id}/target1</input>${segmentElementToStepElement(targetElementXml)}</output></step></rule>`;
+}
+
+/**
+ * The rules as BW keeps them with the handling off: a rule that fills a key figure together with
+ * its unit or currency, or converts it, becomes the plain rule of the key figure, and the unit
+ * or currency gets a rule of its own — a direct assignment of the field it was taken from, or a
+ * reset when there was none. A conversion is dropped; the value then keeps its source currency
+ * or unit, which is what the unit rule assigns.
+ */
+export function splitUnitRules(xml: string): { xml: string; notes: string[] } {
+  let out = xml;
+  const notes: string[] = [];
+  for (const rule of parseRules(xml)) {
+    const conversion = rule.steps.find((st) => st.type === 'CONVERSION');
+    if (rule.targets.length < 2 && !conversion) continue;
+    const main = rule.steps.find((st) => st.rank === 'MAIN') ?? rule.steps[0];
+    if (!main) continue;
+    const g = rule.groupId;
+    const feedsStep = (id: string) => `/rule${rule.id}/step${id}/`;
+    // The key figure is filled by the main step, directly or through the conversion step.
+    const valueTarget =
+      rule.targets.find((t) => t.from.includes(`${feedsStep(main.id)}output`)) ??
+      (conversion ? rule.targets.find((t) => t.from.endsWith(`${feedsStep(conversion.id)}output1`)) : undefined) ??
+      rule.targets[0];
+    const unitTargets = rule.targets.filter((t) => t !== valueTarget);
+    const conversionUnitSource = conversion
+      ? rule.sources.find((src) => src.feeds.includes(`${feedsStep(conversion.id)}input`))
+      : undefined;
+
+    const valueElement = extractTargetFieldProps(xml, valueTarget.field).elementXml;
+    const mainSources = rule.sources.filter((src) => src.feeds.includes(`${feedsStep(main.id)}input`));
+    // A formula or routine behind a conversion carries the currency as an input the server added.
+    const mainInputs = [...main.xml.matchAll(/<input\b[^>]*\bid="(\d+)"[^>]*>[\s\S]*?<\/input>/g)]
+      .filter((i) => !conversionUnitSource || !i[0].includes(`/source${conversionUnitSource.id}</output>`));
+    const keptSources = mainSources
+      .filter((src) => src !== conversionUnitSource)
+      .map((src) => src.xml.replace(/<input>[^<]*<\/input>/g, (ref) => (ref.includes(`${feedsStep(main.id)}input`) ? ref : '')));
+    const valueRule =
+      `<rule id="${rule.id}" conversiontype="NO_CONVERSION" description="">${keptSources.join('')}` +
+      `<target${valueTarget.attrs} id="${valueTarget.id}"><output>#///group${g}/rule${rule.id}/step${main.id}/output1</output>` +
+      `<elementRef>#///target/segment1/${valueTarget.field}</elementRef></target>` +
+      `<step${main.open}>${mainInputs.map((i) => i[0]).join('')}` +
+      `<output id="1"><input>#///group${g}/rule${rule.id}/target${valueTarget.id}</input>${segmentElementToStepElement(valueElement)}</output></step></rule>`;
+
+    let unitRules = '';
+    for (const unitTarget of unitTargets) {
+      const minor = rule.steps.find((st) => unitTarget.from.includes(`${feedsStep(st.id)}output`));
+      const minorSource = minor ? rule.sources.find((src) => src.feeds.includes(`${feedsStep(minor.id)}input`)) : undefined;
+      const from = minorSource ?? conversionUnitSource;
+      const unitElement = extractTargetFieldProps(xml, unitTarget.field).elementXml;
+      const id = nextFreeRuleId(out + unitRules);
+      if (from) {
+        unitRules += plainDirectRule(g, id, from.field, extractSourceFieldProps(xml, from.field).elementXml, unitTarget.field, unitElement);
+        notes.push(`${unitTarget.field} gets a rule of its own, a direct assignment of ${from.field}`);
+      } else {
+        unitRules += resetRule(g, id, unitTarget.field, unitElement);
+        notes.push(`${unitTarget.field} gets a rule of its own without a mapping`);
+      }
+    }
+    if (conversion) notes.push(`the conversion of ${valueTarget.field} is dropped`);
+    out = out.replace(rule.xml, valueRule + unitRules);
+  }
+  return { xml: out, notes };
+}
+
+/**
+ * The rules as BW keeps them with the handling on: the rule of a key figure also fills its unit
+ * or currency field, through a second step that takes the field the unit's own rule assigned.
+ * A unit whose own rule was not a direct assignment cannot be carried into the combined rule.
+ */
+export function combineUnitRules(xml: string): { xml: string; notes: string[] } {
+  let out = xml;
+  const notes: string[] = [];
+  const units = targetUnitFields(xml);
+  const rules = parseRules(xml);
+  const consumed = new Set<string>();
+  for (const rule of rules) {
+    if (rule.targets.length !== 1 || rule.steps.some((st) => st.type === 'CONVERSION')) continue;
+    const unitField = units.get(rule.targets[0].field.toUpperCase());
+    if (!unitField) continue;
+    const main = rule.steps.find((st) => st.rank === 'MAIN') ?? rule.steps[0];
+    if (!main || main.type === 'NO_UPDATE' || main.type === 'INITIAL') continue;
+    const unitRule = rules.find(
+      (r) => r.groupId === rule.groupId && r.targets.length === 1 && r.targets[0].field.toUpperCase() === unitField,
+    );
+    if (!unitRule) continue;
+    const unitMain = unitRule.steps[0];
+    const g = rule.groupId;
+    const stepId = String(Math.max(...rule.steps.map((st) => Number(st.id))) + 1);
+    const sourceId = String(Math.max(0, ...rule.sources.map((src) => Number(src.id))) + 1);
+    const unitElement = segmentElementToStepElement(extractTargetFieldProps(xml, unitField).elementXml);
+    let source = '';
+    let input = '';
+    let sharedSource: { xml: string; replacement: string } | undefined;
+    if (unitMain?.type === 'DIRECT' && unitRule.sources.length === 1) {
+      const from = unitRule.sources[0].field;
+      const wire = `<input>#///group${g}/rule${rule.id}/step${stepId}/input1</input>`;
+      // A field is a source of a rule once; a formula that already reads the unit shares it.
+      const existing = rule.sources.find((src) => src.field.toUpperCase() === from.toUpperCase());
+      if (existing) {
+        sharedSource = { xml: existing.xml, replacement: existing.xml.replace('<elementRef>', `${wire}<elementRef>`) };
+      } else {
+        source = `<source id="${sourceId}">${wire}<elementRef>#///source/segment1/${from}</elementRef></source>`;
+      }
+      input = `<input id="1"><output>#///group${g}/rule${rule.id}/source${existing?.id ?? sourceId}</output>` +
+        `${segmentElementToStepElement(extractSourceFieldProps(xml, from).elementXml)}</input>`;
+      notes.push(`${unitField} is filled from ${from} by the rule of ${rule.targets[0].field}`);
+    } else {
+      notes.push(
+        `${unitField} is filled by the rule of ${rule.targets[0].field} and has no source there` +
+        `${unitMain && unitMain.type !== 'NO_UPDATE' && unitMain.type !== 'INITIAL' ? `; its own ${unitMain.type.toLowerCase()} rule is given up` : ''}`,
+      );
+    }
+    const target = `<target id="2"><output>#///group${g}/rule${rule.id}/step${stepId}/output1</output>` +
+      `<elementRef>#///target/segment1/${unitField}</elementRef></target>`;
+    const minor = `<step xsi:type="trfn:StepDirect" id="${stepId}" rank="MINOR" type="DIRECT">${input}` +
+      `<output id="1"><input>#///group${g}/rule${rule.id}/target2</input>${unitElement}</output></step>`;
+    let combined = rule.xml.replace(/<\/rule>$/, `${minor}</rule>`);
+    const lastTarget = rule.targets[rule.targets.length - 1].xml;
+    combined = combined.replace(lastTarget, `${lastTarget}${target}`);
+    const firstTarget = rule.targets[0].xml;
+    combined = combined.replace(firstTarget, `${source}${firstTarget}`);
+    if (sharedSource) combined = combined.replace(sharedSource.xml, sharedSource.replacement);
+    combined = setRuleConversionType(combined, 'FROM_SOURCE');
+    out = out.replace(rule.xml, combined);
+    if (!consumed.has(unitRule.xml)) {
+      out = out.replace(unitRule.xml, '');
+      consumed.add(unitRule.xml);
+    }
+  }
+  return { xml: out, notes };
+}
+
+// ── Settings of a transformation ─────────────────────────────────────────────
+
+export interface TransformationTargetOptions {
+  target: string;
+  perform_conversion_exit?: boolean;
+  master_data_check?: boolean;
+  /** The description of the rule that fills the field, in the standard rule group. */
+  rule_description?: string;
+}
+
+export interface TransformationSettingsArgs {
+  transformation_name: string;
+  initialize_null_values?: boolean;
+  enable_inverse_routines?: boolean;
+  error_handling_in_routines?: boolean;
+  allow_currency_unit_conversion?: boolean;
+  target_options?: TransformationTargetOptions[];
+  /** The complete list of source fields the extraction is grouped by; [] removes the grouping. */
+  semantic_group_fields?: string[];
+  transport?: string;
+}
+
+const ROOT_SETTINGS: ReadonlyArray<['initialize_null_values' | 'enable_inverse_routines' | 'error_handling_in_routines' | 'allow_currency_unit_conversion', string]> = [
+  ['initialize_null_values', 'initializeNullValues'],
+  ['enable_inverse_routines', 'enableInverseRoutines'],
+  ['error_handling_in_routines', 'enableErrorHandlingInRoutines'],
+  ['allow_currency_unit_conversion', 'allowCurrencyAndUnitConversion'],
+];
+
+function setTagAttribute(tag: string, name: string, value: string): string {
+  const re = new RegExp(`\\s${name}="[^"]*"`);
+  if (re.test(tag)) return tag.replace(re, ` ${name}="${value}"`);
+  return tag.replace(/(\/?>)$/, ` ${name}="${value}"$1`);
+}
+
+function tagAttribute(tag: string, name: string): string | undefined {
+  return tag.match(new RegExp(`\\s${name}="([^"]*)"`))?.[1];
+}
+
+/** The open tag of a segment element by field name, within the source or the target structure. */
+function segmentElementTag(xml: string, side: 'source' | 'target', field: string): string | undefined {
+  const segment = xml.match(new RegExp(`<${side}\\b[^>]*>[\\s\\S]*?<segment[^>]*>([\\s\\S]*?)<\\/segment>`))?.[1] ?? '';
+  return segment.match(new RegExp(`<element\\b[^>]*\\bname="${escapeRegExp(field)}"[^>]*>`))?.[0];
+}
+
+function escapeRegExp(text: string): string {
+  return text.replace(/[.*+?^${}()|[\]\\\/]/g, '\\$&');
+}
+
+/**
+ * Apply the settings to a transformation document. Follows the modeling tools: the three
+ * switches sit on the root, the master data check on the element of the target structure (and
+ * only where BW names an object to check against), the conversion exit on every target of the
+ * rule that fills the field (and only where the field has a conversion routine), the grouping
+ * of the extraction on the elements of the source structure.
+ */
+export function applyTransformationSettings(
+  xml: string,
+  args: Omit<TransformationSettingsArgs, 'transformation_name' | 'transport'>,
+): { xml: string; changes: string[]; unchanged: string[] } | { error: string } {
+  let out = xml;
+  const changes: string[] = [];
+  const unchanged: string[] = [];
+  const note = (changed: boolean, text: string) => (changed ? changes : unchanged).push(text);
+
+  const root = out.match(/<trfn:transformation\b[^>]*>/)?.[0];
+  if (!root) return { error: 'The document has no transformation root element.' };
+  let newRoot = root;
+  let unitHandling: boolean | undefined;
+  for (const [arg, attribute] of ROOT_SETTINGS) {
+    const wanted = args[arg];
+    if (wanted === undefined) continue;
+    const value = wanted ? 'true' : 'false';
+    const changed = (tagAttribute(newRoot, attribute) ?? 'false') !== value;
+    note(changed, `${arg} = ${value}`);
+    if (changed && arg === 'allow_currency_unit_conversion') unitHandling = wanted;
+    newRoot = setTagAttribute(newRoot, attribute, value);
+  }
+  out = out.replace(root, newRoot);
+  if (unitHandling !== undefined) {
+    const reshaped = unitHandling ? combineUnitRules(out) : splitUnitRules(out);
+    out = reshaped.xml;
+    changes.push(...reshaped.notes);
+  }
+
+  for (const option of args.target_options ?? []) {
+    const target = option.target?.trim().toUpperCase();
+    if (!target) return { error: 'Every entry of target_options needs target, the name of the target field.' };
+    const tag = segmentElementTag(out, 'target', target);
+    if (!tag) return { error: `Target field ${target} is not in the target structure.` };
+
+    if (option.master_data_check !== undefined) {
+      const checkObject = tagAttribute(tag, 'masterDataCheckObjectName');
+      if (!checkObject) {
+        return { error: `Target field ${target} has no master data to check against, so master_data_check does not apply to it.` };
+      }
+      const value = option.master_data_check ? 'true' : 'false';
+      note((tagAttribute(tag, 'performMasterDataCheck') ?? 'false') !== value, `${target}: master_data_check = ${value} (against ${checkObject})`);
+      out = out.replace(tag, setTagAttribute(tag, 'performMasterDataCheck', value));
+    }
+
+    if (option.rule_description !== undefined) {
+      const rule = findRuleForTarget(out, target);
+      if (!rule) return { error: `No rule found for target field ${target}.` };
+      const open = rule.oldRuleXml.match(/^<rule\b[^>]*>/)?.[0] ?? '';
+      const text = option.rule_description.trim();
+      note(decodeXmlEntities(tagAttribute(open, 'description') ?? '') !== text, `${target}: rule_description = "${text}"`);
+      out = out.replace(rule.oldRuleXml, rule.oldRuleXml.replace(open, setTagAttribute(open, 'description', escapeXmlAttr(text))));
+    }
+
+    if (option.perform_conversion_exit !== undefined) {
+      const routine = tagAttribute(tag, 'conversionRoutine');
+      if (!routine) {
+        return { error: `Target field ${target} has no conversion routine, so perform_conversion_exit does not apply to it.` };
+      }
+      const rule = findRuleForTarget(out, target);
+      if (!rule) return { error: `No rule found for target field ${target}.` };
+      if (rule.stepType === 'NO_UPDATE') {
+        return { error: `Target field ${target} is not updated by its rule, so there is no value to convert.` };
+      }
+      const value = option.perform_conversion_exit ? 'YES' : 'NO';
+      let changed = false;
+      let refused = false;
+      const newRule = rule.oldRuleXml.replace(/<target\b[^>]*>/g, (targetTag) => {
+        const current = tagAttribute(targetTag, 'performConversionExit');
+        if (current === 'NOT_SUPPORTED') {
+          refused = true;
+          return targetTag;
+        }
+        if (current !== value) changed = true;
+        return setTagAttribute(targetTag, 'performConversionExit', value);
+      });
+      if (refused) return { error: `BW does not support the conversion exit ${routine} in the rule of ${target}.` };
+      note(changed, `${target}: perform_conversion_exit = ${value} (${routine})`);
+      out = out.replace(rule.oldRuleXml, newRule);
+    }
+  }
+
+  if (args.semantic_group_fields !== undefined) {
+    const wanted = new Set(args.semantic_group_fields.map((f) => f.trim().toUpperCase()).filter(Boolean));
+    const available = listSourceSegmentFields(out);
+    const unknown = [...wanted].filter((f) => !available.includes(f));
+    if (unknown.length > 0) return { error: `Source field(s) ${unknown.join(', ')} are not in the source structure.` };
+    const before: string[] = [];
+    for (const field of available) {
+      const tag = segmentElementTag(out, 'source', field);
+      if (!tag) continue;
+      const grouped = tagAttribute(tag, 'groupedExtraction') === 'true';
+      if (grouped) before.push(field);
+      if (grouped === wanted.has(field)) continue;
+      const newTag = wanted.has(field)
+        ? setTagAttribute(tag, 'groupedExtraction', 'true')
+        : tag.replace(/\sgroupedExtraction="[^"]*"/, '');
+      out = out.replace(tag, newTag);
+    }
+    const same = before.length === wanted.size && before.every((f) => wanted.has(f));
+    note(!same, `semantic_group_fields = ${[...wanted].join(', ') || '(none)'}`);
+  }
+
+  return { xml: out, changes, unchanged };
+}
+
+/**
+ * bw_update_transformation_settings — switches of the transformation, options of single
+ * target fields, and the fields the extraction is grouped by. Nothing is saved when every
+ * requested value is already in place.
+ */
+export async function bwUpdateTransformationSettings(client: BwClient, args: TransformationSettingsArgs): Promise<string> {
+  const name = args.transformation_name;
+  const nameUpper = name.toUpperCase();
+  const current = await freshReadInactive(name.toLowerCase());
+  const applied = applyTransformationSettings(current.body, args);
+  if ('error' in applied) {
+    return JSON.stringify({ success: false, message: `${applied.error} Transformation ${nameUpper} was not changed.` });
+  }
+  if (applied.changes.length === 0 && applied.unchanged.length === 0) {
+    return JSON.stringify({
+      success: false,
+      message:
+        'Nothing to change: pass initialize_null_values, enable_inverse_routines, error_handling_in_routines, ' +
+        'target_options or semantic_group_fields.',
+    });
+  }
+  if (applied.changes.length === 0) {
+    return JSON.stringify({
+      success: true,
+      changed: false,
+      message: `Transformation ${nameUpper} already has these settings. Nothing was saved.`,
+      already_set: applied.unchanged,
+    });
+  }
+  const timestamp = current.headers['timestamp'] ?? current.headers['TIMESTAMP'];
+  const lockHandle = await client.lock('trfn', name);
+  try {
+    await putTransformation(client, name, lockHandle, applied.xml, timestamp, args.transport);
+  } catch (err) {
+    await client.unlock('trfn', name).catch(() => {/* ignore */});
+    throw err;
+  }
+  return JSON.stringify({
+    success: true,
+    message: `Settings of transformation ${nameUpper} changed. Call bw_activate to activate.`,
+    changed: applied.changes,
+    ...(applied.unchanged.length > 0 ? { already_set: applied.unchanged } : {}),
+    lock_handle: lockHandle,
+    transformation_name: nameUpper,
+    object_type: 'trfn',
+  });
+}
+
+// ── Rule groups ──────────────────────────────────────────────────────────────
+
+/**
+ * In a rule group, a rule that only refers to the rule of the standard group for a target gets
+ * a copy of that rule, as the modeling tools do before such a rule can be changed. The document
+ * comes back unchanged when the group has a rule of its own for the target.
+ */
+export function materializeReferencedRule(xml: string, groupId: string, targetField: string): string {
+  const group = xml.match(new RegExp(`<group\\s+id="${groupId}"[^>]*>[\\s\\S]*?<\\/group>`))?.[0];
+  if (!group) return xml;
+  for (const ref of group.matchAll(/<rule\b([^>]*)>\s*<refRule>#\/\/\/group(\d+)\/rule(\d+)<\/refRule>\s*<\/rule>/g)) {
+    const original = xml.match(new RegExp(`<group\\s+id="${ref[2]}"[^>]*>[\\s\\S]*?<\\/group>`))?.[0]
+      .match(new RegExp(`<rule\\b[^>]*\\bid="${ref[3]}"[^>]*>[\\s\\S]*?<\\/rule>`))?.[0];
+    if (!original || !original.includes(`<elementRef>#///target/segment1/${targetField.toUpperCase()}</elementRef>`)) continue;
+    const id = ref[1].match(/\bid="(\d+)"/)?.[1] ?? '';
+    const copy = original
+      .split(`#///group${ref[2]}/rule${ref[3]}/`).join(`#///group${groupId}/rule${id}/`)
+      .replace(/^<rule\b[^>]*>/, (open) => open.replace(/\bid="\d+"/, `id="${id}"`));
+    return xml.replace(group, group.replace(ref[0], copy));
+  }
+  return xml;
+}
+
+/** Put the rule of a target in a rule group back to following the standard group by reference. */
+export function referenceStandardRule(xml: string, groupId: string, targetField: string): { xml: string } | { error: string } {
+  const target = targetField.toUpperCase();
+  const groups = listRuleGroups(xml);
+  const standard = groups.find((g) => g.type === 'S');
+  if (!standard || standard.id === groupId) return { error: 'The rules of the standard group are the originals and refer to nothing.' };
+  const standardRule = findRuleForTarget(xml, target, standard.id);
+  if (!standardRule) return { error: `The standard rule group has no rule for ${target}.` };
+  const own = findRuleForTarget(xml, target, groupId);
+  if (!own) {
+    const group = xml.match(new RegExp(`<group\\s+id="${groupId}"[^>]*>[\\s\\S]*?<\\/group>`))?.[0] ?? '';
+    if (group.includes(`<refRule>#///group${standard.id}/rule${standardRule.ruleId}</refRule>`)) return { error: `${target} already follows the standard rule group.` };
+    return { error: `The rule group has no rule for ${target}.` };
+  }
+  if (ruleTargetFieldNames(own.oldRuleXml).length > 1 || ruleTargetFieldNames(standardRule.oldRuleXml).length > 1) {
+    return { error: `${target} is filled together with another field; a combined rule cannot follow the standard group by reference.` };
+  }
+  return {
+    xml: xml.replace(own.oldRuleXml, `<rule id="${own.ruleId}" description=""><refRule>#///group${standard.id}/rule${standardRule.ruleId}</refRule></rule>`),
+  };
+}
+
+export interface RuleGroupInfo {
+  id: string;
+  description: string;
+  type: string;
+  rules: number;
+}
+
+const TECHNICAL_TARGETS: ReadonlyArray<string> = ['0RECORDMODE', '0RECORDTP'];
+
+/** The rule groups of a transformation, in document order. */
+export function listRuleGroups(xml: string): RuleGroupInfo[] {
+  return [...xml.matchAll(/<group\b([^>]*)>([\s\S]*?)<\/group>/g)].map((m) => ({
+    id: m[1].match(/\bid="(\d+)"/)?.[1] ?? '',
+    description: decodeXmlEntities(m[1].match(/\bdescription="([^"]*)"/)?.[1] ?? ''),
+    type: m[1].match(/\btype="([^"]*)"/)?.[1] ?? '',
+    rules: [...m[2].matchAll(/<rule\b/g)].length,
+  }));
+}
+
+/** A rule group by its id or its description; undefined when none or more than one matches. */
+export function findRuleGroup(xml: string, group: string): RuleGroupInfo | undefined {
+  const wanted = group.trim();
+  const groups = listRuleGroups(xml);
+  const byId = groups.filter((g) => g.id === wanted);
+  if (byId.length === 1) return byId[0];
+  const byName = groups.filter((g) => g.description.toUpperCase() === wanted.toUpperCase());
+  return byName.length === 1 ? byName[0] : undefined;
+}
+
+/**
+ * Add a rule group the way the modeling tools do: it works on the segments of the standard
+ * group, a key field takes over the rule of the standard group by reference, and every other
+ * field starts without a mapping. Technical fields stay with the technical group.
+ */
+export function addRuleGroup(xml: string, description: string): { xml: string; groupId: string } | { error: string } {
+  const groups = [...xml.matchAll(/<group\b([^>]*)>([\s\S]*?)<\/group>/g)];
+  const standard = groups.find((m) => /\btype="S"/.test(m[1]));
+  if (!standard) return { error: 'The transformation has no standard rule group to derive a new group from.' };
+  if (listRuleGroups(xml).some((g) => g.description.toUpperCase() === description.trim().toUpperCase())) {
+    return { error: `A rule group named "${description.trim()}" already exists.` };
+  }
+  const standardId = standard[1].match(/\bid="(\d+)"/)?.[1] ?? '1';
+  const segments = (standard[1].match(/\s(?:sourceSegment|targetSegment)="[^"]*"/g) ?? []).join('');
+  const groupId = String(Math.max(...groups.map((m) => Number(m[1].match(/\bid="(\d+)"/)?.[1] ?? 0))) + 1);
+
+  const standardRuleOf = new Map<string, string>();
+  for (const r of standard[2].matchAll(/<rule\b([^>]*)>([\s\S]*?)<\/rule>/g)) {
+    const id = r[1].match(/\bid="(\d+)"/)?.[1] ?? '';
+    for (const t of r[2].matchAll(/<elementRef>#\/\/\/target\/segment1\/([^<]+)<\/elementRef>/g)) standardRuleOf.set(t[1].toUpperCase(), id);
+  }
+
+  const used = new Set([...xml.matchAll(/<rule\b[^>]*\bid="(\d+)"/g)].map((m) => Number(m[1])));
+  const nextId = () => {
+    let id = 1;
+    while (used.has(id)) id++;
+    used.add(id);
+    return String(id);
+  };
+
+  const targetSegment = xml.match(/<target\b[^>]*>[\s\S]*?<segment[^>]*>([\s\S]*?)<\/segment>/)?.[1] ?? '';
+  let rules = '';
+  for (const el of targetSegment.matchAll(/<element\b([^>]*\bposit="[^"]*"[^>]*)>[\s\S]*?<\/element>/g)) {
+    const name = el[1].match(/\bname="([^"]+)"/)?.[1] ?? '';
+    const infoObject = el[1].match(/\binfoObjectName="([^"]+)"/)?.[1] ?? '';
+    if (!name || TECHNICAL_TARGETS.includes(infoObject) || /__TECH_FIELDS__/.test(el[1])) continue;
+    const id = nextId();
+    if (/\bkey="true"/.test(el[1])) {
+      const original = standardRuleOf.get(name.toUpperCase());
+      if (!original) return { error: `The standard rule group has no rule for the key field ${name}.` };
+      rules += `<rule id="${id}" description=""><refRule>#///group${standardId}/rule${original}</refRule></rule>`;
+    } else {
+      rules += `<rule id="${id}" description="">` +
+        `<target id="1"><output>#///group${groupId}/rule${id}/step1/output1</output><elementRef>#///target/segment1/${name}</elementRef></target>` +
+        `<step xsi:type="trfn:StepNoUpdate" id="1" rank="MAIN" type="NO_UPDATE">` +
+        `<output id="1"><input>#///group${groupId}/rule${id}/target1</input>${segmentElementToStepElement(el[0])}</output></step></rule>`;
+    }
+  }
+  const group = `<group id="${groupId}" description="${escapeXmlAttr(description.trim())}" type="N"${segments}>${rules}</group>`;
+  const last = groups[groups.length - 1][0];
+  const at = xml.lastIndexOf(last) + last.length;
+  return { xml: xml.slice(0, at) + group + xml.slice(at), groupId };
+}
+
+export interface RuleGroupArgs {
+  transformation_name: string;
+  action: 'add' | 'rename' | 'remove' | 'list' | 'use_standard_rule';
+  /** For use_standard_rule: the target field whose rule follows the standard group again. */
+  target?: string;
+  /** The group to rename or remove: its id or its description. */
+  group?: string;
+  /** The description of the new group, or the new description of a renamed one. */
+  description?: string;
+  transport?: string;
+}
+
+/**
+ * bw_manage_transformation_rule_group — list, add, rename or remove a rule group. The standard
+ * group, the technical group and the group of the global routines belong to the transformation
+ * and cannot be removed.
+ */
+export async function bwManageTransformationRuleGroup(client: BwClient, args: RuleGroupArgs): Promise<string> {
+  const name = args.transformation_name;
+  const nameUpper = name.toUpperCase();
+  const current = await freshReadInactive(name.toLowerCase());
+  const xml = current.body;
+  const fail = (message: string) =>
+    JSON.stringify({ success: false, message: `${message} Transformation ${nameUpper} was not changed.`, rule_groups: listRuleGroups(xml) });
+
+  if (args.action === 'list') {
+    return JSON.stringify({ success: true, transformation_name: nameUpper, rule_groups: listRuleGroups(xml) });
+  }
+
+  let updated: string;
+  let message: string;
+  if (args.action === 'add') {
+    const description = args.description?.trim();
+    if (!description) return fail('action "add" needs description, the name of the new rule group.');
+    const added = addRuleGroup(xml, description);
+    if ('error' in added) return fail(added.error);
+    updated = added.xml;
+    message =
+      `Rule group "${description}" added to transformation ${nameUpper}. Its key fields follow the rules of the standard group, ` +
+      `every other field has no mapping yet: set them with bw_update_transformation and rule_group "${description}".`;
+  } else {
+    if (!args.group?.trim()) return fail(`action "${args.action}" needs group, the id or the description of the rule group.`);
+    const found = findRuleGroup(xml, args.group);
+    if (!found) return fail(`No rule group "${args.group}" found, or the name is not unique.`);
+    const tag = xml.match(new RegExp(`<group\\s+id="${found.id}"[^>]*>`))?.[0];
+    if (!tag) return fail(`Rule group ${found.id} could not be located in the document.`);
+    if (args.action === 'rename') {
+      const description = args.description?.trim();
+      if (!description) return fail('action "rename" needs description, the new name of the rule group.');
+      if (found.type === 'T' || found.type === 'G') return fail('The technical group and the group of the global routines keep their names.');
+      updated = xml.replace(tag, tag.replace(/\bdescription="[^"]*"/, `description="${escapeXmlAttr(description)}"`));
+      message = `Rule group "${found.description}" of transformation ${nameUpper} renamed to "${description}".`;
+    } else if (args.action === 'use_standard_rule') {
+      const target = args.target?.trim().toUpperCase();
+      if (!target) return fail('action "use_standard_rule" needs target, the target field.');
+      const referenced = referenceStandardRule(xml, found.id, target);
+      if ('error' in referenced) return fail(referenced.error);
+      updated = referenced.xml;
+      message = `${target} in rule group "${found.description}" of transformation ${nameUpper} follows the rule of the standard group again.`;
+    } else if (args.action === 'remove') {
+      const standardId = listRuleGroups(xml).find((g) => g.type === 'S')?.id;
+      if (found.type === 'T' || found.type === 'G' || found.id === standardId) {
+        return fail(`Rule group "${found.description}" belongs to the transformation and cannot be removed.`);
+      }
+      const whole = xml.match(new RegExp(`<group\\s+id="${found.id}"[^>]*>[\\s\\S]*?<\\/group>`))?.[0];
+      if (!whole) return fail(`Rule group ${found.id} could not be located in the document.`);
+      updated = xml.replace(whole, '');
+      message = `Rule group "${found.description}" removed from transformation ${nameUpper} with its ${found.rules} rule(s).`;
+    } else {
+      return fail(`Unknown action "${String(args.action)}". Valid actions: list, add, rename, remove, use_standard_rule.`);
+    }
+  }
+
+  const timestamp = current.headers['timestamp'] ?? current.headers['TIMESTAMP'];
+  const lockHandle = await client.lock('trfn', name);
+  try {
+    await putTransformation(client, name, lockHandle, updated, timestamp, args.transport);
+  } catch (err) {
+    await client.unlock('trfn', name).catch(() => {/* ignore */});
+    throw err;
+  }
+  const saved = (await freshReadInactive(name.toLowerCase())).body;
+  return JSON.stringify({
+    success: true,
+    message: `${message} Call bw_activate to activate.`,
+    rule_groups: listRuleGroups(saved),
+    lock_handle: lockHandle,
+    transformation_name: nameUpper,
+    object_type: 'trfn',
   });
 }
