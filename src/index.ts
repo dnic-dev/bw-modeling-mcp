@@ -2175,23 +2175,30 @@ const TOOL_DEFINITIONS = [
         'Optionally set a filter on one source field (Equal operator). ' +
         'After creation the DTP is activated automatically. ' +
         'IMPORTANT: Before calling this tool, always check the full transformation chain. ' +
-        'Single-step chain (e.g. ADSO->ADSO): use trfn_name only. ' +
-        'Two-step chain (e.g. ADSO->TRCS->ADSO): use trfn_name for the first transformation and trfn_name_2 for the second; ' +
+        'The DTP needs every transformation on the path from its source to its target: one for a direct ' +
+        'connection (e.g. ADSO->ADSO), one per step when the path runs through InfoSources ' +
+        '(e.g. ADSO->TRCS->TRCS->ADSO has three). Pass them all as trfn_names; ' +
         'source_name/source_type = the start object, target_name/target_type = the end object. ' +
-        'Omitting trfn_name_2 in a two-step chain causes a persistent HTTP 500 error. ' +
+        'The path is checked before anything is created: a missing transformation is reported with the ' +
+        'object where the path breaks, and the order of the list does not matter. ' +
         'Use bw_get_transformation or bw_xref to determine the chain before creating the DTP. ' +
         'DataSource source: set source_type "RSDS" and pass source_system (the DataSource source system). ' +
         'source_name is then the plain DataSource name; the tool builds the RSDS compound source key internally.',
       inputSchema: {
         type: 'object',
         properties: {
+          trfn_names: {
+            type: 'array',
+            items: { type: 'string' },
+            description: 'Technical names (UUID-like keys) of every transformation on the path from source to target — one entry for a direct connection, one per step for a path through InfoSources. Any number of steps.',
+          },
           trfn_name: {
             type: 'string',
-            description: 'Technical name of the existing Transformation (UUID-like key).',
+            description: 'Single transformation of a direct connection. Same as trfn_names with one entry.',
           },
           trfn_name_2: {
             type: 'string',
-            description: 'Optional second transformation in a multi-step chain. Include when the DTP spans two transformations (e.g. ADSO→TRCS→ADSO).',
+            description: 'Second transformation of a two-step path, together with trfn_name. For longer paths use trfn_names.',
           },
           source_name: {
             type: 'string',
@@ -2232,7 +2239,7 @@ const TOOL_DEFINITIONS = [
           },
           ...DTP_FILTER_SCHEMA_PROPS,
         },
-        required: ['trfn_name', 'source_name', 'source_type', 'target_name', 'target_type'],
+        required: ['source_name', 'source_type', 'target_name', 'target_type'],
       },
     },
     {
@@ -7446,8 +7453,9 @@ async function handleToolCall(
 
       case 'bw_create_dtp':
         text = await bwCreateDtp(client, {
-          trfn_name: args?.trfn_name as string,
+          trfn_name: args?.trfn_name as string | undefined,
           trfn_name_2: args?.trfn_name_2 as string | undefined,
+          trfn_names: args?.trfn_names as string[] | undefined,
           source_name: args?.source_name as string,
           source_type: args?.source_type as string,
           source_system: args?.source_system as string | undefined,

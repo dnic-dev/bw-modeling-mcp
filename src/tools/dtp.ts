@@ -9,6 +9,7 @@ import {
 } from '../bw-client.js';
 import { resolveLogonUser } from './logon_user.js';
 import { bwActivate } from './activation.js';
+import { readTransformationEnds, type TransformationEnds } from './transformation.js';
 
 interface XrefEntry {
   objectName: string;
@@ -779,9 +780,89 @@ export function resolveFilterSelections(args: {
 
 // ── bwCreateDtp ───────────────────────────────────────────────────────────────
 
+/**
+ * The transformations a DTP runs through, from the create arguments: either the list
+ * trfn_names or the pair trfn_name / trfn_name_2.
+ */
+export function resolveDtpTransformations(
+  args: Pick<CreateDtpArgs, 'trfn_name' | 'trfn_name_2' | 'trfn_names'>,
+): string[] {
+  const clean = (v: unknown) => (typeof v === 'string' ? v.trim().toUpperCase() : '');
+  const single = [clean(args.trfn_name), clean(args.trfn_name_2)].filter(Boolean);
+  if (args.trfn_names !== undefined) {
+    if (!Array.isArray(args.trfn_names)) {
+      throw new Error('trfn_names must be a list of transformation names.');
+    }
+    const list = args.trfn_names.map(clean).filter(Boolean);
+    if (list.length === 0) throw new Error('trfn_names is empty — pass every transformation on the path.');
+    if (single.length > 0 && single.join(',') !== list.join(',')) {
+      throw new Error('Pass the transformations either as trfn_names or as trfn_name / trfn_name_2, not both.');
+    }
+    if (new Set(list).size !== list.length) throw new Error('trfn_names lists a transformation twice.');
+    return list;
+  }
+  if (!clean(args.trfn_name)) {
+    throw new Error('No transformation given — pass trfn_names (every transformation on the path) or trfn_name.');
+  }
+  if (new Set(single).size !== single.length) throw new Error('trfn_name and trfn_name_2 are the same transformation.');
+  return single;
+}
+
+// Object names are compared by their first token: a DataSource carries its source system
+// after padding, and the DTP arguments name the object without it.
+const chainKey = (name: string) => name.trim().split(/\s+/)[0]?.toUpperCase() ?? '';
+
+/**
+ * Put the transformations of a DTP into path order, source first, and verify that they lead
+ * from the DTP source to the DTP target without a gap. The server answers an incomplete path
+ * with an HTTP 500 that names no cause, so the gap is named here instead.
+ */
+export function orderTransformationChain(
+  ends: TransformationEnds[],
+  sourceName: string,
+  targetName: string,
+): string[] {
+  const show = (e: TransformationEnds) =>
+    `${e.name}: ${e.sourceType} ${chainKey(e.sourceName)} -> ${e.targetType} ${chainKey(e.targetName)}`;
+  const listing = ends.map((e) => `  ${show(e)}`).join('\n');
+  const hint =
+    'Pass every transformation on the path as trfn_names; trace the path with bw_xref on the target or ' +
+    'bw_get_transformation.';
+
+  const remaining = [...ends];
+  const ordered: TransformationEnds[] = [];
+  let at = chainKey(sourceName);
+  let atLabel = `the DTP source ${at}`;
+  while (remaining.length > 0) {
+    const next = remaining.filter((e) => chainKey(e.sourceName) === at);
+    if (next.length !== 1) {
+      throw new Error(
+        `The transformations do not form a path from ${chainKey(sourceName)} to ${chainKey(targetName)}: ` +
+          (next.length === 0
+            ? `none of the remaining transformations starts at ${atLabel}.`
+            : `${next.length} transformations start at ${atLabel}.`) +
+          `\n${listing}\n${hint}`,
+      );
+    }
+    const step = next[0];
+    ordered.push(step);
+    remaining.splice(remaining.indexOf(step), 1);
+    at = chainKey(step.targetName);
+    atLabel = `${step.targetType} ${at}`;
+  }
+  if (at !== chainKey(targetName)) {
+    throw new Error(
+      `The transformations end at ${atLabel}, not at the DTP target ${chainKey(targetName)}: ` +
+        `a transformation from ${at} onward is missing.\n${listing}\n${hint}`,
+    );
+  }
+  return ordered.map((e) => e.name);
+}
+
 export interface CreateDtpArgs {
-  trfn_name: string;
+  trfn_name?: string;
   trfn_name_2?: string;
+  trfn_names?: string[];
   source_name: string;
   source_type: string;
   source_system?: string;
@@ -811,7 +892,6 @@ export async function bwCreateDtp(
   client: BwClient,
   args: CreateDtpArgs
 ): Promise<string> {
-  const trfnName   = args.trfn_name.toUpperCase();
   const srcName    = args.source_name.toUpperCase();
   const srcType    = args.source_type.toUpperCase();
   const tgtName    = args.target_name.toUpperCase();
@@ -875,6 +955,22 @@ export async function bwCreateDtp(
     targetTypeAttr = tgtType;
   }
 
+  // Resolved before generateDtpId so a gap in the path fails before any object exists.
+  // Not checked for a query source: the transformation names it by its element id.
+  let trfnNames = resolveDtpTransformations(args);
+  if (srcType !== 'ELEM') {
+    let ends: TransformationEnds[] | undefined;
+    try {
+      ends = await Promise.all(trfnNames.map((t) => readTransformationEnds(t)));
+    } catch {
+      // A transformation that cannot be read is left to the server to judge.
+    }
+    if (ends) trfnNames = orderTransformationChain(ends, srcName, tgtName);
+  }
+  const overviewObjects = trfnNames
+    .map((t) => `    <object xsi:type="Dtpa:DTPObject" name="${t}" tlogo="TRFN"/>`)
+    .join('\n');
+
   const language     = process.env.BW_LANGUAGE ?? 'DE';
   const masterSystem = await resolveMasterSystem(client);
   const responsible  = await resolveLogonUser(client);
@@ -935,7 +1031,7 @@ export async function bwCreateDtp(
       adtcore:responsible="${responsible}"/>
   </generalInformation>
   <overview>
-    <object xsi:type="Dtpa:DTPObject" name="${trfnName}" tlogo="TRFN"/>${args.trfn_name_2 ? `\n    <object xsi:type="Dtpa:DTPObject" name="${args.trfn_name_2.toUpperCase()}" tlogo="TRFN"/>` : ''}
+${overviewObjects}
   </overview>
   <source name="${sourceNameAttr}" tlogo="${sourceTlogo}" type="${sourceTypeAttr}"/>
   <target name="${tgtName}" tlogo="${targetTlogo}" type="${targetTypeAttr}"/>
@@ -1025,7 +1121,8 @@ export async function bwCreateDtp(
     return JSON.stringify({
       success: true,
       dtp_name: dtpName,
-      transformation: trfnName,
+      transformation: trfnNames[0],
+      transformations: trfnNames,
       source: { type: srcType, name: srcName },
       target: { type: tgtType, name: tgtName },
       package: pkg,

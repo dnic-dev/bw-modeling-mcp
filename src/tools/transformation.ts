@@ -31,6 +31,38 @@ async function freshReadInactive(
   return freshRead(`/sap/bw/modeling/trfn/${bwSeg(trfnLower)}/m`, trfnAccept());
 }
 
+export interface TransformationEnds {
+  name: string;
+  sourceName: string;
+  sourceType: string;
+  targetName: string;
+  targetType: string;
+}
+
+/** Source and target object of a transformation, read from its definition. */
+export async function readTransformationEnds(trfnName: string): Promise<TransformationEnds> {
+  const { body } = await freshReadInactive(trfnName.toLowerCase());
+  const end = (tag: string) => {
+    const el = body.match(new RegExp(`<${tag}\\b[^>]*\\bid="0"[^>]*>`))?.[0] ?? '';
+    return {
+      name: el.match(/\sname="([^"]*)"/)?.[1] ?? '',
+      type: el.match(/\stype="([^"]*)"/)?.[1] ?? '',
+    };
+  };
+  const source = end('source');
+  const target = end('target');
+  if (!source.name || !target.name) {
+    throw new Error(`Transformation ${trfnName.toUpperCase()}: source or target not found in its definition.`);
+  }
+  return {
+    name: trfnName.toUpperCase(),
+    sourceName: source.name,
+    sourceType: source.type,
+    targetName: target.name,
+    targetType: target.type,
+  };
+}
+
 /**
  * Drop performConversionExit from the targets a MINOR step of a rule fills.
  *
