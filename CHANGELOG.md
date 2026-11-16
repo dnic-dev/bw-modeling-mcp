@@ -1,5 +1,16 @@
 # Changelog
 
+## [Unreleased]
+
+### Added
+
+- **A DTP can run through any number of transformations** — `bw_create_dtp` takes `trfn_names`, the list of every transformation on the path from the source to the target, so a path through two or more InfoSources can be expressed (#53). `trfn_name` and `trfn_name_2` keep working for one and two steps. The path is checked before anything is created: the transformations are put into path order whatever order they are passed in, and a path with a gap is refused with the object where it breaks, in place of the HTTP 500 without a message the server answers. Verified on BW/4HANA: a DTP over three transformations created and activated; paths with a missing first, middle or last transformation refused.
+
+### Fixed
+
+- **Replacing the tree of a hierarchy no longer ends in a server error** — `bw_update_hierarchy` with `nodes` removes the current nodes before it inserts the new tree, and the server ended that with a runtime error as soon as the tree had more than one level. The nodes are now removed children first, which the server accepts. Verified on BW/4HANA: trees of two and three levels replaced and activated.
+- **Numeric node names of a hierarchy are stored in their internal form** — on a characteristic with the ALPHA conversion routine (or of type NUMC) a value such as `1100` has leading zeros internally, and a hierarchy written with the short form was saved but refused on activation. `bw_create_hierarchy` and `bw_update_hierarchy` now fill a value of digits to the length of the characteristic, and a text node named with digits only to the length BW keeps text node names in. Names that are not purely numeric, and names already at full length, are written as given.
+
 ## [2.0.0] — 2026-11-11
 
 ### Added
