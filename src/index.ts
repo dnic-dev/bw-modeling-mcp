@@ -701,8 +701,22 @@ const TOOL_DEFINITIONS = [
         properties: {
           infoobject_type: {
             type: 'string',
-            enum: ['CHA', 'KYF'],
-            description: 'InfoObject type: CHA (Characteristic) or KYF (Key Figure). Default "CHA".',
+            enum: ['CHA', 'KYF', 'UNI', 'XXL'],
+            description: 'InfoObject type: CHA (Characteristic), KYF (Key Figure), UNI (unit or currency InfoObject) or XXL (long text or binary content, used as XXL attribute). Default "CHA".',
+          },
+          unit_type: {
+            type: 'string',
+            enum: ['currency', 'unit'],
+            description: 'UNI only: "currency" (default) or "unit" (unit of measure).',
+          },
+          xxl_data_type: {
+            type: 'string',
+            enum: ['STRG', 'SSTR', 'RSTR'],
+            description: 'XXL only: STRG (string, default), SSTR (short string) or RSTR (raw string).',
+          },
+          mime_type: {
+            type: 'string',
+            description: 'XXL only: MIME type of the content of a raw string (e.g. "application/pdf").',
           },
           name: {
             type: 'string',
@@ -710,7 +724,7 @@ const TOOL_DEFINITIONS = [
           },
           info_area: {
             type: 'string',
-            description: 'InfoArea to assign the InfoObject to (e.g. "NEXTJUICE").',
+            description: 'InfoArea to assign the InfoObject to (e.g. "AREA_NAME").',
           },
           description: {
             type: 'string',
@@ -720,28 +734,28 @@ const TOOL_DEFINITIONS = [
           data_type: {
             type: 'string',
             enum: ['CHAR', 'NUMC', 'DATS', 'TIMS', 'SNUMC'],
-            description: 'CHA only. ABAP data type. Default "CHAR".',
+            description: 'Characteristic: ABAP data type. Default "CHAR".',
           },
           length: {
             type: 'number',
-            description: 'CHA only. Field length. Default 10.',
+            description: 'Characteristic: Field length. Default 10.',
           },
           conversion_routine: {
             type: 'string',
-            description: 'CHA only. Conversion routine (e.g. "ALPHA"). Default "ALPHA" for CHAR/NUMC, "" for others.',
+            description: 'Characteristic: Conversion routine (e.g. "ALPHA"). Default "ALPHA" for CHAR/NUMC, "" for others.',
           },
           with_master_data: {
             type: 'boolean',
-            description: 'CHA only. Generate master data tables. Default false.',
+            description: 'Characteristic: Generate master data tables. Default false.',
           },
           with_texts: {
             type: 'boolean',
-            description: 'CHA only. Generate text tables. Default false.',
+            description: 'Characteristic: Generate text tables. Default false.',
           },
           lower_case: {
             type: 'boolean',
             description:
-              'CHA only. Allow lower case letters (RSDCHABAS-LOWERCASE). Default false. ' +
+              'Characteristic: Allow lower case letters (RSDCHABAS-LOWERCASE). Default false. ' +
               'Set true for characteristics whose values may contain lower case letters or ' +
               'characters outside the permitted character set (RSKC), such as umlauts — the flag ' +
               'switches off that check for this characteristic. Without it, a load carrying such ' +
@@ -749,7 +763,7 @@ const TOOL_DEFINITIONS = [
           },
           referenced_infoobject: {
             type: 'string',
-            description: 'CHA only. Reference to an existing InfoObject (e.g. "IOBJ_NAME"). Omit withMasterData/withTexts — they are inherited. Default "".',
+            description: 'Characteristic: Reference to an existing InfoObject (e.g. "IOBJ_NAME"). Omit withMasterData/withTexts — they are inherited. Default "".',
           },
           compound_infoobjects: {
             type: 'array',
@@ -760,12 +774,12 @@ const TOOL_DEFINITIONS = [
           object_specific_data_type: {
             type: 'string',
             enum: ['DEC', 'CURR', 'FLTP', 'QUAN', 'DATS', 'INT4', 'INT8', 'TIMS'],
-            description: 'KYF only. Data type. Default "DEC". keyfigureType and semantics are derived automatically.',
+            description: 'Key figure: Data type. Default "DEC". keyfigureType and semantics are derived automatically.',
           },
           aggregation_type: {
             type: 'string',
             enum: ['SUM', 'MAX', 'MIN'],
-            description: 'KYF only. Aggregation type. Default "SUM".',
+            description: 'Key figure: Aggregation type. Default "SUM".',
           },
           fixed_unit: {
             type: 'string',
@@ -780,7 +794,7 @@ const TOOL_DEFINITIONS = [
           unit_currency_infoobject: {
             type: 'string',
             description:
-              'KYF only. Unit characteristic that supplies the unit or currency per record, instead of a fixed one ' +
+              'Key figure: Unit characteristic that supplies the unit or currency per record, instead of a fixed one ' +
               '(e.g. "0CURRENCY" for a CURR key figure, "0UNIT" for a QUAN key figure). Excludes fixed_unit/fixed_currency.',
           },
           // common
@@ -986,7 +1000,8 @@ const TOOL_DEFINITIONS = [
     {
       name: 'bw_update_infoobject',
       description:
-        'Update a Characteristic InfoObject: description, the lower case flag, master data, text and hierarchy properties, and/or the attribute list. ' +
+        'Update an InfoObject. Characteristic: description, data type, length, conversion routine, compounding, the lower case, high cardinality, authorization and attribute-only switches, display and filter value settings, master data, text and hierarchy properties, the attribute list and the XXL attributes. ' +
+        'Key Figure: aggregation, exception aggregation with its reference characteristic, data type, high precision, decimal places and scaling, unit or currency. Only what is passed changes; a value that does not apply to the InfoObject is refused before anything is written. ' +
         'Supplying attributes replaces all existing ones (pass an empty array to remove all); omitting them leaves the list untouched. ' +
         'An attribute can be any characteristic, time characteristic, unit or key figure; the compounding parents of an attribute and the unit InfoObject of a key figure attribute come along and are reported. ' +
         'Also supports Key Figure (KYF) updates: set fixed_unit or fixed_currency, or unit_currency_infoobject to take the unit/currency from a unit characteristic. ' +
@@ -1005,7 +1020,7 @@ const TOOL_DEFINITIONS = [
           lower_case: {
             type: 'boolean',
             description:
-              'CHA only. Allow lower case letters (RSDCHABAS-LOWERCASE). Omit to keep existing. ' +
+              'Characteristic: Allow lower case letters (RSDCHABAS-LOWERCASE). Omit to keep existing. ' +
               'Set true for characteristics whose values may contain lower case letters or characters ' +
               'outside the permitted character set (RSKC), such as umlauts. Changing the flag on a ' +
               'characteristic already used by a provider that holds data is accepted; a load that ' +
@@ -1017,44 +1032,100 @@ const TOOL_DEFINITIONS = [
           },
           fixed_unit: {
             type: 'string',
-            description: 'KYF only. Fixed unit of measure (e.g. "KWH", "M3"). Sets fixedUnit on a QUAN key figure.',
+            description: 'Key figure: Fixed unit of measure (e.g. "KWH", "M3"). Sets fixedUnit on a QUAN key figure.',
           },
           fixed_currency: {
             type: 'string',
-            description: 'KYF only. Fixed currency (e.g. "EUR"). Sets fixedCurrency on a CURR key figure.',
+            description: 'Key figure: Fixed currency (e.g. "EUR"). Sets fixedCurrency on a CURR key figure.',
           },
           unit_currency_infoobject: {
             type: 'string',
             description:
-              'KYF only. Unit characteristic that supplies the unit or currency per record (e.g. "0CURRENCY", "0UNIT"). ' +
+              'Key figure: Unit characteristic that supplies the unit or currency per record (e.g. "0CURRENCY", "0UNIT"). ' +
               'Replaces a fixed unit/currency; excludes fixed_unit/fixed_currency.',
           },
           with_master_data: {
             type: 'boolean',
-            description: 'CHA only. Characteristic has master data (attributes). Switched on automatically with the first attribute; switching it off needs attributes: [] in the same call.',
+            description: 'Characteristic: Characteristic has master data (attributes). Switched on automatically with the first attribute; switching it off needs attributes: [] in the same call.',
           },
           with_texts: {
             type: 'boolean',
-            description: 'CHA only. Characteristic has texts. Switching texts on selects the short text unless a text length is given.',
+            description: 'Characteristic: Characteristic has texts. Switching texts on selects the short text unless a text length is given.',
           },
-          short_text: { type: 'boolean', description: 'CHA only. Short text (20 characters) exists.' },
-          medium_text: { type: 'boolean', description: 'CHA only. Medium text (40 characters) exists.' },
-          long_text: { type: 'boolean', description: 'CHA only. Long text (60 characters) exists.' },
-          extra_long_text: { type: 'boolean', description: 'CHA only. Long text is extra long (1333 characters); needs long_text.' },
-          texts_language_dependent: { type: 'boolean', description: 'CHA only. Texts are language-dependent.' },
-          texts_time_dependent: { type: 'boolean', description: 'CHA only. Texts are time-dependent.' },
+          short_text: { type: 'boolean', description: 'Characteristic: Short text (20 characters) exists.' },
+          medium_text: { type: 'boolean', description: 'Characteristic: Medium text (40 characters) exists.' },
+          long_text: { type: 'boolean', description: 'Characteristic: Long text (60 characters) exists.' },
+          extra_long_text: { type: 'boolean', description: 'Characteristic: Long text is extra long (1333 characters); needs long_text.' },
+          texts_language_dependent: { type: 'boolean', description: 'Characteristic: Texts are language-dependent.' },
+          texts_time_dependent: { type: 'boolean', description: 'Characteristic: Texts are time-dependent.' },
           with_hierarchies: {
             type: 'boolean',
-            description: 'CHA only. Characteristic can have hierarchies. Needed before a hierarchy can be created for it.',
+            description: 'Characteristic: Characteristic can have hierarchies. Needed before a hierarchy can be created for it.',
           },
-          hierarchy_version_dependent: { type: 'boolean', description: 'CHA only. Hierarchies are version-dependent.' },
+          hierarchy_version_dependent: { type: 'boolean', description: 'Characteristic: Hierarchies are version-dependent.' },
           hierarchy_time_dependency: {
             type: 'string',
             enum: ['none', 'entire_hierarchy', 'structure'],
-            description: 'CHA only. Time dependency of the hierarchies: "none", "entire_hierarchy" (each hierarchy has a validity period) or "structure" (the nodes have validity periods).',
+            description: 'Characteristic: Time dependency of the hierarchies: "none", "entire_hierarchy" (each hierarchy has a validity period) or "structure" (the nodes have validity periods).',
           },
-          hierarchy_intervals: { type: 'boolean', description: 'CHA only. Intervals are permitted in hierarchies.' },
-          hierarchy_reverse_sign: { type: 'boolean', description: 'CHA only. The sign of nodes can be reversed.' },
+          hierarchy_intervals: { type: 'boolean', description: 'Characteristic: Intervals are permitted in hierarchies.' },
+          hierarchy_reverse_sign: { type: 'boolean', description: 'Characteristic: The sign of nodes can be reversed.' },
+          data_type: {
+            type: 'string',
+            description: 'Data type. CHA: CHAR, NUMC, DATS, TIMS and the other characteristic types. KYF: one of the two types of its key figure type (amount CURR/FLTP, quantity QUAN/FLTP, number DEC/FLTP, integer INT4/INT8, date DEC/DATS, time DEC/TIMS). Whether existing data allows the change is decided by the activation.',
+          },
+          length: { type: 'number', description: 'Characteristic: Length, 1 to 250. The output length follows a longer length.' },
+          output_length: { type: 'number', description: 'Characteristic: Output length, 0 to 250. BW derives it for some data types; the answer says when it kept another value.' },
+          conversion_routine: { type: 'string', description: 'Characteristic: Conversion routine (e.g. "ALPHA"); an empty text removes it.' },
+          compound_infoobjects: {
+            type: 'array',
+            items: { type: 'string' },
+            description: 'Characteristic: The complete list of compounding parents in order (e.g. ["PARENT_IOBJ"]); [] removes the compounding. Parents are characteristics that are not attribute-only.',
+          },
+          high_cardinality: { type: 'boolean', description: 'Characteristic: High cardinality: no SID table for the values.' },
+          authorization_relevant: { type: 'boolean', description: 'Characteristic: Relevant for the analysis authorization check.' },
+          attribute_only: { type: 'boolean', description: 'The InfoObject can only be used as an attribute, not in a provider on its own.' },
+          display: {
+            type: 'string',
+            enum: ['key_and_text', 'text', 'key', 'text_and_key', 'long_text', 'medium_text', 'no_display', 'short_text'],
+            description: 'Characteristic: How the characteristic is shown in a query by default. BW falls back to the key when the characteristic has no texts.',
+          },
+          filter_values_query_definition: {
+            type: 'string',
+            enum: ['master_data', 'infoprovider'],
+            description: 'Characteristic: Where the filter values come from when a query is defined.',
+          },
+          filter_values_query_execution: {
+            type: 'string',
+            enum: ['navigation', 'infoprovider', 'master_data'],
+            description: 'Characteristic: Where the filter values come from when a query runs.',
+          },
+          filter_value_display: {
+            type: 'string',
+            enum: ['without_values', 'with_values', 'field_only', 'with_input_help', 'radio_button', 'dropdown_box', 'combo_box', 'input_help_only', 'checkboxes'],
+            description: 'Characteristic: How filter values are offered while a query runs.',
+          },
+          xxl_attributes: {
+            type: 'array',
+            items: { type: 'string' },
+            description: 'Characteristic: The complete list of XXL attributes (XXL InfoObjects holding long text or binary content per value); [] removes them. Needs master data.',
+          },
+          aggregation: {
+            type: 'string',
+            enum: ['SUM', 'MIN', 'MAX', 'NO2'],
+            description: 'Key figure: Standard aggregation; NO2 means no aggregation. A date or time key figure only takes MIN or MAX.',
+          },
+          exception_aggregation: {
+            type: 'string',
+            description: 'Key figure: Aggregation along the reference characteristic, different from the standard aggregation (e.g. "LAS", "FIR", "AVG", "AV0", "CNT", "MAX"), or "none" to remove it. Not with aggregation NO2.',
+          },
+          exception_aggregation_reference: {
+            type: 'string',
+            description: 'Key figure: The characteristic the exception aggregation runs along (e.g. "TIME_CHARACTERISTIC").',
+          },
+          high_precision: { type: 'boolean', description: 'Key figure: High precision; for the data types CURR, QUAN and DEC.' },
+          decimal_places: { description: 'Key figure: Decimal places shown, 0 to 9, or "default". Not for date and time key figures.' },
+          display_scaling: { description: 'Key figure: Scaling of the displayed value as a power of ten, 0 (in 1) to 9, or "default". Not for date and time key figures.' },
           attributes: {
             type: 'array',
             description: 'New attribute list, replacing all existing ones. Pass [] to remove all attributes; omit to leave them unchanged.',
@@ -1066,6 +1137,10 @@ const TOOL_DEFINITIONS = [
                 time_dependent: { type: 'boolean', description: 'Time-dependent attribute, display or navigation (default false).' },
                 display_in_query: { type: 'boolean', description: 'Display in query (default true).' },
                 use_text_of_original_characteristic: { type: 'boolean', description: 'Navigation attributes: use the text of the original characteristic (default true).' },
+                navigation_description: { type: 'string', description: 'Navigation attributes: a description of its own in place of the text of the characteristic.' },
+                navigation_short_description: { type: 'string', description: 'Navigation attributes: a short description of its own, up to 20 characters.' },
+                authorization_relevant: { type: 'boolean', description: 'Navigation attributes: relevant for the authorization check.' },
+                f4_help_order: { type: 'number', description: 'Position of the attribute in the value help (1 to 99); 0 leaves it out.' },
               },
               required: ['name', 'type'],
             },
@@ -7270,7 +7345,10 @@ async function handleToolCall(
 
       case 'bw_create_infoobject':
         text = await bwCreateInfoObject(client, {
-          infoobject_type: args?.infoobject_type as 'CHA' | 'KYF' | undefined,
+          infoobject_type: args?.infoobject_type as 'CHA' | 'KYF' | 'UNI' | 'XXL' | undefined,
+          unit_type: args?.unit_type as 'currency' | 'unit' | undefined,
+          xxl_data_type: args?.xxl_data_type as string | undefined,
+          mime_type: args?.mime_type as string | undefined,
           name: args?.name as string,
           info_area: args?.info_area as string,
           description: args?.description as string,
@@ -7356,6 +7434,10 @@ async function handleToolCall(
           timeDependent: a['time_dependent'] as boolean | undefined,
           displayInQuery: a['display_in_query'] as boolean | undefined,
           useTextOfOriginalCharacteristic: a['use_text_of_original_characteristic'] as boolean | undefined,
+          navigationDescription: a['navigation_description'] as string | undefined,
+          navigationShortDescription: a['navigation_short_description'] as string | undefined,
+          authorizationRelevant: a['authorization_relevant'] as boolean | undefined,
+          f4HelpOrder: a['f4_help_order'] as number | undefined,
         }));
         text = await bwUpdateInfoObject(client, {
           name: args?.name as string,
@@ -7379,6 +7461,25 @@ async function handleToolCall(
           hierarchy_intervals: args?.hierarchy_intervals as boolean | undefined,
           hierarchy_reverse_sign: args?.hierarchy_reverse_sign as boolean | undefined,
           transport: args?.transport as string | undefined,
+          aggregation: args?.aggregation as string | undefined,
+          exception_aggregation: args?.exception_aggregation as string | undefined,
+          exception_aggregation_reference: args?.exception_aggregation_reference as string | undefined,
+          decimal_places: args?.decimal_places as number | 'default' | undefined,
+          display_scaling: args?.display_scaling as number | 'default' | undefined,
+          data_type: args?.data_type as string | undefined,
+          high_precision: args?.high_precision as boolean | undefined,
+          length: args?.length as number | undefined,
+          output_length: args?.output_length as number | undefined,
+          conversion_routine: args?.conversion_routine as string | undefined,
+          high_cardinality: args?.high_cardinality as boolean | undefined,
+          authorization_relevant: args?.authorization_relevant as boolean | undefined,
+          attribute_only: args?.attribute_only as boolean | undefined,
+          xxl_attributes: args?.xxl_attributes as string[] | undefined,
+          compound_infoobjects: args?.compound_infoobjects as string[] | undefined,
+          display: args?.display as string | undefined,
+          filter_values_query_definition: args?.filter_values_query_definition as string | undefined,
+          filter_values_query_execution: args?.filter_values_query_execution as string | undefined,
+          filter_value_display: args?.filter_value_display as string | undefined,
         });
         break;
       }

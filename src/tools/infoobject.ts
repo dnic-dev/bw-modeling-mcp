@@ -1,6 +1,10 @@
 import { BwClient, MEDIA_TYPES, createClientFromEnv, freshRead, bwSeg } from '../bw-client.js';
 import { resolveLogonUser } from './logon_user.js';
 import { cachedPlatform } from '../platform.js';
+import {
+  applyKeyFigureProperties, applyCharacteristicProperties as applyCharacteristicGeneralProperties, applyAttributeOnly, applyXxlAttributes,
+  KEY_FIGURE_PROPERTY_KEYS, CHARACTERISTIC_PROPERTY_KEYS, type KeyFigureProperties, type CharacteristicProperties,
+} from './infoobject_properties.js';
 
 /**
  * The full characteristic document a classic backend expects in the create POST.
@@ -85,7 +89,13 @@ export function setLowerCase(xml: string, lowerCase: boolean): string {
 // ── bwCreateInfoObject ────────────────────────────────────────────────────────
 
 export interface CreateInfoObjectArgs {
-  infoobject_type?: 'CHA' | 'KYF';
+  infoobject_type?: 'CHA' | 'KYF' | 'UNI' | 'XXL';
+  /** UNI: a currency (data type CUKY) or a unit of measure (data type UNIT). */
+  unit_type?: 'currency' | 'unit';
+  /** XXL: STRG (string), SSTR (short string) or RSTR (raw string). */
+  xxl_data_type?: string;
+  /** XXL: the MIME type of the content, for a raw string. */
+  mime_type?: string;
   name: string;
   info_area: string;
   description: string;
@@ -164,7 +174,7 @@ export async function bwCreateInfoObject(
   client: BwClient,
   args: CreateInfoObjectArgs
 ): Promise<string> {
-  const isobjType = (args.infoobject_type ?? 'CHA').toUpperCase() as 'CHA' | 'KYF';
+  const isobjType = (args.infoobject_type ?? 'CHA').toUpperCase() as 'CHA' | 'KYF' | 'UNI' | 'XXL';
   const nameLower = args.name.toLowerCase();
   const nameUpper = args.name.toUpperCase();
   const pkg = args.package ?? '$TMP';
@@ -187,6 +197,46 @@ export async function bwCreateInfoObject(
   // A failed step must not leave the CREA lock behind; on success a characteristic keeps it
   // for bw_activate, as before.
   try {
+    // ── UNI and XXL: the POST body is the whole definition ──────────────────────
+    if (isobjType === 'UNI' || isobjType === 'XXL') {
+      const language = process.env.BW_LANGUAGE ?? 'DE';
+      const text = desc.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+      const header = (xsiType: string, attributes: string, typeElements: string) =>
+        `<?xml version="1.0" encoding="UTF-8"?>` +
+        `<InfoObject:infoObject xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" ` +
+        `xmlns:InfoObject="http://www.sap.com/bw/modeling/BwIobj.ecore" xmlns:adtcore="http://www.sap.com/adt/core" ` +
+        `xsi:type="InfoObject:${xsiType}" name="${nameUpper}" shortDescriptionSet="false"${attributes}>` +
+        `${typeElements}<longDescription>${text}</longDescription><shortDescription>${text}</shortDescription>` +
+        `<tlogoProperties adtcore:language="${language}" adtcore:name="${nameUpper}" adtcore:type="IOBJ" ` +
+        `adtcore:masterLanguage="${language}" adtcore:responsible="${responsible}"><infoArea>${infoArea}</infoArea></tlogoProperties>`;
+      let body: string;
+      const result: Record<string, unknown> = {
+        success: true, infoobjectType: isobjType, name: nameUpper, infoArea: args.info_area, description: desc, package: pkg, lockHandle: '',
+      };
+      if (isobjType === 'UNI') {
+        // A unit InfoObject refers to the currency or the unit of measure of the system, as the wizard sets it.
+        const currency = (args.unit_type ?? 'currency') === 'currency';
+        body = header('Unit', ` unitType="${currency ? 'CUR' : 'UNI'}"`,
+          `<infoObjectType>UNI</infoObjectType><dataElement/><dataType>${currency ? 'CUKY' : 'UNIT'}</dataType>`) +
+          `<referencedInfoObject name="${currency ? '0CURRENCY' : '0UNIT'}"/><displayProperties/><sidTable/></InfoObject:infoObject>`;
+        result['unitType'] = currency ? 'currency' : 'unit';
+      } else {
+        const dataType = (args.xxl_data_type ?? 'STRG').toUpperCase();
+        if (!['STRG', 'SSTR', 'RSTR'].includes(dataType)) {
+          throw new Error(`An XXL InfoObject has the data type STRG, SSTR or RSTR, not ${dataType}.`);
+        }
+        const mime = args.mime_type ? ` mimeType="${args.mime_type.replace(/"/g, '&quot;')}"` : '';
+        body = header('XXLInfoObject', ` objectSpecificDataType="${dataType}"${mime}`,
+          `<infoObjectType>XXL</infoObjectType><dataElement/><dataType>${dataType}</dataType>`) +
+          `<referencedInfoObject/></InfoObject:infoObject>`;
+        result['dataType'] = dataType;
+      }
+      await client.create('iobj', nameLower, lockHandle, body, { 'Development-Class': pkg });
+      await client.unlock('iobj', nameLower);
+      result['message'] = `InfoObject '${nameUpper}' created (inactive). Call bw_activate with lock_handle="" to activate.`;
+      return JSON.stringify(result);
+    }
+
     // ── KYF: POST body accepted — fixedUnit/fixedCurrency via GET+PUT ────────────
     if (isobjType === 'KYF') {
       const ost = (args.object_specific_data_type ?? 'DEC').toUpperCase();
@@ -532,10 +582,23 @@ export interface AttributeDef {
   timeDependent?: boolean;
   displayInQuery?: boolean;
   useTextOfOriginalCharacteristic?: boolean;
+  /** Navigation attribute: its own description in place of the text of the characteristic. */
+  navigationDescription?: string;
+  /** Navigation attribute: its own short description (up to 20 characters). */
+  navigationShortDescription?: string;
+  /** Navigation attribute: relevant for the authorization check. */
+  authorizationRelevant?: boolean;
+  /** Position of the attribute in the value help; 0 leaves it out. */
+  f4HelpOrder?: number;
 }
 
-export interface UpdateInfoObjectArgs {
+export interface UpdateInfoObjectArgs extends KeyFigureProperties, CharacteristicProperties {
   name: string;
+  attribute_only?: boolean;
+  /** Replaces the compounding: the complete list of compounding parents in order; [] removes it. */
+  compound_infoobjects?: string[];
+  /** Replaces the whole list of XXL attributes; [] removes them, undefined keeps them. */
+  xxl_attributes?: string[];
   /** Replaces the whole attribute list; [] removes all attributes, undefined keeps them. */
   attributes?: AttributeDef[];
   description?: string;
@@ -800,6 +863,7 @@ export async function bwUpdateInfoObject(
   // Step 1: Lock with the original client (holds the lock session)
   const lockHandle = await client.lock('iobj', nameLower, undefined, 'stateful_enqueue');
   const notes: string[] = [];
+  const propertyChanges: string[] = [];
   const addedDependencies: Array<{ attribute: string; needed_by: string; as: string }> = [];
   let attributes: AttributeDef[] = requested;
 
@@ -840,14 +904,31 @@ export async function bwUpdateInfoObject(
       if (args.unit_currency_infoobject) {
         xml = setUnitCurrencyReference(xml, args.unit_currency_infoobject);
       }
+      const characteristicProps: string[] = CHARACTERISTIC_PROPERTY_KEYS.filter((key) => args[key] !== undefined);
+      if (args.xxl_attributes !== undefined) characteristicProps.push('xxl_attributes');
+      if (characteristicProps.length > 0) {
+        throw new Error(`InfoObject '${nameUpper}' is a Key Figure — ${characteristicProps.join(', ')} appl${characteristicProps.length === 1 ? 'ies' : 'y'} to Characteristics (CHA) only.`);
+      }
+      const keyFigure = applyKeyFigureProperties(xml, args);
+      const onlyAttribute = applyAttributeOnly(keyFigure.xml, args.attribute_only);
+      xml = onlyAttribute.xml;
+      keyFigure.changes.push(...onlyAttribute.changes);
       await freshClient.put('iobj', nameLower, lockHandle, xml, timestamp, args.transport);
       const outcome = await activateInfoObject(nameLower, lockHandle);
       if (!outcome.ok) return notActivated(nameUpper, outcome);
       return JSON.stringify({
         success: true,
         name: nameUpper,
-        message: `InfoObject '${nameUpper}' (KYF) updated and activated.`,
+        message:
+          `InfoObject '${nameUpper}' (KYF) updated and activated` +
+          `${keyFigure.changes.length > 0 ? `: ${keyFigure.changes.join(', ')}` : ''}.`,
+        ...(keyFigure.changes.length > 0 ? { changed: keyFigure.changes } : {}),
       });
+    }
+
+    const keyFigureOnly = KEY_FIGURE_PROPERTY_KEYS.filter((key) => key !== 'data_type' && args[key] !== undefined);
+    if (keyFigureOnly.length > 0) {
+      throw new Error(`InfoObject '${nameUpper}' is not a Key Figure — ${keyFigureOnly.join(', ')} appl${keyFigureOnly.length === 1 ? 'ies' : 'y'} to Key Figures (KYF) only.`);
     }
 
     const own = parseInfoObjectFacts(nameUpper, xml);
@@ -953,10 +1034,39 @@ export async function bwUpdateInfoObject(
           }
         }
 
+        const navigationOnly = [
+          ['navigation_description', attr.navigationDescription],
+          ['navigation_short_description', attr.navigationShortDescription],
+          ['authorization_relevant', attr.authorizationRelevant],
+        ].filter(([, value]) => value !== undefined).map(([key]) => key as string);
+        if (attr.type !== 'NAV' && navigationOnly.length > 0) {
+          throw new Error(`${attr.name} is a display attribute — ${navigationOnly.join(', ')} appl${navigationOnly.length === 1 ? 'ies' : 'y'} to navigation attributes (type "NAV") only.`);
+        }
+        if ((attr.navigationShortDescription?.length ?? 0) > 20) {
+          throw new Error(`The short description of navigation attribute ${attr.name} can have 20 characters, not ${attr.navigationShortDescription?.length}.`);
+        }
+        if (attr.f4HelpOrder !== undefined && (!Number.isInteger(attr.f4HelpOrder) || attr.f4HelpOrder < 0 || attr.f4HelpOrder > 99)) {
+          throw new Error(`f4_help_order of ${attr.name} is a whole number from 0 to 99.`);
+        }
+        // An own description replaces the text of the characteristic, as the editor's switch does.
+        const ownText = attr.navigationDescription !== undefined || attr.navigationShortDescription !== undefined;
+        const useOriginalText = attr.useTextOfOriginalCharacteristic ?? (ownText ? false : undefined);
+        if (ownText && useOriginalText === true) {
+          throw new Error(`${attr.name}: a navigation description of its own does not go with use_text_of_original_characteristic true.`);
+        }
+        const escAttr = (text: string) => text.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+        const detail: Array<[string, string | undefined]> = [
+          ['navigationAttributeDescription', attr.navigationDescription === undefined ? undefined : escAttr(attr.navigationDescription)],
+          ['navigationAttributeShortDescription', attr.navigationShortDescription === undefined ? undefined : escAttr(attr.navigationShortDescription)],
+          ['shortDescriptionSet', attr.navigationShortDescription === undefined ? undefined : 'true'],
+          ['authorizationRelevant', attr.authorizationRelevant === undefined ? undefined : String(attr.authorizationRelevant)],
+          ['f4HelpOrder', attr.f4HelpOrder === undefined ? undefined : String(attr.f4HelpOrder)],
+        ];
         const overridden =
           attr.displayInQuery !== undefined ||
-          attr.useTextOfOriginalCharacteristic !== undefined ||
-          attr.timeDependent !== undefined;
+          useOriginalText !== undefined ||
+          attr.timeDependent !== undefined ||
+          detail.some(([, value]) => value !== undefined);
         if (existing && existingType === attr.type && !overridden) {
           attrXmlParts.push(existing.replace(/\bref="[^"]*"/, `ref="${attr.name}.iobj#//"`));
           continue;
@@ -972,7 +1082,13 @@ export async function bwUpdateInfoObject(
           };
           set('timeDependent', attr.timeDependent);
           set('displayInQuery', attr.displayInQuery);
-          if (attr.type === 'NAV') set('useTextOfOriginalCharacteristic', attr.useTextOfOriginalCharacteristic);
+          if (attr.type === 'NAV') set('useTextOfOriginalCharacteristic', useOriginalText);
+          for (const [key, value] of detail) {
+            if (value === undefined) continue;
+            patched = new RegExp(`\\b${key}="[^"]*"`).test(patched)
+              ? patched.replace(new RegExp(`\\b${key}="[^"]*"`), `${key}="${value}"`)
+              : patched.replace(/^<attributeN\b/, `<attributeN ${key}="${value}"`);
+          }
           attrXmlParts.push(patched);
           continue;
         }
@@ -991,14 +1107,15 @@ export async function bwUpdateInfoObject(
           ` shortDescription="${esc(propsOfAttr.label)}"` +
           ` dataType="${propsOfAttr.dataType}"` +
           ` displayInQuery="${attr.displayInQuery ?? true}"` +
-          ` f4HelpOrder="0"` +
+          ` f4HelpOrder="${attr.f4HelpOrder ?? 0}"` +
+          detail.filter(([key, value]) => key !== 'f4HelpOrder' && value !== undefined).map(([key, value]) => ` ${key}="${value}"`).join('') +
           ` hasAttributes="false"` +
           lengthAttr +
           ` partOfIndex="false"` +
           ` sidKeyFigure="false"` +
           (attr.timeDependent ? ` timeDependent="true"` : '') +
           ` type="${attr.type}"` +
-          ` useTextOfOriginalCharacteristic="${attr.useTextOfOriginalCharacteristic ?? true}"/>`
+          ` useTextOfOriginalCharacteristic="${useOriginalText ?? true}"/>`
         );
       }
 
@@ -1030,6 +1147,49 @@ export async function bwUpdateInfoObject(
     if (args.lower_case !== undefined) {
       xml = setLowerCase(xml, args.lower_case);
     }
+    const general = applyCharacteristicGeneralProperties(xml, args);
+    const onlyAttribute = applyAttributeOnly(general.xml, args.attribute_only);
+    const xxl = applyXxlAttributes(onlyAttribute.xml, args.xxl_attributes);
+    xml = xxl.xml;
+    propertyChanges.push(...general.changes, ...onlyAttribute.changes, ...xxl.changes);
+
+    if (args.compound_infoobjects !== undefined) {
+      const parents = args.compound_infoobjects.map((p) => p.trim().toUpperCase()).filter(Boolean);
+      if (parents.includes(nameUpper)) throw new Error(`InfoObject '${nameUpper}' cannot be compounded to itself.`);
+      const twice = parents.find((p, i) => parents.indexOf(p) !== i);
+      if (twice) throw new Error(`Compounding parent ${twice} is listed twice.`);
+      // The compounding parents of the InfoObject itself are the ones outside its attributes;
+      // a compounded attribute carries its own parents as child elements.
+      const attributeRanges = [...xml.matchAll(new RegExp(ATTRIBUTE_ELEMENT.source, 'g'))].map((m) => [m.index ?? 0, (m.index ?? 0) + m[0].length]);
+      const own = [...xml.matchAll(/<compoundParent\b[^>]*(?:\/>|>[\s\S]*?<\/compoundParent>)/g)]
+        .filter((m) => !attributeRanges.some(([from, to]) => (m.index ?? 0) >= from && (m.index ?? 0) < to));
+      const now = own.map((m) => m[0].match(/\bname="([^"]+)"/)?.[1]?.toUpperCase() ?? '');
+      if (now.length !== parents.length || now.some((p, i) => p !== parents[i])) {
+        const elements: string[] = [];
+        for (const parent of parents) {
+          const got = await freshClient.get(`/sap/bw/modeling/iobj/${bwSeg(parent.toLowerCase())}/a`, MEDIA_TYPES['iobj']);
+          const type = got.body.match(/<infoObjectType>([^<]+)<\/infoObjectType>/)?.[1] ?? '';
+          if (type !== 'CHA' && type !== 'TIM' && type !== 'UNI') {
+            throw new Error(`${parent} cannot be a compounding parent: it is a ${type || 'unknown'} InfoObject, not a characteristic.`);
+          }
+          if (/<iobj:infoObject\b[^>]*\sattributeOnly="true"/.test(got.body)) {
+            throw new Error(`${parent} cannot be a compounding parent: the InfoObject is defined as attribute only.`);
+          }
+          const props = parseInfoObjectProps(got.body);
+          const text = (got.body.match(/<longDescription>([^<]+)<\/longDescription>/)?.[1] ?? props.label).replace(/"/g, '&quot;');
+          elements.push(
+            `<compoundParent description="${text}" infoObjectType="${type}" name="${parent}" ` +
+            `ref="../../${parent.toLowerCase()}/a/model.iobj#//" dataType="${props.dataType}" length="${props.length}">` +
+            `<referencedCharacteristic xsi:type="iobj:ReferencedInfoObject" description=""/></compoundParent>`,
+          );
+        }
+        for (const m of [...own].reverse()) xml = xml.slice(0, m.index ?? 0) + xml.slice((m.index ?? 0) + m[0].length);
+        const point = ['<attributeN', '<externalSAPHANAView', '<runtimeProperties', '<sidTable', '</iobj:infoObject>'].find((p) => xml.includes(p));
+        if (!point) throw new Error('Could not find the place of the compounding in the InfoObject document.');
+        xml = xml.replace(point, elements.join('') + point);
+        propertyChanges.push(parents.length > 0 ? `compounded to ${parents.join(', ')}` : 'compounding removed');
+      }
+    }
 
     // Patch description if provided
     if (args.description) {
@@ -1040,8 +1200,24 @@ export async function bwUpdateInfoObject(
     await freshClient.put('iobj', nameLower, lockHandle, xml, timestamp, args.transport);
 
     // Step 9: Activate — another fresh session (mirrors TRFN pattern)
-    const outcome = await activateInfoObject(nameLower, lockHandle);
+    let outcome = await activateInfoObject(nameLower, lockHandle);
+    // A changed compounding rebuilds the master data tables. Together with other table changes
+    // the first activation can stop at a field the rebuild has not created yet, and the next
+    // one goes through, so it is tried once more before the failure is reported.
+    if (!outcome.ok && propertyChanges.some((change) => change.startsWith('compound'))) {
+      outcome = await activateInfoObject(nameLower, lockHandle);
+      if (outcome.ok) notes.push('The activation took two runs, as BW rebuilt the master data tables for the new compounding.');
+    }
     if (!outcome.ok) return notActivated(nameUpper, outcome);
+
+    // BW derives the output length for some data types, so the stored one is reported.
+    if (args.output_length !== undefined) {
+      const active = await createClientFromEnv().get(`/sap/bw/modeling/iobj/${bwSeg(nameLower)}/a`, MEDIA_TYPES['iobj']);
+      const stored = active.body.match(/<iobj:infoObject\b[^>]*\soutputLength="(\d+)"/)?.[1];
+      if (stored !== undefined && stored !== String(args.output_length)) {
+        notes.push(`BW set the output length to ${stored}, not ${args.output_length}: it derives it from the data type and the length.`);
+      }
+    }
   } finally {
     // Unlock with the original lock-session client
     await client.unlock('iobj', nameLower).catch(() => undefined);
@@ -1051,6 +1227,7 @@ export async function bwUpdateInfoObject(
   if (replaceAttributes) changes.push(`${attributes.length} attribute(s)`);
   if (args.lower_case !== undefined) changes.push(`lowerCase=${args.lower_case}`);
   if (args.description) changes.push('description');
+  changes.push(...propertyChanges);
   if (args.with_master_data !== undefined) changes.push(`master data ${args.with_master_data ? 'on' : 'off'}`);
   if ([args.with_texts, args.short_text, args.medium_text, args.long_text, args.extra_long_text,
     args.texts_language_dependent, args.texts_time_dependent].some((v) => v !== undefined)) changes.push('text properties');
