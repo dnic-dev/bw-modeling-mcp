@@ -310,6 +310,7 @@ export const FOCUSED_TOOLS: FocusedToolSpec[] = [
       op('append_dtp', 'bw_append_process_chain_dtp'),
       op('swap_dtp', 'bw_swap_process_chain_dtp'),
       op('add_program', 'bw_add_process_chain_program'),
+      op('add_decision', 'bw_add_process_chain_decision'),
       op('add_plswitch', 'bw_add_process_chain_plswitch'),
       op('add_edge', 'bw_add_process_chain_edge'),
       op('remove_edge', 'bw_remove_process_chain_edge'),

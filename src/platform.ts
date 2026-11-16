@@ -258,6 +258,7 @@ const COLLECTION_NEEDS: Record<string, string[]> = {
   bw_append_process_chain_dtp: ['rspc'],
   bw_swap_process_chain_dtp: ['rspc'],
   bw_add_process_chain_program: ['rspc'],
+  bw_add_process_chain_decision: ['rspc'],
   bw_add_process_chain_plswitch: ['rspc'],
   bw_create_decision_variant: ['rspc'],
 

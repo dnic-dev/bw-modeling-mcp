@@ -143,7 +143,7 @@ import { resolveLogonUser } from './tools/logon_user.js';
 import { bwCreatePlanningSequence, bwUpdatePlanningSequence, type CreatePlanningSequenceArgs, type UpdatePlanningSequenceArgs } from './tools/planning_sequence_write.js';
 import { bwCreatePlanningFilter, bwUpdatePlanningFilter, type CreatePlanningFilterArgs, type UpdatePlanningFilterArgs } from './tools/planning_filter_write.js';
 import { bwListProcessChainRuns, bwGetProcessChainRunDetail, bwListProcessChainLastStatus } from './tools/process_chain_monitor.js';
-import { bwCreateProcessChain, bwUpdateProcessChain, bwActivateProcessChain, bwAddProcessChainErrorLinks, bwSwapProcessChainDtp, bwAppendProcessChainDtp, bwAddProcessChainProgram, bwAddProcessChainPlanningSwitch, bwAddProcessChainEdge, bwRemoveProcessChainEdge, bwRemoveProcessChainStep, bwCreateDecisionVariant, CreateProcessChainParams, UpdateProcessChainParams, EdgeDef, EdgeStatus, TriggerEventConfig } from './tools/processchain_write.js';
+import { bwCreateProcessChain, bwUpdateProcessChain, bwActivateProcessChain, bwAddProcessChainErrorLinks, bwSwapProcessChainDtp, bwAppendProcessChainDtp, bwAddProcessChainProgram, bwAddProcessChainDecision, bwAddProcessChainPlanningSwitch, bwAddProcessChainEdge, bwRemoveProcessChainEdge, bwRemoveProcessChainStep, bwCreateDecisionVariant, CreateProcessChainParams, UpdateProcessChainParams, EdgeDef, EdgeStatus, TriggerEventConfig } from './tools/processchain_write.js';
 import { bwStartProcessChain, bwRestartProcessChainStep, MAX_WAIT_SECONDS } from './tools/process_chain_run.js';
 import { bwCreateTransportTask } from './tools/transport.js';
 
@@ -6137,7 +6137,8 @@ const TOOL_DEFINITIONS = [
         'A 412 on the PUT means the ETag was stale (chain modified between read and write); the error reports this explicitly. ' +
         'Use bw_create_process_chain to create a new chain; use this tool to update an existing one. ' +
         'This tool REPLACES the whole step model, so every step that should survive must be listed — a step left out is deleted. ' +
-        'For a small change to a big chain prefer the targeted tools (bw_append_process_chain_dtp, bw_add_process_chain_program, bw_add_process_chain_plswitch, bw_add_process_chain_edge, bw_remove_process_chain_edge, bw_remove_process_chain_step), which edit the server\'s own model in place and cannot drop a step they do not model. ' +
+        'For a small change to a big chain prefer the targeted tools (bw_append_process_chain_dtp, bw_add_process_chain_program, bw_add_process_chain_decision, bw_add_process_chain_plswitch, bw_add_process_chain_edge, bw_remove_process_chain_edge, bw_remove_process_chain_step), which edit the server\'s own model in place and cannot drop a step they do not model. ' +
+        'Planning mode switch steps cannot be listed here and are dropped by the replace; to add a DECISION step to a chain that has them use bw_add_process_chain_decision. ' +
         'Supported step types: DTP_LOAD (DTP load), ADSOACT (DSO data activation), ADSOREM (DSO request cleanup), ABAP (execute an ABAP program, optionally with an SE38 selection variant), CHAIN (start a local sub-chain, verified), DECISION (branch on a decision variant, requires the variant field), and collectors AND / OR / XOR; the start trigger is implicit. ' +
         'A generic referenced-step path (any process type string plus an object name, bIsReference=true) is available and verified for DTP_LOAD and CHAIN; for other types it may work but is untested. ' +
         'Other inline-configuration process types (for example OS command, attribute change run) are not supported in this version — a chain containing one cannot be rewritten with this tool without losing that step. ' +
@@ -6369,7 +6370,8 @@ const TOOL_DEFINITIONS = [
         'The variant is created AND activated (activation is mandatory — an inactive variant is not selectable in the chain variant picker). ' +
         'After creation, reference the variant from a DECISION step in bw_create_process_chain / bw_update_process_chain (variant=<this name>), and branch its out-edges with sub_status "01"/"02". ' +
         'Package/transport: $TMP is fine for visibility and picker selection; pass a transportable package (NOT $TMP) only if you need to transport the variant. ' +
-        'For a transportable package a transport_request is used (auto-selected when exactly one changeable request is available; pass it to disambiguate).',
+        'For a transportable package a transport_request is used (auto-selected when exactly one changeable request is available; pass it to disambiguate). ' +
+        'The result reports the package read back from the system after the create (packageVerified), and a packageWarning when it differs from the requested one.',
       inputSchema: {
         type: 'object',
         properties: {
@@ -6647,6 +6649,72 @@ const TOOL_DEFINITIONS = [
           },
         },
         required: ['name', 'program'],
+      },
+    },
+    {
+      name: 'bw_add_process_chain_decision',
+      description:
+        'Add a DECISION step (branch on a decision variant) to an existing Process Chain (RSPC), via the BW/4HANA Cockpit REST API. ' +
+        'In-place edit: reads the current model, adds the node and its edges, and PUTs it back, so every other step of the chain stays as it is — including step types bw_update_process_chain cannot list, such as planning mode switches. ' +
+        'The step references an existing, active decision variant; create it first with bw_create_decision_variant. The branch conditions (EVENTNO) are read from the variant. ' +
+        'A decision has no plain successor, only branches, and the chain check refuses a branch that leads nowhere. The existing strand continues on one branch (continue_on, default "then"); the other branch leads to the existing step named in other_branch_to. ' +
+        'To branch to a step that does not exist yet, add that step first (e.g. with bw_add_process_chain_program or bw_append_process_chain_dtp) and then insert the decision. A step that ends up with two incoming strands gets a collector inserted by the system on save. ' +
+        'Positioning (exactly one): "before" guards an existing step — its incoming edges are rerouted into the decision and the continuing branch leads to it; ' +
+        '"after" puts the decision between a step and its successors — the successors move onto the continuing branch, while steps reached only on error stay with the step. ' +
+        'edge_mode applies to the edges into the decision: "both" (default) adds an on-success and an on-error edge, "success_only" only the on-success edge. Branch edges out of the decision are always on-success. ' +
+        'Idempotent: if a DECISION step for the same variant is already in the chain, nothing is written. ' +
+        'A 412 on the PUT means the ETag was stale (chain modified between read and write); the error reports this explicitly.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          name: {
+            type: 'string',
+            description: 'Process chain technical name (e.g. "CHAIN_NAME"). Case-insensitive.',
+          },
+          variant: {
+            type: 'string',
+            description: 'Decision variant technical name (e.g. "VARIANT_NAME"). Must exist and be active.',
+          },
+          description: {
+            type: 'string',
+            description: 'Optional step description. Defaults to the description of the variant.',
+          },
+          before: {
+            type: 'string',
+            description:
+              'Insert the decision BEFORE this step. Node reference forms: a DTP or process-variant name; an aDSO held by an ADSOACT/ADSOREM node; the program of an ABAP step, or "PROGRAM/VARIANT"; a planning mode switch as "PLSWITCHL/ADSO_NAME" or "PLSWITCHP/ADSO_NAME"; a collector type ("AND"/"OR"); or "#<index>" using the step numbers printed by bw_get_process_chain.',
+          },
+          after: {
+            type: 'string',
+            description: 'Insert the decision AFTER this step, between it and its successors. Same node reference forms as "before". The step needs at least one successor and must not itself be a decision.',
+          },
+          continue_on: {
+            type: 'string',
+            enum: ['then', 'else'],
+            description: 'Branch on which the existing strand continues: "then" (default, the first branch of the variant) or "else" (the second branch).',
+          },
+          other_branch_to: {
+            type: 'string',
+            description: 'Existing step the other branch leads to. Same node reference forms as "before".',
+          },
+          edge_mode: {
+            type: 'string',
+            enum: ['both', 'success_only'],
+            description: 'Edges into the decision. "both" (default): on-success and on-error. "success_only": only on-success.',
+          },
+          activate: {
+            type: 'boolean',
+            description: 'If true, activate the chain immediately after the edit. Default false.',
+          },
+          transport_request: {
+            type: 'string',
+            description:
+              'Optional transport request to record the change into. Only relevant when the chain is in a transportable package (not $TMP). ' +
+              'If the chain is transportable and exactly one request is available, it is chosen automatically; pass this to disambiguate when several are available. ' +
+              'Ignored for $TMP (local) chains.',
+          },
+        },
+        required: ['name', 'variant', 'other_branch_to'],
       },
     },
     {
@@ -8405,6 +8473,21 @@ async function handleToolCall(
           variantDescription: args?.variant_description as string | undefined,
           synchronous: args?.synchronous as boolean | undefined,
           local: args?.local as boolean | undefined,
+          activate: (args?.activate as boolean) ?? false,
+          transportRequest: args?.transport_request as string | undefined,
+        });
+        break;
+
+      case 'bw_add_process_chain_decision':
+        text = await bwAddProcessChainDecision(client, {
+          name: args?.name as string,
+          variant: args?.variant as string,
+          description: args?.description as string | undefined,
+          before: args?.before as string | undefined,
+          after: args?.after as string | undefined,
+          continueOn: args?.continue_on as 'then' | 'else' | undefined,
+          otherBranchTo: args?.other_branch_to as string,
+          edgeMode: args?.edge_mode as 'both' | 'success_only' | undefined,
           activate: (args?.activate as boolean) ?? false,
           transportRequest: args?.transport_request as string | undefined,
         });
