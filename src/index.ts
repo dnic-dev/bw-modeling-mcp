@@ -17,6 +17,7 @@ import { currentClient } from './request-context.js';
 import { filterToolsByScope, mayCall, requiredScope, scopesFor } from './scopes.js';
 import { buildFocusedTools, resolveFocusedCall, toolMode, translateToolNames, type ToolDefinition } from './surface/focused.js';
 import { undeclaredArguments } from './arguments.js';
+import { redactBackend } from './redact.js';
 import {
   cachedPlatform,
   ensurePlatform,
@@ -1502,64 +1503,6 @@ const TOOL_DEFINITIONS = [
       },
     },
     {
-      name: 'bw_set_transformation_runtime',
-      description:
-        'Switch a Transformation between HANA and ABAP runtime. ' +
-        'Only changes the HANARuntime attribute — no rule changes. ' +
-        'The current runtime is read from the active version; if it already matches, returns early. ' +
-        'Activates automatically and verifies the change landed in the active version — no separate bw_activate needed. ' +
-        'Returns an error (not success) if the switch does not persist, e.g. when the server refuses HANA runtime for this transformation.',
-      inputSchema: {
-        type: 'object',
-        properties: {
-          transformation_name: {
-            type: 'string',
-            description: 'Transformation name (UUID-like key).',
-          },
-          runtime: {
-            type: 'string',
-            enum: ['hana', 'abap'],
-            description: '"hana" sets HANARuntime="true", "abap" sets HANARuntime="false".',
-          },
-          transport: {
-            type: 'string',
-            description: 'Transport request number (e.g. DEVK900123). Only required if the BW system requires transport assignment.',
-          },
-        },
-        required: ['transformation_name', 'runtime'],
-      },
-    },
-    {
-      name: 'bw_check',
-      description:
-        'Run the activation checks of one BW object without activating it — the "Check" of the modeling tools. ' +
-        'The saved, inactive version is validated exactly as an activation would validate it; nothing is generated and the active version stays as it is. ' +
-        'Needs no lock handle and releases none, so it fits between two changes of the same object. ' +
-        'Returns consistent true or false with the errors, warnings and information messages of the check. ' +
-        'Use it before bw_activate to see whether the activation would go through, and after a failed activation to check a correction.',
-      inputSchema: {
-        type: 'object',
-        properties: {
-          object_type: {
-            type: 'string',
-            enum: ['adso', 'trfn', 'dtpa', 'iobj', 'trcs', 'rsds', 'hcpr', 'alvl', 'dest'],
-            description:
-              'Object type: adso, trfn, dtpa, iobj, trcs, rsds (DataSource), hcpr (CompositeProvider), ' +
-              'alvl (Aggregation Level) or dest (Open Hub Destination).',
-          },
-          object_name: {
-            type: 'string',
-            description: 'Object name (e.g. "OBJECT_NAME" or "DTP_..."). For rsds, the DataSource name.',
-          },
-          source_system: {
-            type: 'string',
-            description: 'Source system name. Required when object_type is "rsds" (e.g. "LSYS_NAME").',
-          },
-        },
-        required: ['object_type', 'object_name'],
-      },
-    },
-    {
       name: 'bw_update_transformation_settings',
       description:
         'Change the settings of a Transformation that are not rules: its switches, the options of single target fields, and the fields the extraction is grouped by. ' +
@@ -1667,6 +1610,64 @@ const TOOL_DEFINITIONS = [
           },
         },
         required: ['transformation_name', 'action'],
+      },
+    },
+    {
+      name: 'bw_set_transformation_runtime',
+      description:
+        'Switch a Transformation between HANA and ABAP runtime. ' +
+        'Only changes the HANARuntime attribute — no rule changes. ' +
+        'The current runtime is read from the active version; if it already matches, returns early. ' +
+        'Activates automatically and verifies the change landed in the active version — no separate bw_activate needed. ' +
+        'Returns an error (not success) if the switch does not persist, e.g. when the server refuses HANA runtime for this transformation.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          transformation_name: {
+            type: 'string',
+            description: 'Transformation name (UUID-like key).',
+          },
+          runtime: {
+            type: 'string',
+            enum: ['hana', 'abap'],
+            description: '"hana" sets HANARuntime="true", "abap" sets HANARuntime="false".',
+          },
+          transport: {
+            type: 'string',
+            description: 'Transport request number (e.g. DEVK900123). Only required if the BW system requires transport assignment.',
+          },
+        },
+        required: ['transformation_name', 'runtime'],
+      },
+    },
+    {
+      name: 'bw_check',
+      description:
+        'Run the activation checks of one BW object without activating it — the "Check" of the modeling tools. ' +
+        'The saved, inactive version is validated exactly as an activation would validate it; nothing is generated and the active version stays as it is. ' +
+        'Needs no lock handle and releases none, so it fits between two changes of the same object. ' +
+        'Returns consistent true or false with the errors, warnings and information messages of the check. ' +
+        'Use it before bw_activate to see whether the activation would go through, and after a failed activation to check a correction.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          object_type: {
+            type: 'string',
+            enum: ['adso', 'trfn', 'dtpa', 'iobj', 'trcs', 'rsds', 'hcpr', 'alvl', 'dest'],
+            description:
+              'Object type: adso, trfn, dtpa, iobj, trcs, rsds (DataSource), hcpr (CompositeProvider), ' +
+              'alvl (Aggregation Level) or dest (Open Hub Destination).',
+          },
+          object_name: {
+            type: 'string',
+            description: 'Object name (e.g. "OBJECT_NAME" or "DTP_..."). For rsds, the DataSource name.',
+          },
+          source_system: {
+            type: 'string',
+            description: 'Source system name. Required when object_type is "rsds" (e.g. "LSYS_NAME").',
+          },
+        },
+        required: ['object_type', 'object_name'],
       },
     },
     {
@@ -7189,6 +7190,13 @@ async function handleToolCall(
 ): Promise<{ content: Array<{ type: 'text'; text: string }>; isError?: boolean }> {
   const { name, arguments: args } = request.params;
 
+  // A name that is no tool at all is a protocol error for every caller. Checked first: the
+  // scope check below treats anything unrecognised as a write tool and would tell a reader
+  // to ask for a role that would not help either.
+  if (!TOOL_DEFINITIONS.some((t) => t.name === name)) {
+    throw new McpError(ErrorCode.InvalidParams, `Unknown tool: ${name}`);
+  }
+
   // Deny before doing any work. stdio has no authInfo and nothing to check.
   if (!mayCall(name, extra.authInfo)) {
     // Naming every scope that would admit the tool, because two of them overlap: a query
@@ -8816,12 +8824,18 @@ async function handleToolCall(
         break;
 
       default:
-        throw new McpError(ErrorCode.MethodNotFound, `Unknown tool: ${name}`);
+        throw new Error(`Tool '${name}' is defined but has no handler.`);
     }
 
     return { content: [{ type: 'text', text }] };
   } catch (error: unknown) {
-    const message = error instanceof Error ? error.message : String(error);
+    const full = error instanceof Error ? error.message : String(error);
+    // Over HTTP the caller is remote: the full text goes to the log, the answer leaves out
+    // where the backend lives. Under stdio the operator is the caller and sees everything.
+    const remote = currentClient();
+    const message = remote ? redactBackend(full, remote.baseUrl) : full;
+    if (remote && message !== full) process.stderr.write(`[error] ${name}: ${full}
+`);
     // Return as error content so Claude can see the details
     return {
       content: [{ type: 'text', text: `Error: ${message}` }],
