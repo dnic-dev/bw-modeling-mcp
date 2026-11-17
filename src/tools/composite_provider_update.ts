@@ -6,6 +6,7 @@ import {
   bwSeg,
   bwEscapeName,
 } from '../bw-client.js';
+import { enterScope, leaveScope } from './composite_provider_nodes.js';
 import {
   NameUsage,
   NewElementDefaults,
@@ -212,7 +213,7 @@ export async function bwUpdateCompositeProvider(
   const cpPath = `/sap/bw/modeling/hcpr/${bwSeg(compositeProviderName)}/m`;
   const cpResult = await freshRead(cpPath, hcprAccept());
   const timestamp = cpResult.headers['timestamp'] ?? cpResult.headers['TIMESTAMP'];
-  let xml = cpResult.body;
+  let xml = enterScope(cpResult.body);
 
   const inputs = parseInputs(xml);
   const processed: string[] = [];
@@ -352,7 +353,7 @@ export async function bwUpdateCompositeProvider(
 
   const lockHandle = await client.lock('hcpr', compositeProviderName);
   try {
-    await client.put('hcpr', compositeProviderName, lockHandle, xml, timestamp, transport);
+    await client.put('hcpr', compositeProviderName, lockHandle, leaveScope(xml), timestamp, transport);
   } catch (err) {
     await client.unlock('hcpr', compositeProviderName).catch(() => {/* ignore unlock error */});
     throw err;

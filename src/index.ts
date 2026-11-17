@@ -62,9 +62,9 @@ import {
   bwUpdateCompositeProviderFields,
   bwUpdateCompositeProviderGroup,
   bwUpdateCompositeProviderNavigationAttributes,
-  NameUsage,
-} from './tools/composite_provider.js';
+  NameUsage, bwUpdateCompositeProviderFilter, bwReplaceCompositeProviderInput, bwInsertCompositeProviderNode, bwRemoveCompositeProviderNode } from './tools/composite_provider.js';
 import { bwUpdateCompositeProvider, CompositeProviderFieldAction } from './tools/composite_provider_update.js';
+import { selectNode, scopeNotes } from './tools/composite_provider_nodes.js';
 import { bwGetCkf, bwGetRkf, bwGetStructure, bwGetVariable } from './tools/cp_components.js';
 import { bwCreateRkf, CreateRkfArgs } from './tools/rkf_create.js';
 import {
@@ -4045,13 +4045,17 @@ const TOOL_DEFINITIONS = [
         'source providers (inputs) with mapping counts, fields with their field group (dimension) and, for InfoObject-bound fields, ' +
         'their name usage ("direct" or "unique_name" — a query finds a "unique_name" field only under "<prefix>-<FIELD>") ' +
         'and the navigation attributes switched on ("<FIELD_IOBJ>__<ATTR_NAME>"), ' +
-        'the declared field groups, join condition, and temporal join details. Returns the inactive version.',
+        'the declared field groups, the SQL filter of the view node (filter_expression), join condition, and temporal join details. Returns the inactive version.',
       inputSchema: {
         type: 'object',
         properties: {
           composite_provider_name: {
             type: 'string',
             description: 'Technical name of the CompositeProvider (e.g. "HCPR_NAME").',
+          },
+          node: {
+            type: 'string',
+            description: 'View node to show the fields and inputs of (e.g. "J1"); defaults to the default node. view_nodes lists all nodes when there is more than one.',
           },
         },
         required: ['composite_provider_name'],
@@ -4063,11 +4067,13 @@ const TOOL_DEFINITIONS = [
         'Change a CompositeProvider (HCPR): its fields, its source providers, their field mappings, the join condition, or root settings. ' +
         'Every action returns a lock_handle that must be passed to bw_activate (object type hcpr) — an HCPR cannot be activated without it. ' +
         'Fields: "add_field" (default) adds an element plus a mapping in every part provider supplying it, taking the field metadata from there; "remove_field" removes the element and all mappings referencing it, and refuses a field that is the common target of a join condition or the compounding parent of another field. A compounded field brings its compounding parent along wherever it is added or mapped. ' +
-        'Sources: "add_input" attaches a source provider, creates the target elements it needs and returns the generated alias; "remove_input" strips one by alias and leaves its fields in place, so a replacement input can feed them (auto-mapping reuses fields no input feeds). On a join node the condition has to be set again afterwards. ' +
+        'Sources: "add_input" attaches a source provider, creates the target elements it needs and returns the generated alias; "remove_input" strips one by alias and leaves its fields in place, so a replacement input can feed them (auto-mapping reuses fields no input feeds). On a join node the condition has to be set again afterwards. "replace_input" puts another provider (provider_name) in the place of one input: mappings stay where the new provider has a field of the same name, joins follow, and the answer carries the new alias and the mappings it dropped. ' +
         'Mappings: "update_mapping" replaces the complete mapping list of one input; pass no mappings to map every field of its source one to one. This is also how an input attached at creation time gets its mappings. The result names fields that no input feeds any more. ' +
         'Joins: "update_join" sets the condition between one pair of inputs — call it once per pair to build an N-way join — and "remove_join" drops one pair. Both sides of a join key need a common target field: update_join maps the right key onto the field the left key feeds (creating it if needed) and reports it; a key that leaves the condition goes back to being fed by the left input only, since in a join only a key field may be fed by both sides. ' +
         'Field groups and name usage: every field the tool creates goes into a field group (CHARACTERISTICS or KEYFIGURES unless dimension names another) and, when it is named after its InfoObject, uses that InfoObject directly by name — the form a query needs to find it. "update_fields" moves existing fields into a group and/or switches their name usage; "update_group" creates a group, changes its label or renames it. ' +
         'Navigation attributes: "update_navigation_attributes" switches navigation attributes of one InfoObject-bound field on or off. In a union every part provider that supplies the field must deliver the attribute too: an aDSO does, an aggregation level or another CompositeProvider only when it lists the attribute as a field; the result warns about parts that cannot. ' +
+        'Filter: "update_filter" sets or removes the SQL filter of the view node (filter_expression). Join keys take an operator other than equality in key_pairs (operator); such a pair gets a target field per side in place of a common one. ' +
+        'View nodes: a CompositeProvider is a tree of nodes, each with its own fields and inputs; an input is a provider or the node below. "insert_node" puts a join, union, projection or aggregation node (node_type) above one input (input_alias) or, without it, above the default node; a join node takes its second input with provider_name. "remove_node" takes a node out with the nodes below it. Every other action works on the node named in node, the default node if omitted; an input that is a node has the node name as its alias. ' +
         'Settings: "update_settings" edits label, stackable, default node and aggregation behaviour.',
       inputSchema: {
         type: 'object',
@@ -4079,8 +4085,8 @@ const TOOL_DEFINITIONS = [
           action: {
             type: 'string',
             enum: [
-              'add_field', 'remove_field', 'add_input', 'remove_input',
-              'update_mapping', 'update_join', 'remove_join', 'update_fields', 'update_group',
+              'add_field', 'remove_field', 'add_input', 'remove_input', 'replace_input', 'insert_node', 'remove_node',
+              'update_mapping', 'update_join', 'remove_join', 'update_fields', 'update_group', 'update_filter',
               'update_navigation_attributes', 'update_settings',
             ],
             description: 'Defaults to "add_field".',
@@ -4101,6 +4107,27 @@ const TOOL_DEFINITIONS = [
           enabled: {
             type: 'boolean',
             description: 'update_navigation_attributes: true (default) switches the attributes on, false switches them off.',
+          },
+          field_description: {
+            type: 'string',
+            description: 'update_fields: the description of the listed fields in this CompositeProvider.',
+          },
+          node: {
+            type: 'string',
+            description: 'Name of the view node the action works on (e.g. "J1"), for a CompositeProvider with more than one; defaults to the default node. remove_node: the node to remove.',
+          },
+          node_type: {
+            type: 'string',
+            enum: ['join', 'union', 'projection', 'aggregation'],
+            description: 'insert_node: kind of the new view node.',
+          },
+          filter_expression: {
+            type: 'string',
+            description: 'update_filter: the SQL condition every record of the view node has to meet, written over the fields of the CompositeProvider in double quotes (e.g. "FIELD_NAME" = \'VALUE\'); an empty text removes the filter.',
+          },
+          new_field_name: {
+            type: 'string',
+            description: 'update_fields: a new name for the one field named in info_object_name. Its mappings and the references of other fields follow. A field exposed under its InfoObject name keeps that name until name_usage is "unique_name"; the same call can set it.',
           },
           name_usage: {
             type: 'string',
@@ -4130,15 +4157,15 @@ const TOOL_DEFINITIONS = [
           },
           provider_name: {
             type: 'string',
-            description: 'add_input: technical name of the source InfoProvider to attach.',
+            description: 'add_input / replace_input: technical name of the source InfoProvider to attach.',
           },
           provider_type: {
             type: 'string',
-            description: 'add_input: TLOGO-style suffix used in the generated alias (e.g. "ADSO"). Defaults to "ADSO".',
+            description: 'add_input / replace_input: TLOGO-style suffix used in the generated alias (e.g. "ADSO"). Defaults to "ADSO".',
           },
           input_alias: {
             type: 'string',
-            description: 'remove_input / update_mapping: alias of the input (e.g. "U1.ADSO.1").',
+            description: 'remove_input / replace_input / update_mapping: alias of the input (e.g. "U1.ADSO.1").',
           },
           mappings: {
             type: 'array',
@@ -4177,6 +4204,7 @@ const TOOL_DEFINITIONS = [
               properties: {
                 left: { type: 'string' },
                 right: { type: 'string' },
+                operator: { type: 'string', enum: ['EQ', 'NE', 'LT', 'LE', 'GT', 'GE'], description: 'How the two keys are compared (default EQ). A pair that is not compared for equality gets no common target field.' },
               },
               required: ['left', 'right'],
             },
@@ -8193,12 +8221,14 @@ async function handleToolCall(
         break;
 
       case 'bw_get_composite_provider':
+        selectNode(args?.node as string | undefined);
         text = await bwGetCompositeProvider(client, args?.composite_provider_name as string);
         break;
 
       case 'bw_update_composite_provider': {
         const cpName = args?.composite_provider_name as string;
         const cpAction = (args?.action as string | undefined) ?? 'add_field';
+        selectNode(args?.node as string | undefined);
         const cpTransport = args?.transport as string | undefined;
         const cpMappings = ((args?.mappings as Array<Record<string, string>> | undefined) ?? []).map((m) => ({
           target: m.target,
@@ -8231,8 +8261,16 @@ async function handleToolCall(
               client,
               cpName,
               ((args?.info_object_name as string | undefined) ?? '').split(',').map((f) => f.trim()).filter(Boolean),
-              { ...cpDefaults, transport: cpTransport },
+              {
+                ...cpDefaults,
+                description: args?.field_description as string | undefined,
+                newName: args?.new_field_name as string | undefined,
+                transport: cpTransport,
+              },
             );
+            break;
+          case 'update_filter':
+            text = await bwUpdateCompositeProviderFilter(client, cpName, args?.filter_expression as string | undefined, cpTransport);
             break;
           case 'update_group':
             text = await bwUpdateCompositeProviderGroup(client, cpName, args?.dimension as string, {
@@ -8267,6 +8305,24 @@ async function handleToolCall(
               transport: cpTransport,
             });
             break;
+          case 'insert_node':
+            text = await bwInsertCompositeProviderNode(client, cpName, {
+              nodeType: args?.node_type as string | undefined,
+              inputAlias: args?.input_alias as string | undefined,
+              providerName: args?.provider_name as string | undefined,
+              providerType: args?.provider_type as string | undefined,
+              transport: cpTransport,
+            });
+            break;
+          case 'remove_node':
+            text = await bwRemoveCompositeProviderNode(client, cpName, args?.node as string | undefined, cpTransport);
+            break;
+          case 'replace_input':
+            text = await bwReplaceCompositeProviderInput(client, cpName, args?.input_alias as string, {
+              providerName: args?.provider_name as string,
+              providerType: (args?.provider_type as string | undefined) ?? 'ADSO',
+            }, cpTransport);
+            break;
           case 'update_mapping':
             text = await bwUpdateCompositeProviderMapping(
               client,
@@ -8283,7 +8339,7 @@ async function handleToolCall(
               cpName,
               args?.left_alias as string,
               args?.right_alias as string,
-              (args?.key_pairs as Array<{ left: string; right: string }> | undefined) ?? [],
+              (args?.key_pairs as Array<{ left: string; right: string; operator?: string }> | undefined) ?? [],
               {
                 joinType: args?.join_type as string | undefined,
                 cardinality: args?.cardinality as string | undefined,
@@ -8311,6 +8367,11 @@ async function handleToolCall(
             break;
           default:
             throw new Error(`Unknown action '${cpAction}' for bw_update_composite_provider.`);
+        }
+        if (scopeNotes().length) {
+          try {
+            text = JSON.stringify({ ...JSON.parse(text), node_above: scopeNotes() });
+          } catch { /* a result that is not JSON stays as it is */ }
         }
         break;
       }
