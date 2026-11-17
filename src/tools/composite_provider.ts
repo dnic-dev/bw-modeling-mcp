@@ -283,6 +283,7 @@ export async function bwGetCompositeProvider(
       ...(lastModified ? { last_modified: lastModified } : {}),
       provider_type: providerType,
       ...(nodeOfInput(im[0]) ? { view_node: nodeOfInput(im[0]) } : {}),
+      ...(hanaViewOfInput(im[0]) ? { hana_view: hanaViewOfInput(im[0]) } : {}),
       mapping_count: allMappings.length,
       regular_mapping_count: allMappings.length - constantMappings.length,
       constant_mappings: constantMappings,
@@ -405,9 +406,93 @@ function escapeXmlAttr(value: string): string {
     .replace(/"/g, '&quot;');
 }
 
+const HANA_VIEW_TYPES = ['calculationview', 'analyticview', 'attributeview'];
+const HANA_VIEW_ACCEPT = 'application/vnd.sap.bw.modeling.hanv-v1_0_0+xml';
+/** View type per SAP HANA view read in this process, needed to reference the view. */
+const hanaViewTypes = new Map<string, string>();
+
+/** A SAP HANA view is named "<package>::<view>", the way SAP HANA itself writes it. */
+export function parseHanaViewName(providerName: string): { packageName: string; viewName: string } | undefined {
+  const m = providerName.trim().match(/^([^:\s]+)::([^:\s]+)$/);
+  return m ? { packageName: m[1], viewName: m[2] } : undefined;
+}
+
 /** Relative entity reference used inside `<input><entity>…</entity></input>`. */
-function buildEntityRef(providerName: string): string {
+export function buildEntityRef(providerName: string): string {
+  const view = parseHanaViewName(providerName);
+  if (view) {
+    const type = hanaViewTypes.get(providerName.trim()) ?? HANA_VIEW_TYPES[0];
+    return `../../../hana/repository/${view.packageName.replace(/\./g, '/')}/${view.viewName}.${type}#/`;
+  }
   return `../../../infoprov_dt/a/${providerName.trim().toUpperCase()}.composite#//`;
+}
+
+/** "<package>::<view>" when the input is a SAP HANA view. */
+function hanaViewOfInput(inputBlock: string): string | undefined {
+  const name = nodeOfInput(inputBlock) ? undefined : extractProviderNameFromInput(inputBlock);
+  return name && parseHanaViewName(name) ? name : undefined;
+}
+
+/** The alias segment of an input: the view type for a SAP HANA view, the provider type otherwise. */
+function inputAliasType(providerName: string, providerType: string): string {
+  return parseHanaViewName(providerName) ? (hanaViewTypes.get(providerName.trim()) ?? HANA_VIEW_TYPES[0]) : providerType;
+}
+
+/** ABAP data type a field of a SAP HANA view is given in a CompositeProvider. */
+export function hanaFieldType(primitiveType: string, length: number, precision: number, scale: number): string | undefined {
+  switch (primitiveType.toUpperCase()) {
+    case 'CHAR': case 'NCHAR': case 'VARCHAR': case 'NVARCHAR': case 'ALPHANUM':
+      return length > 0 ? `<inlineType name="CHAR" length="${length}" semanticType="empty"/>` : undefined;
+    case 'INTEGER': case 'SMALLINT': case 'TINYINT':
+      return '<inlineType name="INT4" length="10" semanticType="empty"/>';
+    case 'BIGINT':
+      return '<inlineType name="DEC" precision="18" scale="0" semanticType="empty"/>';
+    case 'DECIMAL': case 'SMALLDECIMAL': case 'NUMERIC': {
+      const digits = Math.min(precision || length || 17, 31);
+      return `<inlineType name="DEC" precision="${digits}" scale="${Math.min(scale, digits)}" semanticType="empty"/>`;
+    }
+    case 'DOUBLE': case 'FLOAT': case 'REAL':
+      return '<inlineType name="FLTP" length="16" semanticType="empty"/>';
+    case 'DATE': case 'SECONDDATE': case 'TIMESTAMP':
+      return '<inlineType name="DATS" length="8" semanticType="date"/>';
+    case 'TIME':
+      return '<inlineType name="TIMS" length="6" semanticType="empty"/>';
+    default:
+      return undefined;
+  }
+}
+
+/** The fields of a SAP HANA view, in the shape the fields of a BW provider have. */
+export function hanaViewFields(xml: string): SourceFieldMeta[] {
+  const fields: SourceFieldMeta[] = [];
+  for (const m of xml.matchAll(/<element\b((?:[^>/]|\/(?!>))*)(?:\/>|>([\s\S]*?)<\/element>)/g)) {
+    const name = attr(m[1], 'name');
+    if (!name) continue;
+    const body = m[2] ?? '';
+    const type = body.match(/<inlineType\b[^>]*/)?.[0] ?? '';
+    const number = (key: string) => parseInt(attr(type, key) || '0', 10);
+    // An input parameter of the view is listed as an element of its own type, with an ABAP type
+    // already; BW takes its value from the field it is mapped to.
+    const inlineTypeXml = /\bxsi:type="/.test(m[1])
+      ? (attr(type, 'name') ? `${type.replace(/\/$/, '')}/>` : undefined)
+      : hanaFieldType(attr(type, 'primitiveType'), number('length'), number('precision'), number('scale'));
+    if (!inlineTypeXml) continue;
+    const aggregation = attr(m[1], 'aggregationBehavior');
+    fields.push({
+      sourceName: name,
+      defaultTargetName: name,
+      label: decodeXmlEntities(body.match(/<endUserTexts label="([^"]*)"/)?.[1] ?? ''),
+      inlineTypeXml,
+      dataType: attr(inlineTypeXml, 'name'),
+      isKeyFigure: Boolean(aggregation) && aggregation !== 'NONE',
+      aggregationBehavior: aggregation || 'NONE',
+      outputLength: 0,
+      isMetaObject: false,
+      compoundParents: [],
+      parameterXml: body.match(/<Parameter\b(?:[^>/]|\/(?!>))*(?:\/>|>[\s\S]*?<\/Parameter>)/)?.[0],
+    });
+  }
+  return fields;
 }
 
 export interface CompositeProviderCreateOptions {
@@ -691,6 +776,8 @@ export interface SourceFieldMeta {
   compoundParents: string[];
   /** A time-dependent attribute of a characteristic. */
   timeDependent?: boolean;
+  /** Set for an input parameter of a SAP HANA view: its `<Parameter>` block. */
+  parameterXml?: string;
   baseInfoObjectName?: string;
 }
 
@@ -754,6 +841,17 @@ const SEMANTICS_TAG: Record<string, string> = {
 export async function fetchCompositeSourceFields(
   providerName: string
 ): Promise<{ fieldNamePrefix: string; lastModified?: string; fields: SourceFieldMeta[] }> {
+  const hanaView = parseHanaViewName(providerName);
+  if (hanaView) {
+    const viewXml = (await freshRead(
+      `/sap/bw/modeling/hana/repository/${encodeURIComponent(hanaView.packageName)}/${encodeURIComponent(hanaView.viewName)}`,
+      HANA_VIEW_ACCEPT,
+    )).body;
+    const type = attr(viewXml.match(/<entity:Entity\b[^>]*/)?.[0] ?? '', 'objectType');
+    if (HANA_VIEW_TYPES.includes(type)) hanaViewTypes.set(providerName.trim(), type);
+    // A view has no generated field names; the prefix only says that the fields were read.
+    return { fieldNamePrefix: hanaView.viewName, fields: hanaViewFields(viewXml) };
+  }
   const path = `/sap/bw/modeling/infoprov/${bwSegUpper(providerName)}/a?view=dt`;
   const xml = (await freshRead(path, IPROV_ACCEPT)).body;
 
@@ -899,7 +997,9 @@ function buildTargetElementXml(
   ].join(' ');
 
   const label = escapeXmlAttr(field.label);
-  const lines: string[] = [`  <element xsi:type="BwCore:BwElement" ${attrs}>`];
+  // An input parameter of a SAP HANA view needs a parameter as its target, with the same definition.
+  const elementType = field.parameterXml ? 'BwCore:RestrictedBwElement' : 'BwCore:BwElement';
+  const lines: string[] = [`  <element xsi:type="${elementType}" ${attrs}>`];
   if (inlineType) lines.push(`    ${inlineType}`);
   lines.push(...fixedLines);
   if (field.unitCurrencyRefBareName) {
@@ -920,6 +1020,7 @@ function buildTargetElementXml(
     lines.push(`    </localProperties>`);
     if (infoObjectName) lines.push(`    <associationType>1</associationType>`);
   }
+  if (field.parameterXml) lines.push(`    ${field.parameterXml}`);
   lines.push(`  </element>`);
   return lines.join('\n');
 }
@@ -1117,7 +1218,7 @@ function buildAutoMappings(
 
 /** Next free alias for a view node and provider type, continuing BW's own numbering. */
 function nextInputAlias(xml: string, nodeName: string, providerType: string): string {
-  const type = providerType.trim().toUpperCase();
+  const type = HANA_VIEW_TYPES.includes(providerType.trim()) ? providerType.trim() : providerType.trim().toUpperCase();
   const re = new RegExp(`alias="${escapeRegex(nodeName)}\\.${escapeRegex(type)}\\.(\\d+)"`, 'g');
   let max = 0;
   let m: RegExpExecArray | null;
@@ -1127,6 +1228,13 @@ function nextInputAlias(xml: string, nodeName: string, providerType: string): st
 
 /** Extracts the source provider name from an input's entity reference. */
 function extractProviderNameFromInput(inputBlock: string): string | undefined {
+  const view = inputBlock.match(
+    /<entity>(?:[^<]*hana\/repository\/)?([^<#]+)\/([^<#/]+)\.(calculationview|analyticview|attributeview)#\/<\/entity>/);
+  if (view) {
+    const name = `${view[1].replace(/\//g, '.')}::${view[2]}`;
+    hanaViewTypes.set(name, view[3]);
+    return name;
+  }
   return inputBlock.match(/(?:infoprov_dt\/a\/)?([A-Za-z0-9_]+)\.composite#\/\//)?.[1];
 }
 
@@ -1205,7 +1313,7 @@ export async function bwUpdateCompositeProviderInput(
         ? input.mappings
         : buildAutoMappings(fields, xml, getViewNodeType(xml));
 
-    const alias = nextInputAlias(xml, nodeName, input.providerType);
+    const alias = nextInputAlias(xml, nodeName, inputAliasType(input.providerName, input.providerType));
     const { mappingsXml, newElementsXml, groups, compounding } = resolveMappings(
       requested, fields, input.providerName, nodeName, xml, defaults
     );
@@ -1386,7 +1494,7 @@ export async function bwReplaceCompositeProviderInput(
     ? (await fetchCompositeSourceFields(oldProvider).catch(() => ({ fields: [] as SourceFieldMeta[] }))).fields
     : [];
   const { lastModified, fields: newFields } = await fetchCompositeSourceFields(input.providerName);
-  const newAlias = nextInputAlias(xml, nodeName, input.providerType);
+  const newAlias = nextInputAlias(xml, nodeName, inputAliasType(input.providerName, input.providerType));
   const result = replaceInput(
     xml, alias,
     { alias: newAlias, providerName: input.providerName, lastModified },

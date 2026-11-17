@@ -4076,6 +4076,7 @@ const TOOL_DEFINITIONS = [
         'Filter: "update_filter" sets or removes the SQL filter of the view node (filter_expression). Join keys take an operator other than equality in key_pairs (operator); such a pair gets a target field per side in place of a common one. ' +
         'View nodes: a CompositeProvider is a tree of nodes, each with its own fields and inputs; an input is a provider or the node below. "insert_node" puts a join, union, projection or aggregation node (node_type) above one input (input_alias) or, without it, above the default node; a join node takes its second input with provider_name. "remove_node" takes a node out with the nodes below it. Every other action works on the node named in node, the default node if omitted; an input that is a node has the node name as its alias. ' +
         'Temporal join: "update_temporal_join" makes a join temporal — the inputs are joined for the time their records are valid. A characteristic input with time-dependent attributes brings its validity along (time_dependent_fields: false reads its attributes as of a key date instead); an aDSO input takes part with a validity interval in two of its date fields (valid_from_field, valid_to_field) or names the date the other inputs are read for (key_date_field). temporal_join: false switches it off. ' +
+        'SAP HANA views: an input can be a calculation, analytic or attribute view of the SAP HANA repository, named "<package>::<view>" in provider_name. Its fields become plain fields of the CompositeProvider with the matching ABAP data type; mandatory input parameters of the view are mapped like fields and become parameters of the CompositeProvider. A view BW generated itself is not accepted. ' +
         'Settings: "update_settings" edits label, stackable, default node and aggregation behaviour.',
       inputSchema: {
         type: 'object',
@@ -4179,7 +4180,7 @@ const TOOL_DEFINITIONS = [
           },
           provider_name: {
             type: 'string',
-            description: 'add_input / replace_input: technical name of the source InfoProvider to attach.',
+            description: 'add_input / replace_input: technical name of the source InfoProvider to attach, or a SAP HANA view as "<package>::<view>".',
           },
           provider_type: {
             type: 'string',

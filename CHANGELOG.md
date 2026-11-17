@@ -18,6 +18,8 @@
 
 ### Added
 
+- **SAP HANA views as inputs of a CompositeProvider** — `add_input`, `replace_input` and the inputs of `bw_create_composite_provider` take a calculation, analytic or attribute view of the SAP HANA repository as `provider_name` in the form `<package>::<view>`. Its fields are mapped as plain fields with the matching ABAP data type, and mandatory input parameters of the view become parameters of the CompositeProvider. `bw_get_composite_provider` names the view of such an input in `hana_view`. Verified on BW/4HANA: a union over a calculation view with two mandatory input parameters, activated.
+
 - **Temporal joins in a CompositeProvider** — `bw_update_composite_provider` with the new action `update_temporal_join` makes a join temporal: its inputs are joined for the time their records are valid. A characteristic with time-dependent attributes brings its validity along; `time_dependent_fields: false` reads its attributes as of a key date instead. An aDSO input takes part with a validity interval in two of its date fields (`valid_from_field`, `valid_to_field`) and can name the date the other inputs are read for (`key_date_field`). `temporal_join: false` switches the temporal join off. Adding, removing or replacing an input of a temporal join keeps it in step. `bw_get_composite_provider` shows the choice per input in `temporal_join_details`. Verified on BW/4HANA: an aDSO joined with a characteristic over its validity, with a key date and with a validity interval, each activated.
 
 - **A characteristic can be made usable as an InfoProvider** — `bw_update_infoobject` takes `usable_as_infoprovider`. A characteristic with master data then serves as a provider of its own, for queries and as an input of a CompositeProvider.
