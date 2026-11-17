@@ -158,7 +158,8 @@ SNC is not involved — that is the RFC propagation path, not HTTPS.
 
 | Symptom | Cause | Fix |
 |---|---|---|
-| `502 Could not connect to BW` | destination lookup or propagation failed | the message says which; check the destination name and binding |
+| `502 Could not connect to BW (reference …)` | destination lookup or propagation failed | search the application log (`cf logs`) for the reference: the entry names the destination and the cause |
+| Registration answers `400` with `redirect_uri is not allowed`, or an MCP client that worked before can no longer sign in | the client's callback is not on the redirect allowlist | add the exact callback to `BW_OAUTH_REDIRECT_URIS` and restart; the client registers again on its next sign-in |
 | 401 + basic-auth popup; ICM trace `intermediary is NOT trusted` | ICM stripped `SSL_CLIENT_CERT` | step 9 — missing, mistyped, lowercase keyword, wrong spacing, or both variants set |
 | `403 Access denied to resource … expose the resource correctly in your cloud connector` | path not exposed | step 7 — a Cloud Connector message, not an authorization failure |
 | `invalid_scope` at login, message `<xsappname>.<scope> is invalid` | the XSUAA instance predates a scope the app advertises — `xs-security.json` changed, the instance was not updated | `cf update-service bwmcp-xsuaa -c <deployment file>` with the exact callback kept in it, then log in again |
@@ -182,6 +183,8 @@ KBA **3361376259** (propagation over HTTPS), **3367280** (401 / credential popup
 | `BW_CC_LOCATION_ID` | Cloud Connector location id, when several are connected |
 | `BW_PUBLIC_URL` | advertised URL behind a reverse proxy |
 | `BW_ALLOWED_ORIGINS` | CORS allowlist for browser-based MCP clients |
+| `BW_OAUTH_REDIRECT_URIS` | further redirect URIs an MCP client may register, comma-separated. The callbacks of Claude, VS Code, Cursor, Copilot Studio, Mistral and any client on the user's own machine (loopback) are allowed without it. An entry names its host exactly; `*` and `**` are allowed in the path only, and an entry that breaks this stops the start |
+| `BW_TLS_VERIFY` | `off` switches off the certificate check for a BW system reached over HTTPS directly; prefer `NODE_EXTRA_CA_CERTS` with the system's certificate authority. Not involved on the Cloud Connector route |
 | `BW_TRUST_PROXY_HOPS` | proxy hops trusted for the client address the OAuth rate limits key on; default `2` on Cloud Foundry (load balancer and CF router), `0` elsewhere. Raise it only for a further proxy that overwrites `X-Forwarded-For` — a value too high lets a client choose its own address |
 | `BW_MCP_SERVER_NAME` | server name in the MCP handshake (default `bw-modeling-mcp`); make it unique per instance |
 | `BW_MCP_SYSTEM_LABEL` | free-text system label (e.g. `AP4 (BW production, read-only)`) shown at the top of the server instructions |

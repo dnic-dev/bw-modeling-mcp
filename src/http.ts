@@ -14,6 +14,7 @@
  * stdio is untouched — no auth, no destination, one process one user.
  */
 import express from 'express';
+import { randomUUID } from 'node:crypto';
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
 import type { AuthInfo } from '@modelcontextprotocol/sdk/server/auth/types.js';
 import { setupHttpAuth, loadXsuaaCredentials, resolveAppUrl } from '@arc-mcp/xsuaa-auth';
@@ -22,6 +23,7 @@ import { withSessionScope } from './bw-client.js';
 import { createServer } from './index.js';
 import { ensurePlatform } from './platform.js';
 import { trustedProxyHops } from './proxy-trust.js';
+import { redirectAllowlistFromEnv } from './redirect-allowlist.js';
 import { runWithClient } from './request-context.js';
 import { SCOPES, hasScope } from './scopes.js';
 import {
@@ -77,6 +79,7 @@ async function main(): Promise<void> {
   app.use(express.json({ limit: '4mb' }));
   app.use(express.urlencoded({ extended: true }));
 
+  const redirectUris = redirectAllowlistFromEnv(process.env);
   const bearer = setupHttpAuth(
     app,
     {
@@ -103,6 +106,11 @@ async function main(): Promise<void> {
         // 30-day lifetime locked it out until the connection was recreated by hand.
         // Revocation still works by rotating the signing secret.
         dcrTtlSeconds: 0,
+        // Without these the library admits any https redirect URI at registration. The same
+        // list gates the pre-registered client and is re-applied to every signed client_id
+        // when it is loaded, so narrowing it also withdraws earlier registrations.
+        redirectUriPatterns: redirectUris,
+        dcrRedirectUriPatterns: redirectUris,
       },
       allowedOrigins: process.env.BW_ALLOWED_ORIGINS?.split(',').map((s) => s.trim()).filter(Boolean),
       // Never start open: an unauthenticated MCP server in front of a Cloud Connector
@@ -137,11 +145,14 @@ async function main(): Promise<void> {
     } catch (err) {
       // Fail closed. A principal-propagation failure must never quietly fall back to a
       // shared identity — an error is the only safe outcome.
+      // The cause names the destination and backend addresses, which a remote caller has no
+      // use for. It goes to the log under a reference the caller can quote to the operator.
       const message = err instanceof Error ? err.message : String(err);
-      log.error('could not build BW client', { user: userLabel(authInfo), destination: destinationName, message });
+      const reference = randomUUID();
+      log.error('could not build BW client', { reference, user: userLabel(authInfo), destination: destinationName, message });
       res.status(502).json({
         jsonrpc: '2.0',
-        error: { code: -32000, message: `Could not connect to BW: ${message}` },
+        error: { code: -32000, message: `Could not connect to BW (reference ${reference}). The operator finds the cause in the server log under this reference.` },
         id: null,
       });
       return;

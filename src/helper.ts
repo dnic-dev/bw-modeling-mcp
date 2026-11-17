@@ -20,6 +20,7 @@
  * carrying an older build of it degrades one capability at a time instead of all at once.
  */
 import type { BwClient } from './bw-client.js';
+import { currentClient } from './request-context.js';
 import { ensurePlatform } from './platform.js';
 
 /** Where the handler is mounted. Overridable for a customer who mounts it elsewhere. */
@@ -86,6 +87,7 @@ export interface DtpFilter {
 let probe: Promise<HelperProfile> | null = null;
 let cached: HelperProfile | undefined;
 let session: BwClient | undefined;
+const requestSessions = new WeakMap<BwClient, BwClient>();
 
 /**
  * The helper runs on its own session, and that is not a nicety.
@@ -94,10 +96,23 @@ let session: BwClient | undefined;
  * for a different ICF context. Absorbing those into the session that also drives ADT made two
  * DataPreview reads issued in parallel collide and answer HTTP 500 — a failure that looked
  * like a flaky server and was in fact this client's own doing.
+ *
+ * Over HTTP the session belongs to the request: a client carries one caller's identity, and a
+ * session kept for the process would serve every later caller as the first one. stdio has one
+ * user for the life of the process and keeps a single session.
  */
-function helperSession(client: BwClient): BwClient {
-  if (!session) session = client.freshSession();
-  return session;
+export function helperSession(client: BwClient): BwClient {
+  const request = currentClient();
+  if (!request) {
+    if (!session) session = client.freshSession();
+    return session;
+  }
+  let own = requestSessions.get(request);
+  if (!own) {
+    own = client.freshSession();
+    requestSessions.set(request, own);
+  }
+  return own;
 }
 
 function notInstalled(detail: string): HelperProfile {

@@ -1,4 +1,4 @@
-import { BwClient, bwSeg } from '../bw-client.js';
+import { BwClient, bwSeg, maskSetCookie } from '../bw-client.js';
 
 const BASE = '/sap/bc/http/sap/bw4/v1/modeling/processchains';
 const DECISION_VARIANTS_BASE = '/sap/bc/http/sap/bw4/v1/modeling/processtypes/decision/variants';
@@ -436,7 +436,7 @@ async function resolveTransportHeader(
   // BW_DEBUG_SESSION) so a failing sequence can be compared to a working one.
   const callValidate = async (token: string) => {
     if (debug) {
-      console.error(`[bw-session] validateobject uri=${uri} outgoing cookies: ${JSON.stringify(client.sessionInfo())}`);
+      console.error(`[bw-session] validateobject uri=${uri} outgoing cookies: ${JSON.stringify(client.maskedSessionInfo())}`);
     }
     const res = await client.rawPost(
       VALIDATEOBJECT_PATH,
@@ -444,7 +444,7 @@ async function resolveTransportHeader(
       writeHeaders(token)
     );
     if (debug) {
-      console.error(`[bw-session] validateobject uri=${uri} incoming Set-Cookie: ${JSON.stringify((res.headers as Record<string, unknown>)['set-cookie'] ?? null)}`);
+      console.error(`[bw-session] validateobject uri=${uri} incoming Set-Cookie: ${JSON.stringify(((res.headers as Record<string, unknown>)['set-cookie'] as string[] | undefined)?.map(maskSetCookie) ?? null)}`);
     }
     return res;
   };

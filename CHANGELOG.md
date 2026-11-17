@@ -2,6 +2,20 @@
 
 ## [Unreleased]
 
+### Security
+
+- **The certificate of the BW system is verified** — HTTPS connections to BW check the server certificate. A system whose certificate comes from an in-house certificate authority needs the Node.js variable `NODE_EXTRA_CA_CERTS` pointing at a PEM file with that authority; a system with a self-signed certificate needs `BW_TLS_VERIFY=off`, which the server reports on start. A refused certificate is answered with the reason and both ways out. **Check your configuration when updating:** a connection that relied on the check being off fails until one of the two is set.
+
+- **Only known redirect targets can be registered on the hosted server** — the OAuth endpoints accept the callbacks of Claude, VS Code, Cursor, Copilot Studio, Mistral and clients on the user's own machine. Any other MCP client or gateway is named in `BW_OAUTH_REDIRECT_URIS`. A client registered earlier with another callback has to be added there before it can sign in again.
+
+- **Diagnostic output no longer contains session cookies** — with `BW_DEBUG_SESSION` on, cookie values are written as a length and a short fingerprint, enough to compare two sessions.
+
+- **Requests of different users no longer share the session of the classic helper endpoint** — on the hosted server with principal propagation, each request reaches the optional helper endpoint of a classic BW release as its own caller.
+
+- **`bw_list_contents` stays inside the repository tree** — a path with dot segments, a query or a fragment is refused.
+
+- **Errors on the hosted server leave out the backend address** — a failed connection is answered with a reference to the server log, and tool errors name the backend as `<backend>`. Over stdio the full text is kept.
+
 ### Added
 
 - **A DTP can run through any number of transformations** — `bw_create_dtp` takes `trfn_names`, the list of every transformation on the path from the source to the target, so a path through two or more InfoSources can be expressed (#53). `trfn_name` and `trfn_name_2` keep working for one and two steps. The path is checked before anything is created: the transformations are put into path order whatever order they are passed in, and a path with a gap is refused with the object where it breaks, in place of the HTTP 500 without a message the server answers. Verified on BW/4HANA: a DTP over three transformations created and activated; paths with a missing first, middle or last transformation refused.
@@ -32,6 +46,8 @@
 
 - **A conversion the server does not keep is no longer reported as set** — when a conversion type does not fit the currency or unit of the target, BW saves the rule as a plain assignment without a message, and `bw_update_transformation` answered with success. A conversion type that ends in another currency or unit than the fixed one of the target key figure is now refused before anything is written, and the saved rule is read back before the conversion is reported.
 - **Parameter descriptions of the focused tools are no longer cut off after "e.g."** — the shortened descriptions ended in the middle of an example, or started with a fragment of one.
+- **A tool name that does not exist is answered as such** — a reader calling an unknown tool was told to ask for the write role.
+
 - **A decision variant is created in the package that was asked for** — `bw_create_decision_variant` with a transportable package reported success while the variant was filed as a local object and recorded in no transport request, so a chain referencing it was transported without it. The package now reaches the create, and the result reports the package read back from the system, with a warning when it differs from the requested one. Verified on BW/4HANA against the object directory and the transport request.
 - **Replacing the tree of a hierarchy no longer ends in a server error** — `bw_update_hierarchy` with `nodes` removes the current nodes before it inserts the new tree, and the server ended that with a runtime error as soon as the tree had more than one level. The nodes are now removed children first, which the server accepts. Verified on BW/4HANA: trees of two and three levels replaced and activated.
 - **Numeric node names of a hierarchy are stored in their internal form** — on a characteristic with the ALPHA conversion routine (or of type NUMC) a value such as `1100` has leading zeros internally, and a hierarchy written with the short form was saved but refused on activation. `bw_create_hierarchy` and `bw_update_hierarchy` now fill a value of digits to the length of the characteristic, and a text node named with digits only to the length BW keeps text node names in. Names that are not purely numeric, and names already at full length, are written as given.

@@ -98,9 +98,35 @@ function parseAtomFeed(xml: string): RepoEntry[] {
   return entries;
 }
 
+/**
+ * Refuse a path that would leave the repository tree.
+ *
+ * The path becomes part of the request URL, and the HTTP client resolves dot segments before
+ * sending. Unchecked, "../" reaches any other service the backend exposes on the same host.
+ * Segments are decoded before the comparison because an encoded dot is a dot to the server;
+ * encoded slashes inside a segment stay valid, since namespaced names depend on them. The URL
+ * parser has the last word, as it is what decides where the request goes.
+ */
+export function assertRepositoryPath(path: string): void {
+  const invalid = () =>
+    new Error(`Invalid repository path '${path}': pass "/" or a children_path from a previous result.`);
+  if (/[?#\\]/.test(path)) throw invalid();
+  for (const segment of path.split('/')) {
+    let decoded: string;
+    try {
+      decoded = decodeURIComponent(segment);
+    } catch {
+      throw invalid();
+    }
+    if (decoded === '.' || decoded === '..') throw invalid();
+  }
+  if (path && !new URL(`${BASE}/${path}`, 'http://bw').pathname.startsWith(CHILDREN_PREFIX)) throw invalid();
+}
+
 export async function bwListContents(client: BwClient, path: string): Promise<string> {
   // Normalise: strip leading/trailing slashes, lowercase
-  const normalizedPath = path.toLowerCase().replace(/^\/+/, '').replace(/\/+$/, '');
+  const normalizedPath = (path ?? '').toLowerCase().replace(/^\/+/, '').replace(/\/+$/, '');
+  assertRepositoryPath(normalizedPath);
   const url = normalizedPath ? `${BASE}/${normalizedPath}` : BASE;
 
   const { body } = await client.get(url, 'application/atom+xml');

@@ -8834,8 +8834,7 @@ async function handleToolCall(
     // where the backend lives. Under stdio the operator is the caller and sees everything.
     const remote = currentClient();
     const message = remote ? redactBackend(full, remote.baseUrl) : full;
-    if (remote && message !== full) process.stderr.write(`[error] ${name}: ${full}
-`);
+    if (remote && message !== full) process.stderr.write(`[error] ${name}: ${full}\n`);
     // Return as error content so Claude can see the details
     return {
       content: [{ type: 'text', text: `Error: ${message}` }],
