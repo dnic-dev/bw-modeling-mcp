@@ -509,7 +509,7 @@ function deriveSourceSystemType(xsiType: string, context: string | null, hanaTyp
 }
 
 export async function bwGetSourceSystem(client: BwClient, sourceSystem: string): Promise<string> {
-  const url = `/sap/bw/modeling/lsys/${sourceSystem.toLowerCase()}/a`;
+  const url = `/sap/bw/modeling/lsys/${encodeURIComponent(sourceSystem.toLowerCase())}/a`;
   const { body, headers } = await client.get(url, LSYS_ACCEPT);
 
   // Root element opening tag attributes (up to first closing >)

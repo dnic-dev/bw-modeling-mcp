@@ -103,9 +103,19 @@ would block every later change of the object until the session times out.
 
 Arguments a writing tool does not declare are refused before any request goes to BW
 (`src/arguments.ts`). Handlers read the parameters they know, so anything else used to vanish
-while the save still reported success. Only top-level names are checked; nested objects are
-validated where they are interpreted. Read tools are not checked: an ignored argument there
-changes no data.
+while the save still reported success. Only top-level names are checked. Read tools are not
+checked: an ignored argument there changes no data.
+
+Every call is then validated against the schema the tool publishes (`src/validate-arguments.ts`):
+the handlers read their arguments with type assertions, which check nothing at run time, so the
+schema is enforced before a handler runs. Nothing is converted; a value of the wrong type is
+refused with the parameter named. In the focused mode the call is resolved to its full tool
+first, so the schema that applies is the one of the operation, not of the tool that stands
+for it.
+
+`tools/list` adds a title and the MCP behaviour hints to every tool
+(`src/tool-presentation.ts`). The hints come from the scope classification, so what a tool is
+said to do and who may call it cannot drift apart.
 
 ---
 
@@ -204,6 +214,13 @@ src/
 ├── index.ts              # createServer() — tool definitions and dispatch; a run-as-main guard also makes it a valid stdio entry
 ├── stdio.ts              # stdio transport entry point (default bin) — one process, one user, no auth
 ├── http.ts               # HTTP transport entry point (SAP BTP Cloud Foundry) — Express + XSUAA OAuth, a fresh per-request BW client
+├── auth.ts               # OAuth endpoints in front of /mcp: redirect allowlist, client credentials in the header,
+│                         # refresh tokens bound to their client, rate limits that fit shared addresses
+├── refresh-binding.ts    # sealing a refresh token to the client it was issued to
+├── redirect-allowlist.ts # the redirect URIs an MCP client may register
+├── transport-guard.ts    # Host and Origin check and the per-user rate limit of /mcp
+├── redact.ts             # errors sent to a remote caller: backend address taken out, response documents reduced to their message
+├── request-path.ts       # every request to BW checked for relative segments and foreign addresses before it is sent
 ├── destination.ts        # builds a BwClient from a BTP destination (PrincipalPropagation or BasicAuthentication)
 ├── request-context.ts    # AsyncLocalStorage holding the per-request BW client under principal propagation
 ├── scopes.ts             # read/write scope classification and tools/list filtering for XSUAA role-based access
@@ -212,6 +229,8 @@ src/
 ├── soap-rfc.ts           # calling an RFC-enabled function module over /sap/bc/soap/rfc, with a clear
 │                         # message when the ICF service is inactive
 ├── arguments.ts          # refusal of undeclared arguments to writing tools
+├── validate-arguments.ts # every call checked against the schema its tool publishes
+├── tool-presentation.ts  # title and MCP behaviour hints of the listed tools
 ├── platform.ts           # BW/4HANA vs classic BW detection and the platform half of the tools/list filter
 ├── classic-writes.ts     # per-write-tool status on a classic release, printed by bw_system_profile
 ├── bw-client.ts          # HTTP client (CSRF, session, lock/unlock, GET/PUT/POST/rawGet/rawPost/rawPut)

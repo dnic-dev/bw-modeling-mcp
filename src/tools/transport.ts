@@ -18,7 +18,7 @@ export async function bwCreateTransportTask(
   const trUpper = args.transportRequest.toUpperCase();
   const userUpper = args.user.toUpperCase();
 
-  const path = `/sap/bc/adt/cts/transportrequests/${trUpper}/tasks`;
+  const path = `/sap/bc/adt/cts/transportrequests/${encodeURIComponent(trUpper)}/tasks`;
 
   const body = `<?xml version="1.0" encoding="ASCII"?>
 <tm:root xmlns:tm="http://www.sap.com/cts/adt/tm" tm:number="${trUpper}" tm:targetuser="${userUpper}" tm:useraction="newtask"/>`;

@@ -17,7 +17,9 @@ import { currentClient } from './request-context.js';
 import { filterToolsByScope, mayCall, requiredScope, scopesFor } from './scopes.js';
 import { buildFocusedTools, resolveFocusedCall, toolMode, translateToolNames, type ToolDefinition } from './surface/focused.js';
 import { undeclaredArguments } from './arguments.js';
-import { redactBackend } from './redact.js';
+import { redactBackend, trimBackendDocuments } from './redact.js';
+import { presentTools } from './tool-presentation.js';
+import { invalidArguments, withoutNulls } from './validate-arguments.js';
 import {
   cachedPlatform,
   ensurePlatform,
@@ -7318,7 +7320,7 @@ async function handleToolCall(
   request: { params: { name: string; arguments?: Record<string, unknown> } },
   extra: { authInfo?: AuthInfo },
 ): Promise<{ content: Array<{ type: 'text'; text: string }>; isError?: boolean }> {
-  const { name, arguments: args } = request.params;
+  const { name } = request.params;
 
   // A name that is no tool at all is a protocol error for every caller. Checked first: the
   // scope check below treats anything unrecognised as a write tool and would tell a reader
@@ -7336,11 +7338,18 @@ async function handleToolCall(
     throw new McpError(ErrorCode.InvalidRequest, `Tool '${name}' requires the ${admitted} scope.`);
   }
 
+  const definition = TOOL_DEFINITIONS.find((t) => t.name === name);
+  const args = withoutNulls(definition, request.params.arguments);
+
   // A write tool that ignored an argument it does not know would report a change it never made.
   if (requiredScope(name) === 'write') {
-    const refused = undeclaredArguments(TOOL_DEFINITIONS.find((t) => t.name === name), args);
+    const refused = undeclaredArguments(definition, args);
     if (refused) return { content: [{ type: 'text', text: refused }], isError: true };
   }
+
+  // The handlers trust the types the schema names, so the schema is enforced before one runs.
+  const invalid = invalidArguments(definition, args);
+  if (invalid) return { content: [{ type: 'text', text: invalid }], isError: true };
 
   // HTTP: the per-request client, whose identity came from XSUAA and the destination.
   // stdio: no request context, so read the environment exactly as before.
@@ -9024,7 +9033,7 @@ async function handleToolCall(
     // Over HTTP the caller is remote: the full text goes to the log, the answer leaves out
     // where the backend lives. Under stdio the operator is the caller and sees everything.
     const remote = currentClient();
-    const message = remote ? redactBackend(full, remote.baseUrl) : full;
+    const message = remote ? redactBackend(trimBackendDocuments(full), remote.baseUrl) : full;
     if (remote && message !== full) process.stderr.write(`[error] ${name}: ${full}\n`);
     // Return as error content so Claude can see the details
     return {
@@ -9106,7 +9115,8 @@ export function createServer(): Server {
     const offered = filterToolsByPlatform(filterToolsByScope(TOOL_DEFINITIONS, extra.authInfo), profile);
     // The focused surface is built from the offered full tools, so whatever the scope or the
     // platform removes is gone from the focused tools' discriminators too.
-    return { tools: toolMode() === 'focused' ? buildFocusedTools(offered as ToolDefinition[]) : offered };
+    const listed = toolMode() === 'focused' ? buildFocusedTools(offered as ToolDefinition[]) : (offered as ToolDefinition[]);
+    return { tools: presentTools(listed, offered.map((t) => t.name)) };
   });
 
   server.setRequestHandler(CallToolRequestSchema, (request, extra) =>

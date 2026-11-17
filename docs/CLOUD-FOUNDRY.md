@@ -160,6 +160,11 @@ SNC is not involved — that is the RFC propagation path, not HTTPS.
 |---|---|---|
 | `502 Could not connect to BW (reference …)` | destination lookup or propagation failed | search the application log (`cf logs`) for the reference: the entry names the destination and the cause |
 | Registration answers `400` with `redirect_uri is not allowed`, or an MCP client that worked before can no longer sign in | the client's callback is not on the redirect allowlist | add the exact callback to `BW_OAUTH_REDIRECT_URIS` and restart; the client registers again on its next sign-in |
+| `403 Host not allowed` on `/mcp` | the request reached the server under a name it does not know, typically a custom domain or a further route | set `BW_PUBLIC_URL` to the address clients use, or add the name to `BW_ALLOWED_HOSTS` |
+| `403 Origin not allowed` on `/mcp` | a browser-based client calls from an origin that is not listed | add the origin to `BW_ALLOWED_ORIGINS` |
+| `invalid_grant … belongs to another client` when a client refreshes its token | the refresh token was issued before refresh tokens were bound to their client, or to a different client | sign in again once; the new refresh token is bound to the client |
+| `429` from the OAuth endpoints for many users at once | the users share one address (gateway, company proxy) and its share is used up | raise `BW_OAUTH_RATE_LIMIT`, or name the gateway in `BW_OAUTH_GATEWAY_IPS` |
+| `429 Too many requests` on `/mcp` | one user sent more requests in a minute than `BW_MCP_RATE_LIMIT` allows | wait a minute; raise the limit if agents legitimately work in larger bursts |
 | 401 + basic-auth popup; ICM trace `intermediary is NOT trusted` | ICM stripped `SSL_CLIENT_CERT` | step 9 — missing, mistyped, lowercase keyword, wrong spacing, or both variants set |
 | `403 Access denied to resource … expose the resource correctly in your cloud connector` | path not exposed | step 7 — a Cloud Connector message, not an authorization failure |
 | `invalid_scope` at login, message `<xsappname>.<scope> is invalid` | the XSUAA instance predates a scope the app advertises — `xs-security.json` changed, the instance was not updated | `cf update-service bwmcp-xsuaa -c <deployment file>` with the exact callback kept in it, then log in again |
@@ -182,7 +187,12 @@ KBA **3361376259** (propagation over HTTPS), **3367280** (401 / credential popup
 | `BW_CLIENT`, `BW_LANGUAGE` | as for stdio |
 | `BW_CC_LOCATION_ID` | Cloud Connector location id, when several are connected |
 | `BW_PUBLIC_URL` | advertised URL behind a reverse proxy |
-| `BW_ALLOWED_ORIGINS` | CORS allowlist for browser-based MCP clients |
+| `BW_ALLOWED_ORIGINS` | origins of browser-based MCP clients, comma-separated. They receive CORS headers, and a request to `/mcp` that carries any other `Origin` is refused. Native clients and gateways send no `Origin` and need nothing here |
+| `BW_ALLOWED_HOSTS` | further host names `/mcp` answers under, comma-separated. The advertised URL and the Cloud Foundry routes of the application are accepted without it; a custom domain that is not `BW_PUBLIC_URL` goes here |
+| `BW_MCP_RATE_LIMIT` | MCP requests one user may send per minute; default `120`, `0` switches the limit off |
+| `BW_OAUTH_RATE_LIMIT` | requests per address per 15 minutes on `/authorize`, `/token` and `/revoke`; default `300` |
+| `BW_OAUTH_REGISTER_RATE_LIMIT` | client registrations per address per hour; default `60` |
+| `BW_OAUTH_GATEWAY_IPS` | addresses of MCP gateways that stand in front of many users, comma-separated; they get twenty times the two limits above |
 | `BW_OAUTH_REDIRECT_URIS` | further redirect URIs an MCP client may register, comma-separated. The callbacks of Claude, VS Code, Cursor, Copilot Studio, Mistral and any client on the user's own machine (loopback) are allowed without it. An entry names its host exactly; `*` and `**` are allowed in the path only, and an entry that breaks this stops the start |
 | `BW_TLS_VERIFY` | `off` switches off the certificate check for a BW system reached over HTTPS directly; prefer `NODE_EXTRA_CA_CERTS` with the system's certificate authority. Not involved on the Cloud Connector route |
 | `BW_TRUST_PROXY_HOPS` | proxy hops trusted for the client address the OAuth rate limits key on; default `2` on Cloud Foundry (load balancer and CF router), `0` elsewhere. Raise it only for a further proxy that overwrites `X-Forwarded-For` — a value too high lets a client choose its own address |

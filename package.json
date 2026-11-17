@@ -39,8 +39,10 @@
   "dependencies": {
     "@arc-mcp/xsuaa-auth": "^1.2.0",
     "@modelcontextprotocol/sdk": "^1.29.0",
+    "ajv": "^8.20.0",
     "axios": "^1.7.0",
     "express": "^5.2.1",
+    "express-rate-limit": "^8.7.4",
     "fast-xml-parser": "^4.3.0"
   },
   "devDependencies": {

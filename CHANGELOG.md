@@ -14,9 +14,23 @@
 
 - **`bw_list_contents` stays inside the repository tree** — a path with dot segments, a query or a fragment is refused.
 
-- **Errors on the hosted server leave out the backend address** — a failed connection is answered with a reference to the server log, and tool errors name the backend as `<backend>`. Over stdio the full text is kept.
+- **No request leaves the path it was built for** — every request to BW is checked before it is sent: a relative segment in the path, plain or encoded, a backslash, or an address other than the BW system is refused. An object name can no longer steer a tool to another service on the same host.
+
+- **Errors on the hosted server leave out the backend address** — a failed connection is answered with a reference to the server log, and tool errors name the backend as `<backend>`. A response document quoted in an error is reduced to its message, the exception type and the message number. Over stdio the full text is kept.
+
+- **Tool arguments are checked against the published schema** — every call is validated before its handler runs: types, required parameters, enumerations and the shape of nested objects and lists. A call that does not match is answered with the parameters at fault and nothing is sent to BW. Values are not converted, so a number sent as text is refused. A parameter passed as `null` counts as left out.
+
+- **The hosted endpoint checks where a request comes from** — `/mcp` answers only under the advertised URL, the Cloud Foundry routes of the application and the names in `BW_ALLOWED_HOSTS`, and refuses a request whose `Origin` is not the server itself or listed in `BW_ALLOWED_ORIGINS`. Native clients and gateways send no `Origin` and are unaffected; a browser-based client needs its origin listed.
+
+- **Refresh tokens belong to the client they were issued to** — on the hosted server a refresh token is accepted from that client only. **Sign in again once after updating:** a refresh token issued before is refused with `invalid_grant`.
+
+- **MCP requests are limited per user** — on the hosted server one user may send 120 requests per minute (`BW_MCP_RATE_LIMIT`, `0` switches it off).
 
 ### Added
+
+- **Tools carry a title and behaviour hints** — every tool is listed with a readable title and the MCP annotations `readOnlyHint`, `destructiveHint`, `idempotentHint` and `openWorldHint`, derived from the classification that decides access. A client can tell a read from a change and no longer has to ask for confirmation before every read. In the focused mode a tool is read-only when every operation left to the caller is, and destructive as soon as one of them is.
+
+- **The hosted server works behind an MCP gateway** — a confidential client may send its credentials in the `Authorization: Basic` header (`client_secret_basic`), which the server metadata now names. The limits of the OAuth endpoints are configurable (`BW_OAUTH_RATE_LIMIT`, `BW_OAUTH_REGISTER_RATE_LIMIT`), and addresses named in `BW_OAUTH_GATEWAY_IPS` get twenty times as much, since a gateway or a company proxy puts every user behind one address.
 
 - **SAP HANA views as inputs of a CompositeProvider** — `add_input`, `replace_input` and the inputs of `bw_create_composite_provider` take a calculation, analytic or attribute view of the SAP HANA repository as `provider_name` in the form `<package>::<view>`. Its fields are mapped as plain fields with the matching ABAP data type, and mandatory input parameters of the view become parameters of the CompositeProvider. `bw_get_composite_provider` names the view of such an input in `hana_view`. Verified on BW/4HANA: a union over a calculation view with two mandatory input parameters, activated.
 

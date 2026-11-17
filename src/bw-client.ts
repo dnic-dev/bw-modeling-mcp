@@ -7,6 +7,7 @@ import { AsyncLocalStorage } from 'node:async_hooks';
 import { currentClient } from './request-context.js';
 // Value import, but no cycle at runtime: platform.ts takes BwClient as a type only.
 import { cachedPlatform } from './platform.js';
+import { assertBackendPath } from './request-path.js';
 
 const ECLIPSE_USER_AGENT =
   'Eclipse/4.38.0.v20251201-0920 (win32; x86_64; Java 21.0.9) ADT/3.56.0 (devedition)';
@@ -544,6 +545,10 @@ export class BwClient {
     this.http.interceptors.response.use(undefined, (error: unknown) => {
       const refused = certificateFailure(error);
       return Promise.reject(refused ? new Error(refused, { cause: error }) : error);
+    });
+    this.http.interceptors.request.use((config) => {
+      assertBackendPath(config.url, config.baseURL);
+      return config;
     });
     delete this.http.defaults.headers.post['Content-Type'];
     delete (this.http.defaults.headers as any).common['Content-Type'];

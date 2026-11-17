@@ -13,18 +13,20 @@
  *
  * stdio is untouched — no auth, no destination, one process one user.
  */
-import express from 'express';
+import express, { type NextFunction, type Request, type Response } from 'express';
+import { rateLimit } from 'express-rate-limit';
 import { randomUUID } from 'node:crypto';
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
 import type { AuthInfo } from '@modelcontextprotocol/sdk/server/auth/types.js';
-import { setupHttpAuth, loadXsuaaCredentials, resolveAppUrl } from '@arc-mcp/xsuaa-auth';
+import { loadXsuaaCredentials, resolveAppUrl } from '@arc-mcp/xsuaa-auth';
 import { createConnectivityProxy, parseVCAPServices } from '@arc-mcp/xsuaa-auth/btp';
+import { oauthSettingsFromEnv, setupOAuth } from './auth.js';
 import { withSessionScope } from './bw-client.js';
 import { createServer } from './index.js';
 import { ensurePlatform } from './platform.js';
 import { trustedProxyHops } from './proxy-trust.js';
-import { redirectAllowlistFromEnv } from './redirect-allowlist.js';
 import { runWithClient } from './request-context.js';
+import { allowedHosts, allowedOrigins, hostAllowed, mcpRateLimit, originAllowed } from './transport-guard.js';
 import { SCOPES, hasScope } from './scopes.js';
 import {
   createPrincipalPropagationClient,
@@ -79,43 +81,46 @@ async function main(): Promise<void> {
   app.use(express.json({ limit: '4mb' }));
   app.use(express.urlencoded({ extended: true }));
 
-  const redirectUris = redirectAllowlistFromEnv(process.env);
-  const bearer = setupHttpAuth(
+  const appUrl = resolveAppUrl(process.env, { publicUrlEnvVar: 'BW_PUBLIC_URL', port });
+  const refuse = (res: Response, status: number, message: string): void => {
+    res.status(status).json({ jsonrpc: '2.0', error: { code: -32000, message }, id: null });
+  };
+
+  // Before authentication, so a page that got a browser to call this server under a foreign
+  // name learns nothing from it, not even whether a token would have been accepted.
+  const hosts = allowedHosts(process.env, appUrl, port);
+  const origins = allowedOrigins(process.env, appUrl);
+  const hostAndOrigin = (req: Request, res: Response, next: NextFunction): void => {
+    if (!hostAllowed(req.headers.host, hosts)) return refuse(res, 403, 'Host not allowed.');
+    if (!originAllowed(req.headers.origin, origins)) return refuse(res, 403, 'Origin not allowed.');
+    next();
+  };
+
+  // After authentication, since the limit is per user.
+  const perMinute = mcpRateLimit(process.env);
+  const perUser =
+    perMinute > 0
+      ? rateLimit({
+          windowMs: 60_000,
+          limit: perMinute,
+          keyGenerator: (req) => userLabel((req as unknown as { auth?: AuthInfo }).auth),
+          standardHeaders: true,
+          legacyHeaders: false,
+          handler: (_req, res) => refuse(res, 429, 'Too many requests: wait a minute before the next call.'),
+        })
+      : (_req: Request, _res: Response, next: NextFunction): void => next();
+
+  // Never start open: an unauthenticated MCP server in front of a Cloud Connector is a
+  // tunnel into the corporate network. Without the XSUAA binding this throws.
+  const bearer = setupOAuth(
     app,
     {
-      xsuaa: {
-        credentials: loadXsuaaCredentials(),
-        appUrl: resolveAppUrl(process.env, { publicUrlEnvVar: 'BW_PUBLIC_URL', port }),
-        clientIdPrefix: 'bwmcp-',
-        resourceName: 'SAP BW Modeling MCP',
-        // Advertised as `scopes_supported` in the OAuth metadata. Without it a client
-        // requests no scopes; XSUAA still grants them, and Copilot's older auth code
-        // then falls back to the JWT `scope` claim — an array on XSUAA — and crashes
-        // with `scope.split is not a function` (fixed upstream in vscode#325344, but
-        // the Eclipse Language Server lags behind). Also narrows the verifier's
-        // accepted scopes from the arc-1 default set to the three this server defines.
-        //
-        // No `requiredScopes`: the middleware names them in the `scope` of its 401
-        // challenge, and an MCP client requests the challenge's scope in preference to
-        // `scopes_supported` — `['read']` there meant every token held `read` alone, so no
-        // write tool was ever offered, and an analyst-only caller was refused outright.
-        // Holding at least one of the three is checked on `/mcp` instead.
-        scopesSupported: [...SCOPES],
-        // A dynamically registered client_id never expires by age. Copilot Studio caches
-        // its client_id and does not register again when it is refused, so the default
-        // 30-day lifetime locked it out until the connection was recreated by hand.
-        // Revocation still works by rotating the signing secret.
-        dcrTtlSeconds: 0,
-        // Without these the library admits any https redirect URI at registration. The same
-        // list gates the pre-registered client and is re-applied to every signed client_id
-        // when it is loaded, so narrowing it also withdraws earlier registrations.
-        redirectUriPatterns: redirectUris,
-        dcrRedirectUriPatterns: redirectUris,
-      },
-      allowedOrigins: process.env.BW_ALLOWED_ORIGINS?.split(',').map((s) => s.trim()).filter(Boolean),
-      // Never start open: an unauthenticated MCP server in front of a Cloud Connector
-      // is a tunnel into the corporate network.
-      required: true,
+      credentials: loadXsuaaCredentials(),
+      appUrl,
+      clientIdPrefix: 'bwmcp-',
+      resourceName: 'SAP BW Modeling MCP',
+      scopesSupported: [...SCOPES],
+      settings: oauthSettingsFromEnv(process.env),
     },
     log,
   );
@@ -124,7 +129,7 @@ async function main(): Promise<void> {
     res.status(200).json({ status: 'ok', transport: 'http-streamable', principalPropagation: ppEnabled });
   });
 
-  app.all('/mcp', bearer!, async (req, res) => {
+  app.all('/mcp', hostAndOrigin, bearer, perUser, async (req, res) => {
     const authInfo = (req as unknown as { auth?: AuthInfo }).auth;
     if (!SCOPES.some((s) => hasScope(authInfo, s))) {
       res.status(403).json({
