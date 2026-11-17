@@ -369,7 +369,7 @@ export function applyXxlAttributes(xml: string, names: string[] | undefined): { 
   const wanted = names.map((n) => n.trim().toUpperCase()).filter(Boolean);
   const duplicate = wanted.find((n, i) => wanted.indexOf(n) !== i);
   if (duplicate) throw new Error(`XXL attribute ${duplicate} is listed twice.`);
-  const element = /<xxlAttribute\b[^>]*(?:\/>|>[\s\S]*?<\/xxlAttribute>)/g;
+  const element = /<xxlAttribute\b(?:[^>\/]|\/(?!>))*(?:\/>|>[\s\S]*?<\/xxlAttribute>)/g;
   const now = [...xml.matchAll(element)].map((m) => m[0].match(/\bname="([^"]+)"/)?.[1] ?? '');
   if (now.length === wanted.length && now.every((n, i) => n === wanted[i])) return { xml, changes: [] };
   if (wanted.length > 0 && !/<masterDataProperties\b[^>]*\bwithMasterData="true"/.test(xml)) {

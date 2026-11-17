@@ -25,7 +25,7 @@ import {
   platformInstructions,
   unavailableReason,
 } from './platform.js';
-import { bwGetAdso, bwCreateAdso, FieldDef, bwUpdateAdso, bwUpdateAdsoAddPureField, bwUpdateAdsoSettings, AdsoSettings, bwUpdateAdsoManageKeys, bwUpdateAdsoFieldProperties, FieldProperties, bwUpdateAdsoPartitions, PartitionSpec } from './tools/adso.js';
+import { bwGetAdso, bwCreateAdso, FieldDef, bwUpdateAdso, bwUpdateAdsoAddPureField, bwUpdateAdsoSettings, AdsoSettings, bwUpdateAdsoManageKeys, bwUpdateAdsoFieldProperties, FieldProperties, bwUpdateAdsoPartitions, PartitionSpec, bwUpdateAdsoStructure, type AdsoStructureArgs } from './tools/adso.js';
 import { bwGetInfoObject, bwCreateInfoObject, bwUpdateInfoObject, AttributeDef } from './tools/infoobject.js';
 import { bwGetTransformation, bwUpdateTransformation, bwCreateTransformation, bwSetTransformationRuntime, bwSetTransformationRoutine, bwDeleteTransformationRoutine, bwSetTransformationRoutineFields, bwSetTransformationExpertRoutine, bwUpdateTransformationSettings, bwManageTransformationRuleGroup, type RuleConversion, type LookupOptions, type TransformationSettingsArgs, type RuleGroupArgs } from './tools/transformation.js';
 import { bwActivate, bwCheck } from './tools/activation.js';
@@ -538,6 +538,7 @@ const TOOL_DEFINITIONS = [
         'action "manage_keys": replace the complete key field list — pass key_fields array (empty = no key fields). Key fields must exist, must not aggregate and must not be key figures; compounding parents of a key field are added to the key. ' +
         'action "manage_partitions": replace the partitioning of the active table — pass partitioning with field and either ranges (static) or dynamic: true; an empty partitioning removes it. ' +
         'action "update_field_properties": modify sidDeterminationMode, aggregationBehavior, fixedCurrency/Unit, a unit/currency field reference (unit_currency_field), the field group (dimension), or descriptions of a single field — pass field_name and properties. ' +
+        'action "update_structure": secondary indexes (indexes, the complete list), field groups (field_groups: add, rename, remove), changes to fields that are not based on an InfoObject (change_fields: new name, data type, length, precision, scale, conversion routine), and rules that fill fields from the data that exists (initialize_fields: a constant or another field). A renamed field keeps its data through such a rule. When the aDSO holds data, activating a document with such rules creates a remodeling request in place of converting the tables, and that request has to be executed (bw_list_remodeling_requests, bw_run_remodeling). ' +
         'Field groups: pass "dimension" on add_field/add_pure_field to place new fields in the right group straight away — a field added without it lands in the catch-all group and moving it afterwards costs a second activation. ' +
         'Returns a lock_handle that must be passed to bw_activate to complete the operation. ' +
         'Sequence: bw_update_adso → bw_activate (adso) → bw_activate (trfn) → bw_activate (each dtpa).',
@@ -554,8 +555,80 @@ const TOOL_DEFINITIONS = [
           },
           action: {
             type: 'string',
-            enum: ['add_field', 'remove_field', 'add_pure_field', 'update_settings', 'manage_keys', 'manage_partitions', 'update_field_properties'],
-            description: '"add_field" (default), "remove_field", "add_pure_field", "update_settings", "manage_keys", "manage_partitions", or "update_field_properties".',
+            enum: ['add_field', 'remove_field', 'add_pure_field', 'update_settings', 'manage_keys', 'manage_partitions', 'update_field_properties', 'update_structure'],
+            description: '"add_field" (default), "remove_field", "add_pure_field", "update_settings", "manage_keys", "manage_partitions", "update_field_properties", or "update_structure".',
+          },
+          indexes: {
+            type: 'array',
+            description: 'For update_structure: the complete list of secondary indexes on the table of active data, up to 16; [] removes them. Each has fields (in index order) and optionally unique.',
+            items: {
+              type: 'object',
+              properties: {
+                fields: { type: 'array', items: { type: 'string' }, description: 'Field names of the index, in order (e.g. ["FIELD_A", "FIELD_B"]).' },
+                unique: { type: 'boolean', description: 'Unique index (default false).' },
+              },
+              required: ['fields'],
+            },
+          },
+          hash_fields: {
+            type: 'array',
+            items: { type: 'string' },
+            description: 'For update_structure: the complete list of hash partitioning fields of an aDSO without a key (a data mart, or a staging aDSO with the inbound queue only); [] removes them. Refused for an aDSO with a key.',
+          },
+          criteria: {
+            type: 'array',
+            description: 'For update_structure: the complete list of criteria — per field the value or range of values the aDSO holds, which lets BW leave it out of queries asking for other values; [] removes them. Each entry names field and either value, or from and to. Values are written as a user enters them.',
+            items: {
+              type: 'object',
+              properties: {
+                field: { type: 'string', description: 'Field name (e.g. "FIELD_NAME").' },
+                value: { type: 'string', description: 'A single value.' },
+                from: { type: 'string', description: 'Lower end of a range.' },
+                to: { type: 'string', description: 'Upper end of a range.' },
+              },
+              required: ['field'],
+            },
+          },
+          field_groups: {
+            type: 'object',
+            description: 'For update_structure: changes to the field groups. A field is moved into a group with update_field_properties (dimension); a group that still holds fields is not removed.',
+            properties: {
+              add: { type: 'array', items: { type: 'object', properties: { name: { type: 'string', description: 'Group name, up to 16 characters (e.g. "GROUP_NAME").' }, description: { type: 'string' } }, required: ['name'] } },
+              rename: { type: 'array', items: { type: 'object', properties: { name: { type: 'string' }, new_name: { type: 'string' }, description: { type: 'string' } }, required: ['name'] } },
+              remove: { type: 'array', items: { type: 'string' } },
+            },
+          },
+          change_fields: {
+            type: 'array',
+            description: 'For update_structure: changes to fields that are not based on an InfoObject. A renamed field keeps its data unless keep_data is false; a rename that keeps data cannot change type or length in the same step. A longer length activates on a filled aDSO; BW refuses a changed conversion routine while the aDSO holds data.',
+            items: {
+              type: 'object',
+              properties: {
+                field: { type: 'string', description: 'Current field name (e.g. "FIELD_NAME").' },
+                new_name: { type: 'string', description: 'New field name, up to 30 characters.' },
+                data_type: { type: 'string', description: 'New data type (e.g. "CHAR", "NUMC", "DEC", "INT4").' },
+                length: { type: 'number', description: 'New length, for types with a length.' },
+                precision: { type: 'number', description: 'New precision, for DEC, CURR and QUAN.' },
+                scale: { type: 'number', description: 'New scale, for DEC, CURR and QUAN.' },
+                conversion_routine: { type: 'string', description: 'Conversion routine (e.g. "ALPHA"); an empty text removes it.' },
+                keep_data: { type: 'boolean', description: 'Carry the data over to the new name (default true).' },
+              },
+              required: ['field'],
+            },
+          },
+          initialize_fields: {
+            type: 'array',
+            description: 'For update_structure: how fields that are new since the last activation are filled from the data that exists. Each entry names field and exactly one of constant or from_field; remove true takes a rule back that has not been activated. A field the active aDSO already has is refused, since BW fills new fields only.',
+            items: {
+              type: 'object',
+              properties: {
+                field: { type: 'string', description: 'The field to fill (e.g. "FIELD_NAME").' },
+                constant: { type: 'string', description: 'Fill every existing record with this value.' },
+                from_field: { type: 'string', description: 'Fill from this other field of the aDSO.' },
+                remove: { type: 'boolean', description: 'Take back the pending rule of this field.' },
+              },
+              required: ['field'],
+            },
           },
           fields: {
             type: 'array',
@@ -638,6 +711,12 @@ const TOOL_DEFINITIONS = [
               write_changelog: { type: 'boolean', description: 'Write change log (standard type only; default true when the type changes to standard).' },
               snap_shot_scenario: { type: 'boolean', description: 'Snapshot support (standard type only; needs the change log and excludes unique_data_records).' },
               unique_data_records: { type: 'boolean', description: 'Unique records (standard type only; excludes snap_shot_scenario).' },
+              memory_optimized_key: { type: 'boolean', description: 'Memory-optimized primary key structure of the active table.' },
+              suppress_compound_index: { type: 'boolean', description: 'Suppress the index structures for compounded characteristics.' },
+              expected_row_count: { type: 'number', description: 'Expected number of rows in the largest table; 0 clears it. Not with data tiering per partition (HWP).' },
+              external_hana_view: { type: 'boolean', description: 'Generate an external SAP HANA view for the aDSO.' },
+              log_read_access: { type: 'boolean', description: 'Log the output of read access.' },
+              odata: { type: 'boolean', description: 'Generate an OData service for the aDSO.' },
               planning_mode: { type: 'boolean', description: 'Planning enabled.' },
               write_interface: { type: 'boolean', description: 'Enable or disable write interface (pushMode).' },
               temperature_schema: {
@@ -7283,6 +7362,12 @@ async function handleToolCall(
             planningMode: s['planning_mode'] as boolean | undefined,
             writeInterface: s['write_interface'] as boolean | undefined,
             temperatureSchema: s['temperature_schema'] as AdsoSettings['temperatureSchema'],
+            memoryOptimizedKey: s['memory_optimized_key'] as boolean | undefined,
+            suppressCompoundIndex: s['suppress_compound_index'] as boolean | undefined,
+            expectedRowCount: s['expected_row_count'] as number | undefined,
+            externalHanaView: s['external_hana_view'] as boolean | undefined,
+            logReadAccess: s['log_read_access'] as boolean | undefined,
+            odata: s['odata'] as boolean | undefined,
             label: s['label'] as string | undefined,
           };
           // Remove undefined keys so applied output is clean
@@ -7339,6 +7424,16 @@ async function handleToolCall(
             args?.field_name as string,
             fp
           );
+        } else if (args?.action === 'update_structure') {
+          text = await bwUpdateAdsoStructure(client, args?.adso_name as string, {
+            indexes: args?.indexes as AdsoStructureArgs['indexes'],
+            hash_fields: args?.hash_fields as string[] | undefined,
+            criteria: args?.criteria as AdsoStructureArgs['criteria'],
+            field_groups: args?.field_groups as AdsoStructureArgs['field_groups'],
+            change_fields: args?.change_fields as AdsoStructureArgs['change_fields'],
+            initialize_fields: args?.initialize_fields as AdsoStructureArgs['initialize_fields'],
+            transport: args?.transport as string | undefined,
+          });
         } else {
           text = await bwUpdateAdso(
             client,

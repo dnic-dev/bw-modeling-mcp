@@ -8,6 +8,10 @@ import {
 } from '../bw-client.js';
 import { parseInfoObjectProps, parseInfoObjectFacts, type InfoObjectFacts } from './infoobject.js';
 import { readPlanningMode, type PlanningMode } from './adso_data.js';
+import {
+  setIndexes, setHashKey, changeFieldGroups, changeField, initializeFields, readIndexes, readFieldGroups, setCriteria, readCriteria,
+  type IndexSpec, type FieldGroupChanges, type FieldChange, type FieldInitialization, type Criterion,
+} from './adso_structure.js';
 
 // ── aDSO type presets ────────────────────────────────────────────────────────
 
@@ -343,6 +347,18 @@ export interface AdsoSettings {
   planningMode?: boolean;
   writeInterface?: boolean;
   temperatureSchema?: 'HO' | 'WO' | 'HWO' | 'HWP';
+  /** Memory-optimized primary key structure of the active table. */
+  memoryOptimizedKey?: boolean;
+  /** Suppress the index structures for compounded characteristics. */
+  suppressCompoundIndex?: boolean;
+  /** Expected number of rows in the largest table. */
+  expectedRowCount?: number;
+  /** Generate an external SAP HANA view for the aDSO. */
+  externalHanaView?: boolean;
+  /** Log the output of read access (read access logging). */
+  logReadAccess?: boolean;
+  /** Generate an OData service for the aDSO. */
+  odata?: boolean;
   label?: string;
   transport?: string;
 }
@@ -462,6 +478,27 @@ export async function bwUpdateAdsoSettings(
     }
   }
 
+  // 3a. Switches of the aDSO as a whole.
+  if (settings.externalHanaView !== undefined) xml = setRootAttr(xml, 'withHanaModel', String(settings.externalHanaView));
+  if (settings.logReadAccess !== undefined) xml = setRootAttr(xml, 'logRalOutput', String(settings.logReadAccess));
+  if (settings.odata !== undefined) xml = setRootAttr(xml, 'oDataGen', String(settings.odata));
+
+  // 3b. Technical settings of the tables.
+  if (settings.memoryOptimizedKey !== undefined) xml = setRootAttr(xml, 'invertedIndividuals', String(settings.memoryOptimizedKey));
+  if (settings.suppressCompoundIndex !== undefined) xml = setRootAttr(xml, 'forceNoConcat', String(settings.suppressCompoundIndex));
+  if (settings.expectedRowCount !== undefined) {
+    if (!Number.isInteger(settings.expectedRowCount) || settings.expectedRowCount < 0) {
+      throw new Error('expected_row_count is a whole number of rows, 0 or more.');
+    }
+    const schema = rootAttrOf(xml, 'temperatureSchema');
+    if (settings.expectedRowCount > 0 && (schema === 'HWP' || schema === 'HWCP')) {
+      throw new Error(
+        `aDSO ${adsoUpper} tiers its data per partition (temperature schema ${schema}), where the expected row count of the whole object does not apply.`,
+      );
+    }
+    xml = setRootAttr(xml, 'expectedRowCount', String(settings.expectedRowCount));
+  }
+
   // 4. Drop what the resulting type cannot carry.
   const removedKeyFields: string[] = [];
   let removedPartitions = false;
@@ -525,6 +562,26 @@ export async function bwUpdateAdsoSettings(
     throw err;
   }
 
+  // A release that does not know one of these settings saves the document without it and says
+  // nothing, so the stored values decide what is reported.
+  const requestedSwitches: Array<[string, string, string | undefined]> = [
+    ['external_hana_view', 'withHanaModel', settings.externalHanaView === undefined ? undefined : String(settings.externalHanaView)],
+    ['log_read_access', 'logRalOutput', settings.logReadAccess === undefined ? undefined : String(settings.logReadAccess)],
+    ['odata', 'oDataGen', settings.odata === undefined ? undefined : String(settings.odata)],
+    ['memory_optimized_key', 'invertedIndividuals', settings.memoryOptimizedKey === undefined ? undefined : String(settings.memoryOptimizedKey)],
+    ['suppress_compound_index', 'forceNoConcat', settings.suppressCompoundIndex === undefined ? undefined : String(settings.suppressCompoundIndex)],
+    ['expected_row_count', 'expectedRowCount', settings.expectedRowCount === undefined ? undefined : String(settings.expectedRowCount)],
+  ];
+  const notKept: string[] = [];
+  if (requestedSwitches.some(([, , value]) => value !== undefined)) {
+    const saved = (await freshRead(adsoPath, adsoAccept())).body;
+    for (const [setting, attribute, value] of requestedSwitches) {
+      if (value === undefined) continue;
+      const stored = rootAttrOf(saved, attribute) ?? (value === 'true' || value === 'false' ? 'false' : '0');
+      if (stored !== value) notKept.push(setting);
+    }
+  }
+
   const dropped = [
     removedKeyFields.length ? `the key definition (${removedKeyFields.join(', ')})` : '',
     removedPartitions ? 'the partitioning' : '',
@@ -539,6 +596,7 @@ export async function bwUpdateAdsoSettings(
     success: true,
     message:
       `aDSO ${adsoUpper} settings updated. Call bw_activate to activate.` +
+      (notKept.length ? ` The server did not keep ${notKept.join(', ')}: this BW release does not have ${notKept.length === 1 ? 'this setting' : 'these settings'}.` : '') +
       (dropped ? ` The new type cannot carry ${dropped}, which was removed as the modeling tools do.` : '') +
       (needsKey ? ' This type needs a key definition before it activates: set it with action "manage_keys".' : '') +
       (adjustedSid.length
@@ -2040,3 +2098,134 @@ export async function bwUpdateAdso(
   return JSON.stringify(result);
 }
 
+// ── Structure: indexes, hash key, field groups, field changes ────────────────
+
+export interface AdsoStructureArgs {
+  /** The complete list of secondary indexes; [] removes them. */
+  indexes?: IndexSpec[];
+  /** The complete list of hash key fields; [] removes the hash key. */
+  hash_fields?: string[];
+  /** The complete list of criteria; [] removes them. */
+  criteria?: Criterion[];
+  field_groups?: FieldGroupChanges;
+  change_fields?: FieldChange[];
+  initialize_fields?: FieldInitialization[];
+  transport?: string;
+}
+
+/**
+ * bw_update_adso action "update_structure" — secondary indexes, the hash key, field groups,
+ * changes to fields that are not based on an InfoObject, and the rules that fill fields from
+ * existing data. Everything given is applied to one document and saved once.
+ */
+export async function bwUpdateAdsoStructure(client: BwClient, adsoName: string, args: AdsoStructureArgs): Promise<string> {
+  const adsoUpper = adsoName.toUpperCase();
+  const adsoResult = await freshRead(`/sap/bw/modeling/adso/${bwSeg(adsoName)}/m`, adsoAccept());
+  const timestamp = adsoResult.headers['timestamp'] ?? adsoResult.headers['TIMESTAMP'];
+  let xml = adsoResult.body;
+  const changes: string[] = [];
+  const apply = (step: { xml: string; changes: string[] }) => {
+    xml = step.xml;
+    changes.push(...step.changes);
+  };
+  // BW fills only fields that are new since the last activation; its check refuses a rule for a
+  // field the active version already has.
+  const filling = (args.initialize_fields ?? []).filter((rule) => !rule.remove);
+  if (filling.length > 0) {
+    let activeFields: string[] | undefined;
+    try {
+      const active = (await freshRead(`/sap/bw/modeling/adso/${bwSeg(adsoName)}/a`, adsoAccept())).body;
+      activeFields = [...active.matchAll(/<element\b[^>]*\bname="([^"]+)"/g)].map((m) => m[1].toUpperCase());
+    } catch {
+      activeFields = undefined;
+    }
+    const notNew = filling.map((rule) => rule.field.trim().toUpperCase()).filter((field) => activeFields?.includes(field));
+    if (notNew.length > 0) {
+      return JSON.stringify({
+        success: false,
+        message:
+          `${notNew.join(', ')} ${notNew.length === 1 ? 'is' : 'are'} already part of the active aDSO ${adsoUpper}: BW fills only fields ` +
+          `that are new since the last activation. Add the field and its initialization before activating. aDSO ${adsoUpper} was not changed.`,
+      });
+    }
+  }
+  // The hash key partitions an aDSO that has no key; where a key can be maintained the modeling
+  // tools do not offer it and the server drops it without a message.
+  if (args.hash_fields?.length) {
+    const root = xml.match(/<adso:dataStore\b[^>]*>/)?.[0] ?? '';
+    const flag = (name: string) => new RegExp(`\\s${name}="true"`).test(root);
+    if (!flag('cubeDeltaOnly') && (flag('activateData') || flag('directUpdate'))) {
+      return JSON.stringify({
+        success: false,
+        message:
+          `aDSO ${adsoUpper} has a key, and hash partitioning is for an aDSO without one (a data mart, or a staging aDSO with ` +
+          `the inbound queue only). Its partitioning goes through action "manage_partitions". aDSO ${adsoUpper} was not changed.`,
+      });
+    }
+  }
+  try {
+    // Fields first, so that indexes and the hash key can name a field by its new name.
+    for (const change of args.change_fields ?? []) apply(changeField(xml, change));
+    if (args.field_groups) apply(changeFieldGroups(xml, args.field_groups));
+    if (args.indexes !== undefined) apply(setIndexes(xml, args.indexes));
+    if (args.hash_fields !== undefined) apply(setHashKey(xml, args.hash_fields));
+    if (args.criteria !== undefined) apply(setCriteria(xml, args.criteria));
+    if (args.initialize_fields?.length) apply(initializeFields(xml, args.initialize_fields));
+  } catch (err) {
+    return JSON.stringify({ success: false, message: `${(err as Error).message} aDSO ${adsoUpper} was not changed.` });
+  }
+  const state = { indexes: readIndexes(xml), field_groups: readFieldGroups(xml).map((g) => ({ name: g.name, description: g.description, fields: g.fields.length })) };
+  if (changes.length === 0) {
+    const asked = [args.indexes, args.hash_fields, args.criteria, args.field_groups, args.change_fields, args.initialize_fields].some((v) => v !== undefined);
+    return JSON.stringify({
+      success: asked,
+      changed: false,
+      message: asked
+        ? `aDSO ${adsoUpper} already has this structure. Nothing was saved.`
+        : 'Nothing to change: pass indexes, hash_fields, criteria, field_groups, change_fields or initialize_fields.',
+      ...state,
+    });
+  }
+  const lockHandle = await client.lock('adso', adsoName);
+  try {
+    await client.put('adso', adsoName, lockHandle, xml, timestamp, args.transport);
+  } catch (err) {
+    await client.unlock('adso', adsoName).catch(() => {/* ignore */});
+    throw err;
+  }
+  // The server accepts a document and can still leave out a part it does not take, so the hash
+  // key and the indexes are read back before they are reported.
+  const saved = (await freshRead(`/sap/bw/modeling/adso/${bwSeg(adsoName)}/m`, adsoAccept())).body;
+  const dropped: string[] = [];
+  if (args.hash_fields?.length && !/<hashElements>/.test(saved)) dropped.push('the hash key');
+  if (args.indexes?.length && readIndexes(saved).length !== args.indexes.length) dropped.push('the secondary indexes');
+  if (args.criteria?.length && readCriteria(saved).length !== args.criteria.length) dropped.push('the criteria');
+  if (dropped.length > 0) {
+    return JSON.stringify({
+      success: false,
+      message:
+        `aDSO ${adsoUpper} was saved, but the server did not keep ${dropped.join(' and ')}. ` +
+        `Whatever else was requested is in the inactive version; read the aDSO before activating.`,
+      not_kept: dropped,
+      indexes: readIndexes(saved),
+      lock_handle: lockHandle,
+      adso_name: adsoUpper,
+      object_type: 'adso',
+    });
+  }
+  const remodeling = /<elementInitialization\b/.test(saved);
+  return JSON.stringify({
+    success: true,
+    message:
+      `aDSO ${adsoUpper} changed: ${changes.join('; ')}. Call bw_activate to activate.` +
+      `${remodeling
+        ? ' The document holds rules that fill fields from existing data: when the aDSO holds data, the activation creates a remodeling request in place of converting the tables, and that request has to be executed (bw_list_remodeling_requests, bw_run_remodeling) before the change is in effect.'
+        : ''}`,
+    changed: changes,
+    ...(remodeling ? { remodeling_rules_pending: true } : {}),
+    ...state,
+    lock_handle: lockHandle,
+    adso_name: adsoUpper,
+    object_type: 'adso',
+  });
+}

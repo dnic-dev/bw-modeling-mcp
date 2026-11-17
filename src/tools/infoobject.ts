@@ -1161,7 +1161,7 @@ export async function bwUpdateInfoObject(
       // The compounding parents of the InfoObject itself are the ones outside its attributes;
       // a compounded attribute carries its own parents as child elements.
       const attributeRanges = [...xml.matchAll(new RegExp(ATTRIBUTE_ELEMENT.source, 'g'))].map((m) => [m.index ?? 0, (m.index ?? 0) + m[0].length]);
-      const own = [...xml.matchAll(/<compoundParent\b[^>]*(?:\/>|>[\s\S]*?<\/compoundParent>)/g)]
+      const own = [...xml.matchAll(/<compoundParent\b(?:[^>\/]|\/(?!>))*(?:\/>|>[\s\S]*?<\/compoundParent>)/g)]
         .filter((m) => !attributeRanges.some(([from, to]) => (m.index ?? 0) >= from && (m.index ?? 0) < to));
       const now = own.map((m) => m[0].match(/\bname="([^"]+)"/)?.[1]?.toUpperCase() ?? '');
       if (now.length !== parents.length || now.some((p, i) => p !== parents[i])) {
