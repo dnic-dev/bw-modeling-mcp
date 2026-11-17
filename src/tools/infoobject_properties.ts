@@ -389,3 +389,10 @@ export function applyAttributeOnly(xml: string, attributeOnly: boolean | undefin
   if ((rootAttribute(xml, 'attributeOnly') ?? 'false') === String(attributeOnly)) return { xml, changes: [] };
   return { xml: setRootAttribute(xml, 'attributeOnly', String(attributeOnly)), changes: [`attribute only ${attributeOnly ? 'on' : 'off'}`] };
 }
+
+/** Whether a characteristic with master data is offered as a provider, for a query or as an input of a CompositeProvider. */
+export function applyInfoProvider(xml: string, infoProvider: boolean | undefined): { xml: string; changes: string[] } {
+  if (infoProvider === undefined) return { xml, changes: [] };
+  if ((rootAttribute(xml, 'infoProvider') ?? 'false') === String(infoProvider)) return { xml, changes: [] };
+  return { xml: setRootAttribute(xml, 'infoProvider', String(infoProvider)), changes: [`usable as InfoProvider ${infoProvider ? 'on' : 'off'}`] };
+}

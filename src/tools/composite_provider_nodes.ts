@@ -1,3 +1,4 @@
+import { settleInputDateElements } from './composite_provider_temporal.js';
 import { AsyncLocalStorage } from 'node:async_hooks';
 
 /**
@@ -213,6 +214,10 @@ export function followFieldChanges(
 
 /** Widen a narrowed document again, right before it is saved. */
 export function leaveScope(xml: string): string {
+  return settleInputDateElements(reassemble(xml));
+}
+
+function reassemble(xml: string): string {
   const s = storage.getStore();
   if (!s || s.others.length === 0) return unmaskNodeRefs(xml);
   const node = viewNodes(xml).find((n) => n.name === s.node);

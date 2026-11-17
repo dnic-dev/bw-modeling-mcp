@@ -62,7 +62,7 @@ import {
   bwUpdateCompositeProviderFields,
   bwUpdateCompositeProviderGroup,
   bwUpdateCompositeProviderNavigationAttributes,
-  NameUsage, bwUpdateCompositeProviderFilter, bwReplaceCompositeProviderInput, bwInsertCompositeProviderNode, bwRemoveCompositeProviderNode } from './tools/composite_provider.js';
+  NameUsage, bwUpdateCompositeProviderFilter, bwReplaceCompositeProviderInput, bwInsertCompositeProviderNode, bwRemoveCompositeProviderNode, bwUpdateCompositeProviderTemporalJoin } from './tools/composite_provider.js';
 import { bwUpdateCompositeProvider, CompositeProviderFieldAction } from './tools/composite_provider_update.js';
 import { selectNode, scopeNotes } from './tools/composite_provider_nodes.js';
 import { bwGetCkf, bwGetRkf, bwGetStructure, bwGetVariable } from './tools/cp_components.js';
@@ -1165,6 +1165,7 @@ const TOOL_DEFINITIONS = [
           high_cardinality: { type: 'boolean', description: 'Characteristic: High cardinality: no SID table for the values.' },
           authorization_relevant: { type: 'boolean', description: 'Characteristic: Relevant for the analysis authorization check.' },
           attribute_only: { type: 'boolean', description: 'The InfoObject can only be used as an attribute, not in a provider on its own.' },
+          usable_as_infoprovider: { type: 'boolean', description: 'Characteristic: The characteristic is offered as a provider of its own — for queries and as an input of a CompositeProvider. Needs master data.' },
           display: {
             type: 'string',
             enum: ['key_and_text', 'text', 'key', 'text_and_key', 'long_text', 'medium_text', 'no_display', 'short_text'],
@@ -4074,6 +4075,7 @@ const TOOL_DEFINITIONS = [
         'Navigation attributes: "update_navigation_attributes" switches navigation attributes of one InfoObject-bound field on or off. In a union every part provider that supplies the field must deliver the attribute too: an aDSO does, an aggregation level or another CompositeProvider only when it lists the attribute as a field; the result warns about parts that cannot. ' +
         'Filter: "update_filter" sets or removes the SQL filter of the view node (filter_expression). Join keys take an operator other than equality in key_pairs (operator); such a pair gets a target field per side in place of a common one. ' +
         'View nodes: a CompositeProvider is a tree of nodes, each with its own fields and inputs; an input is a provider or the node below. "insert_node" puts a join, union, projection or aggregation node (node_type) above one input (input_alias) or, without it, above the default node; a join node takes its second input with provider_name. "remove_node" takes a node out with the nodes below it. Every other action works on the node named in node, the default node if omitted; an input that is a node has the node name as its alias. ' +
+        'Temporal join: "update_temporal_join" makes a join temporal — the inputs are joined for the time their records are valid. A characteristic input with time-dependent attributes brings its validity along (time_dependent_fields: false reads its attributes as of a key date instead); an aDSO input takes part with a validity interval in two of its date fields (valid_from_field, valid_to_field) or names the date the other inputs are read for (key_date_field). temporal_join: false switches it off. ' +
         'Settings: "update_settings" edits label, stackable, default node and aggregation behaviour.',
       inputSchema: {
         type: 'object',
@@ -4087,7 +4089,7 @@ const TOOL_DEFINITIONS = [
             enum: [
               'add_field', 'remove_field', 'add_input', 'remove_input', 'replace_input', 'insert_node', 'remove_node',
               'update_mapping', 'update_join', 'remove_join', 'update_fields', 'update_group', 'update_filter',
-              'update_navigation_attributes', 'update_settings',
+              'update_temporal_join', 'update_navigation_attributes', 'update_settings',
             ],
             description: 'Defaults to "add_field".',
           },
@@ -4124,6 +4126,26 @@ const TOOL_DEFINITIONS = [
           filter_expression: {
             type: 'string',
             description: 'update_filter: the SQL condition every record of the view node has to meet, written over the fields of the CompositeProvider in double quotes (e.g. "FIELD_NAME" = \'VALUE\'); an empty text removes the filter.',
+          },
+          temporal_join: {
+            type: 'boolean',
+            description: 'update_temporal_join: true (default) writes the temporal join, false switches it off.',
+          },
+          time_dependent_fields: {
+            type: 'boolean',
+            description: 'update_temporal_join, with input_alias of a characteristic that has time-dependent attributes: true (default) joins over its validity, false reads its attributes as of a key date.',
+          },
+          valid_from_field: {
+            type: 'string',
+            description: 'update_temporal_join, with input_alias of an aDSO: the date field a record is valid from (e.g. "FIELD_NAME"). Goes with valid_to_field; both empty remove the interval.',
+          },
+          valid_to_field: {
+            type: 'string',
+            description: 'update_temporal_join, with input_alias of an aDSO: the date field a record is valid to.',
+          },
+          key_date_field: {
+            type: 'string',
+            description: 'update_temporal_join, with input_alias: the date field of that input the time-dependent inputs are read for; an empty text removes it.',
           },
           new_field_name: {
             type: 'string',
@@ -7605,6 +7627,7 @@ async function handleToolCall(
           high_cardinality: args?.high_cardinality as boolean | undefined,
           authorization_relevant: args?.authorization_relevant as boolean | undefined,
           attribute_only: args?.attribute_only as boolean | undefined,
+          usable_as_infoprovider: args?.usable_as_infoprovider as boolean | undefined,
           xxl_attributes: args?.xxl_attributes as string[] | undefined,
           compound_infoobjects: args?.compound_infoobjects as string[] | undefined,
           display: args?.display as string | undefined,
@@ -8271,6 +8294,17 @@ async function handleToolCall(
             break;
           case 'update_filter':
             text = await bwUpdateCompositeProviderFilter(client, cpName, args?.filter_expression as string | undefined, cpTransport);
+            break;
+          case 'update_temporal_join':
+            text = await bwUpdateCompositeProviderTemporalJoin(client, cpName, {
+              enabled: args?.temporal_join as boolean | undefined,
+              inputAlias: args?.input_alias as string | undefined,
+              timeDependentFields: args?.time_dependent_fields as boolean | undefined,
+              validFromField: args?.valid_from_field as string | undefined,
+              validToField: args?.valid_to_field as string | undefined,
+              keyDateField: args?.key_date_field as string | undefined,
+              transport: cpTransport,
+            });
             break;
           case 'update_group':
             text = await bwUpdateCompositeProviderGroup(client, cpName, args?.dimension as string, {

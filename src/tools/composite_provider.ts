@@ -15,11 +15,21 @@ import {
   insertNodeAboveInput,
   insertNodeAboveRoot,
   leaveScope,
+  maskNodeRefs,
   nodeOfInput,
   noteFieldRename,
   parkedNode,
   removeNode,
+  viewNodes,
 } from './composite_provider_nodes.js';
+import {
+  TemporalInput,
+  inputDateElements,
+  isTemporalJoin,
+  readTemporalChoices,
+  stripTemporalJoin,
+  writeTemporalJoin,
+} from './composite_provider_temporal.js';
 
 /**
  * The schema version the modeling tools write on create is the major.minor of the content type
@@ -356,6 +366,12 @@ export async function bwGetCompositeProvider(
       anchor_query_alias: extractAlias(aqRef),
       characteristic_query_alias: extractAlias(cqRef),
       operands,
+      inputs: [...readTemporalChoices(xml, viewNodeName)].map(([alias, choice]) => ({
+        alias,
+        ...(choice.showTimeDependent !== undefined ? { time_dependent_fields: choice.showTimeDependent } : {}),
+        ...(choice.validFrom ? { valid_from_field: choice.validFrom, valid_to_field: choice.validTo } : {}),
+        ...(choice.keyDate ? { key_date_field: choice.keyDate } : {}),
+      })),
     };
   }
 
@@ -673,6 +689,9 @@ export interface SourceFieldMeta {
   isMetaObject: boolean;
   /** Bare names of the source fields this one is compounded to. */
   compoundParents: string[];
+  /** A time-dependent attribute of a characteristic. */
+  timeDependent?: boolean;
+  baseInfoObjectName?: string;
 }
 
 export interface CompoundingMapping {
@@ -789,6 +808,8 @@ export async function fetchCompositeSourceFields(
             : undefined,
         outputLength: outputLengthRaw ? parseInt(outputLengthRaw, 10) : 0,
         isMetaObject: isTechnicalSourceElement(body),
+        timeDependent: attr(elemAttrs, 'timeDependent') === 'true' || undefined,
+        baseInfoObjectName: attr(elemAttrs, 'baseInfoObjectName') || undefined,
         compoundParents: [...body.matchAll(/<compoundInfoObject>#\/\/\/([^<]+)<\/compoundInfoObject>/g)]
           .map((c) => (c[1].startsWith(`${fieldNamePrefix}-`) ? c[1].slice(fieldNamePrefix.length + 1) : c[1])),
       });
@@ -1213,6 +1234,7 @@ export async function bwUpdateCompositeProviderInput(
       broughtAlongNote(compounding);
   }
 
+  xml = await keepTemporalJoin(xml);
   const lockHandle = await client.lock('hcpr', compositeProviderName);
   try {
     await client.put('hcpr', compositeProviderName, lockHandle, leaveScope(xml), timestamp, transport);
@@ -1370,6 +1392,7 @@ export async function bwReplaceCompositeProviderInput(
     { alias: newAlias, providerName: input.providerName, lastModified },
     (sourceName) => translateSourceName(sourceName, oldFields, newFields),
   );
+  result.xml = await keepTemporalJoin(result.xml);
   const lockHandle = await putModel(client, compositeProviderName, result.xml, timestamp, transport);
   return JSON.stringify({
     success: true,
@@ -1411,6 +1434,7 @@ export async function bwInsertCompositeProviderNode(
     throw new Error('insert_node with node_type "join" requires provider_name: the provider the new node joins.');
   }
   const cpResult = await freshRead(HCPR_PATH(compositeProviderName), HCPR_ACCEPT);
+  refuseOnTemporalJoin(cpResult.body, 'insert_node', cpUpper);
   const timestamp = cpResult.headers['timestamp'] ?? cpResult.headers['TIMESTAMP'];
   const alias = opts.inputAlias?.trim();
   const inserted = alias
@@ -1464,6 +1488,7 @@ export async function bwRemoveCompositeProviderNode(
   const cpUpper = compositeProviderName.toUpperCase();
   if (!nodeName?.trim()) throw new Error('remove_node requires node.');
   const cpResult = await freshRead(HCPR_PATH(compositeProviderName), HCPR_ACCEPT);
+  refuseOnTemporalJoin(cpResult.body, 'remove_node', cpUpper);
   const timestamp = cpResult.headers['timestamp'] ?? cpResult.headers['TIMESTAMP'];
   const result = removeNode(cpResult.body, nodeName.trim());
   const lockHandle = await putModel(client, compositeProviderName, result.xml, timestamp, transport);
@@ -1536,11 +1561,13 @@ export async function bwUpdateCompositeProviderMapping(
   xml = ensureNamespace(xml, 'Type', 'http://www.sap.com/ndb/DataModelType.ecore');
 
   // Keep the input's opening tag and entity reference, replace only the mapping list.
+  const dateElements = inputDateElements(
+    xml.match(new RegExp(`<input\\b[^>]*\\balias="${escapeRegex(alias)}"[^>]*>[\\s\\S]*?<\\/input>`))?.[0] ?? '');
   xml = xml.replace(
     new RegExp(
       `(<input\\b[^>]*\\balias="${escapeRegex(alias)}"[^>]*>\\s*(?:<entity>[^<]*<\\/entity>|<nodeRef\\b[^>]*>[^<]*<\\/nodeRef>))[\\s\\S]*?(<\\/input>)`
     ),
-    `$1\n${mappingsXml.join('\n')}\n  $2`
+    (_all, head: string, tail: string) => `${head}\n${mappingsXml.join('\n')}\n  ${dateElements}${tail}`
   );
 
   // Replacing a mapping list can leave fields behind that no input feeds any more.
@@ -1809,6 +1836,165 @@ export async function bwUpdateCompositeProviderFields(
   });
 }
 
+/** The inputs of the view node with what the temporal join needs to know about their providers. */
+async function temporalInputsOf(xml: string): Promise<{ nodeName: string; nodeType: string; inputs: TemporalInput[] }> {
+  const node = xml.match(/<viewNode\b([^>]*)>[\s\S]*?<\/viewNode>/);
+  if (!node) throw new Error('The CompositeProvider has no view node.');
+  const inputs: TemporalInput[] = [];
+  for (const m of node[0].matchAll(/<input\b([^>]*)>[\s\S]*?<\/input>/g)) {
+    const alias = attr(m[1], 'alias');
+    const providerName = nodeOfInput(m[0]) ? undefined : extractProviderNameFromInput(m[0]);
+    if (!alias || !providerName) continue;
+    const kind = (alias.split('.')[1] ?? '').toUpperCase();
+    const fields = kind === 'IOBJ' || kind === 'ADSO'
+      ? (await fetchCompositeSourceFields(providerName)).fields.filter((f) => !f.isMetaObject)
+      : [];
+    inputs.push({
+      alias,
+      providerName: providerName.toUpperCase(),
+      kind,
+      fields: fields.map((f) => f.sourceName),
+      timeDependent: kind === 'IOBJ' && fields.some((f) => f.timeDependent),
+      baseName: fields.find((f) => f.sourceName === providerName.toUpperCase())?.baseInfoObjectName,
+    });
+  }
+  return { nodeName: attr(node[1], 'name'), nodeType: attr(node[1], 'xsi:type'), inputs };
+}
+
+/** A change to the inputs of a temporal join: its parts are written anew for the inputs that are there now. */
+async function keepTemporalJoin(xml: string): Promise<string> {
+  if (!isTemporalJoin(xml)) return xml;
+  const { nodeName, inputs } = await temporalInputsOf(xml);
+  return writeTemporalJoin(xml, nodeName, inputs, readTemporalChoices(xml, nodeName)).xml;
+}
+
+function refuseOnTemporalJoin(xml: string, action: string, cpUpper: string): void {
+  if (isTemporalJoin(xml)) {
+    throw new Error(
+      `CompositeProvider ${cpUpper} is a temporal join, which lives in one join node; ${action} is not available on it. ` +
+      'Switch the temporal join off with action "update_temporal_join" (temporal_join: false) first.');
+  }
+}
+
+export interface TemporalJoinOptions {
+  enabled?: boolean;
+  inputAlias?: string;
+  timeDependentFields?: boolean;
+  validFromField?: string;
+  validToField?: string;
+  keyDateField?: string;
+  transport?: string;
+}
+
+/**
+ * bw_update_composite_provider action "update_temporal_join" — make a join temporal, change
+ * where the validity of an input comes from, or switch the temporal join off.
+ */
+export async function bwUpdateCompositeProviderTemporalJoin(
+  client: BwClient,
+  compositeProviderName: string,
+  opts: TemporalJoinOptions,
+): Promise<string> {
+  const cpUpper = compositeProviderName.toUpperCase();
+  const cpResult = await readModel(compositeProviderName);
+  const timestamp = cpResult.headers['timestamp'] ?? cpResult.headers['TIMESTAMP'];
+  const xml = cpResult.body;
+  const { nodeName, nodeType, inputs } = await temporalInputsOf(xml);
+  if (!nodeType.endsWith('JoinNode')) {
+    throw new Error(`A temporal join needs a join node; view node ${nodeName} of CompositeProvider ${cpUpper} is not one.`);
+  }
+  if (viewNodes(maskNodeRefs(leaveScope(xml))).length > 1) {
+    throw new Error(`A temporal join is written for a CompositeProvider with one join node; ${cpUpper} has several view nodes.`);
+  }
+
+  if (opts.enabled === false) {
+    if (!isTemporalJoin(xml)) {
+      return JSON.stringify({ success: true, changed: false, message: `CompositeProvider ${cpUpper} is not a temporal join. Nothing was saved.` });
+    }
+    const lock = await putModel(client, compositeProviderName, stripTemporalJoin(xml, inputs.map((i) => i.alias)), timestamp, opts.transport);
+    return JSON.stringify({
+      success: true,
+      message: `Temporal join of CompositeProvider ${cpUpper} switched off. Call bw_activate to activate.`,
+      temporal_join: false,
+      lock_handle: lock,
+      composite_provider_name: cpUpper,
+      object_type: 'hcpr',
+    });
+  }
+
+  if (setNodeFilter(xml, '').previous) {
+    throw new Error(
+      `View node ${nodeName} of CompositeProvider ${cpUpper} has an SQL filter, which BW does not allow on a temporal join. ` +
+      'Remove it first with action "update_filter" and an empty filter_expression.');
+  }
+  const choices = readTemporalChoices(xml, nodeName);
+  const perInput =[opts.timeDependentFields, opts.validFromField, opts.validToField, opts.keyDateField].some((v) => v !== undefined);
+  if (perInput) {
+    const alias = opts.inputAlias?.trim();
+    const input = inputs.find((i) => i.alias === alias);
+    if (!input) {
+      throw new Error(
+        `update_temporal_join needs input_alias for time_dependent_fields, valid_from_field, valid_to_field and key_date_field. ` +
+        `Inputs of ${cpUpper}: ${inputs.map((i) => i.alias).join(', ') || '(none)'}.`);
+    }
+    const choice = { ...(choices.get(input.alias) ?? {}) };
+    const dateField = (given: string, param: string): string | undefined => {
+      const wanted = given.trim().toUpperCase();
+      if (!wanted) return undefined;
+      const field = input.fields.find((f) => f === wanted || f.endsWith(`-${wanted}`));
+      if (!field) throw new Error(`${param}: ${wanted} is not a field of ${input.providerName}. Fields: ${input.fields.join(', ')}.`);
+      return field;
+    };
+    if (opts.timeDependentFields !== undefined) {
+      if (input.kind !== 'IOBJ' || !input.timeDependent) {
+        throw new Error(`time_dependent_fields applies to a characteristic with time-dependent attributes; ${input.providerName} (${input.alias}) is not one.`);
+      }
+      choice.showTimeDependent = opts.timeDependentFields;
+    }
+    if (opts.validFromField !== undefined || opts.validToField !== undefined) {
+      if (input.kind !== 'ADSO') {
+        throw new Error(`valid_from_field and valid_to_field apply to an aDSO input; ${input.providerName} (${input.alias}) is of type ${input.kind}.`);
+      }
+      const from = dateField(opts.validFromField ?? choice.validFrom ?? '', 'valid_from_field');
+      const to = dateField(opts.validToField ?? choice.validTo ?? '', 'valid_to_field');
+      if (Boolean(from) !== Boolean(to)) throw new Error('A validity interval needs both valid_from_field and valid_to_field; pass both empty to remove it.');
+      choice.validFrom = from;
+      choice.validTo = to;
+    }
+    if (opts.keyDateField !== undefined) choice.keyDate = dateField(opts.keyDateField, 'key_date_field');
+    choices.set(input.alias, choice);
+  }
+
+  const result = writeTemporalJoin(xml, nodeName, inputs, choices);
+  if (!result.enabled && inputs.some((i) => i.timeDependent)) {
+    const lock = await putModel(client, compositeProviderName, result.xml, timestamp, opts.transport);
+    return JSON.stringify({
+      success: true,
+      message: `No input of CompositeProvider ${cpUpper} takes part with its validity any more, so the join is not temporal. Call bw_activate to activate.`,
+      temporal_join: false,
+      lock_handle: lock,
+      composite_provider_name: cpUpper,
+      object_type: 'hcpr',
+    });
+  }
+  if (!result.enabled) {
+    throw new Error(
+      `CompositeProvider ${cpUpper} has no time-dependent input, so there is nothing to join over time. ` +
+      'A temporal join needs a characteristic with time-dependent attributes as an input (the characteristic has to be usable as an InfoProvider), ' +
+      'or an aDSO input with valid_from_field and valid_to_field.');
+  }
+  const lockHandle = await putModel(client, compositeProviderName, result.xml, timestamp, opts.transport);
+  return JSON.stringify({
+    success: true,
+    message: `Temporal join of CompositeProvider ${cpUpper} written. Call bw_activate to activate.`,
+    temporal_join: true,
+    inputs: result.providers,
+    lock_handle: lockHandle,
+    composite_provider_name: cpUpper,
+    object_type: 'hcpr',
+  });
+}
+
 const FILTER_ELEMENT = /<filterExpression\b(?:[^>\/]|\/(?!>))*(?:\/>|>[\s\S]*?<\/filterExpression>)/;
 
 /**
@@ -1849,6 +2035,9 @@ export async function bwUpdateCompositeProviderFilter(
   if (expression === undefined) throw new Error('update_filter requires filter_expression (an empty text removes the filter).');
   const cpResult = await readModel(compositeProviderName);
   const timestamp = cpResult.headers['timestamp'] ?? cpResult.headers['TIMESTAMP'];
+  if (expression.trim() && isTemporalJoin(cpResult.body)) {
+    throw new Error(`CompositeProvider ${cpUpper} is a temporal join, and BW does not allow an SQL filter on one.`);
+  }
   const result = setNodeFilter(cpResult.body, expression);
   if (!result.changed) {
     return JSON.stringify({

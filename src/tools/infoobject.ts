@@ -2,7 +2,7 @@ import { BwClient, MEDIA_TYPES, createClientFromEnv, freshRead, bwSeg } from '..
 import { resolveLogonUser } from './logon_user.js';
 import { cachedPlatform } from '../platform.js';
 import {
-  applyKeyFigureProperties, applyCharacteristicProperties as applyCharacteristicGeneralProperties, applyAttributeOnly, applyXxlAttributes,
+  applyKeyFigureProperties, applyCharacteristicProperties as applyCharacteristicGeneralProperties, applyAttributeOnly, applyInfoProvider, applyXxlAttributes,
   KEY_FIGURE_PROPERTY_KEYS, CHARACTERISTIC_PROPERTY_KEYS, type KeyFigureProperties, type CharacteristicProperties,
 } from './infoobject_properties.js';
 
@@ -595,6 +595,7 @@ export interface AttributeDef {
 export interface UpdateInfoObjectArgs extends KeyFigureProperties, CharacteristicProperties {
   name: string;
   attribute_only?: boolean;
+  usable_as_infoprovider?: boolean;
   /** Replaces the compounding: the complete list of compounding parents in order; [] removes it. */
   compound_infoobjects?: string[];
   /** Replaces the whole list of XXL attributes; [] removes them, undefined keeps them. */
@@ -849,6 +850,7 @@ export async function bwUpdateInfoObject(
     ['texts_time_dependent', 'texts_time_dependent'], ['with_hierarchies', 'with_hierarchies'],
     ['hierarchy_version_dependent', 'hierarchy_version_dependent'], ['hierarchy_time_dependency', 'hierarchy_time_dependency'],
     ['hierarchy_intervals', 'hierarchy_intervals'], ['hierarchy_reverse_sign', 'hierarchy_reverse_sign'],
+    ['usable_as_infoprovider', 'usable_as_infoprovider'],
   ];
 
   if (replaceAttributes) {
@@ -1149,9 +1151,10 @@ export async function bwUpdateInfoObject(
     }
     const general = applyCharacteristicGeneralProperties(xml, args);
     const onlyAttribute = applyAttributeOnly(general.xml, args.attribute_only);
-    const xxl = applyXxlAttributes(onlyAttribute.xml, args.xxl_attributes);
+    const asProvider = applyInfoProvider(onlyAttribute.xml, args.usable_as_infoprovider);
+    const xxl = applyXxlAttributes(asProvider.xml, args.xxl_attributes);
     xml = xxl.xml;
-    propertyChanges.push(...general.changes, ...onlyAttribute.changes, ...xxl.changes);
+    propertyChanges.push(...general.changes, ...onlyAttribute.changes, ...asProvider.changes, ...xxl.changes);
 
     if (args.compound_infoobjects !== undefined) {
       const parents = args.compound_infoobjects.map((p) => p.trim().toUpperCase()).filter(Boolean);
