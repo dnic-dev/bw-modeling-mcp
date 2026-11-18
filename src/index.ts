@@ -1846,7 +1846,7 @@ const TOOL_DEFINITIONS = [
     },
     {
       name: 'bw_get_infosource',
-      description: 'Read an InfoSource (TRCS) structure — fields, key fields, label, InfoArea, version status.',
+      description: 'Read an InfoSource (TRCS) structure — label, InfoArea, version status, the aggregation and DataStore-like switches, the owning object of a generated InfoSource, and the fields in their order with data type, length, precision and scale, key flag, InfoObject, conversion routine and unit or currency field.',
       inputSchema: {
         type: 'object',
         properties: {
@@ -1876,7 +1876,7 @@ const TOOL_DEFINITIONS = [
       name: 'bw_create_infosource',
       description:
         'Create a new InfoSource (TRCS) shell. ' +
-        'Optionally copy fields from an existing aDSO, CompositeProvider, DataSource, or InfoObject via copy_from_* parameters. ' +
+        'Optionally copy fields from an existing aDSO, CompositeProvider, DataSource, InfoObject or InfoSource via copy_from_* parameters. ' +
         'Created inactive — call bw_activate with object_type "trcs" afterwards. ' +
         'To add fields after creation use bw_update_infosource.',
       inputSchema: {
@@ -1904,8 +1904,8 @@ const TOOL_DEFINITIONS = [
           },
           copy_from_object_type: {
             type: 'string',
-            enum: ['ADSO', 'HCPR', 'RSDS', 'IOBJ'],
-            description: 'Type of the source object: ADSO (aDSO), HCPR (CompositeProvider), RSDS (DataSource), IOBJ (InfoObject).',
+            enum: ['ADSO', 'HCPR', 'RSDS', 'IOBJ', 'TRCS'],
+            description: 'Type of the source object: ADSO (aDSO), HCPR (CompositeProvider), RSDS (DataSource), IOBJ (InfoObject), TRCS (another InfoSource).',
           },
           copy_from_object_sub_type: {
             type: 'string',
@@ -1923,10 +1923,13 @@ const TOOL_DEFINITIONS = [
     {
       name: 'bw_update_infosource',
       description:
-        'Update an InfoSource — change description, add/remove fields, and update labels. ' +
-        'Provide fields as an array of the fields to add, and remove_fields as an array of field names to delete; ' +
-        'other existing fields are always preserved verbatim. ' +
-        'Each field can reference an InfoObject (set infoobject_name) or be a local field (omit infoobject_name). ' +
+        'Change an InfoSource: description, the aggregation and DataStore-like switches, fields, key and field order. Everything not named stays as it is. ' +
+        'fields adds fields: an InfoObject field needs infoobject_name only (type, length, text and conversion routine come from the InfoObject; its compounding parents and the unit InfoObject of a key figure are added with it; a non-cumulative key figure is refused), a plain field needs name and type. ' +
+        'change_fields changes existing fields: a plain field can be renamed and given another text, type, length, precision, scale, conversion routine or unit field; infoobject_name binds a field to an InfoObject, and an empty infoobject_name turns an InfoObject field into a plain field of the same type. ' +
+        'remove_fields deletes fields; a field that is the unit field of another one or the compounding parent of a remaining characteristic is refused. ' +
+        'key_fields sets the complete key in key order and moves the key fields to the front; key figures and fields of type CURR, QUAN, FLTP, STRG, SSTR, RSTR or RAW cannot be key fields. ' +
+        'field_order names the fields that come first; the others follow in their present order. ' +
+        'An InfoSource stores neither an aggregation nor a fixed unit for a plain field. The server does not return the conversion routine of a plain field and drops it with the next change of the InfoSource, so pass conversion_routine again for every plain field that has one. ' +
         'Returns a lock_handle for bw_activate.',
       inputSchema: {
         type: 'object',
@@ -1939,31 +1942,67 @@ const TOOL_DEFINITIONS = [
             type: 'string',
             description: 'New description text (optional — omit to leave unchanged).',
           },
+          aggregation: {
+            type: 'boolean',
+            description: 'Switch "Aggregation" of the InfoSource: records with the same key are aggregated.',
+          },
+          datastore_like: {
+            type: 'boolean',
+            description: 'Switch that makes the InfoSource behave like a DataStore object. Turning it on adds the record mode field if it is missing; that field cannot be removed while the switch is on.',
+          },
           fields: {
             type: 'array',
-            description: 'Fields to add (or whose label to update). Existing fields are preserved; omit to leave fields unchanged.',
+            description: 'Fields to add at the end of the field list. A field that exists already is refused; use change_fields for it.',
             items: {
               type: 'object',
               properties: {
-                name: { type: 'string', description: 'Field name (uppercase).' },
-                infoobject_name: { type: 'string', description: 'InfoObject name to bind this field to (omit for local fields).' },
-                type: { type: 'string', description: 'Data type (e.g. CHAR, NUMC, DEC, CURR, DATS).' },
-                length: { type: 'number', description: 'Field length.' },
-                label: { type: 'string', description: 'Field label / description.' },
-                is_key: { type: 'boolean', description: 'If true, also adds a keyElement entry.' },
-                aggregation_behavior: {
-                  type: 'string',
-                  enum: ['NONE', 'SUM', 'MIN', 'MAX', 'AVG', 'LAST'],
-                  description: 'Aggregation behavior (default "NONE").',
-                },
+                name: { type: 'string', description: 'Field name of a plain field (e.g. "FIELD_NAME"): starts with a letter, no two underscores in a row. Not needed for an InfoObject field.' },
+                infoobject_name: { type: 'string', description: 'InfoObject to add as a field (e.g. "INFOOBJECT_NAME"); the field is named after it.' },
+                type: { type: 'string', description: 'Plain field: ABAP data type (e.g. CHAR, NUMC, DEC, CURR, QUAN, CUKY, UNIT, DATS, INT4).' },
+                length: { type: 'number', description: 'Plain field: length, for CHAR, NUMC and the like.' },
+                precision: { type: 'number', description: 'Plain field of type DEC, CURR or QUAN: total number of digits.' },
+                scale: { type: 'number', description: 'Plain field of type DEC, CURR or QUAN: decimal places.' },
+                label: { type: 'string', description: 'Plain field: description.' },
+                conversion_routine: { type: 'string', description: 'Plain field: conversion routine (e.g. "ALPHA").' },
+                unit_field: { type: 'string', description: 'Plain field of type CURR or QUAN: the field of type CUKY or UNIT that holds its currency or unit.' },
+                is_key: { type: 'boolean', description: 'Add the field to the end of the key. For an InfoObject its compounding parents become key fields too.' },
               },
-              required: ['name', 'type', 'length', 'label'],
+            },
+          },
+          change_fields: {
+            type: 'array',
+            description: 'Changes to existing fields, one entry per field.',
+            items: {
+              type: 'object',
+              properties: {
+                name: { type: 'string', description: 'Present name of the field (e.g. "FIELD_NAME").' },
+                new_name: { type: 'string', description: 'New name of a plain field. Key and unit references follow.' },
+                label: { type: 'string', description: 'New description of a plain field.' },
+                type: { type: 'string', description: 'New ABAP data type of a plain field. Length, precision and scale of the old type are dropped unless given again.' },
+                length: { type: 'number', description: 'New length.' },
+                precision: { type: 'number', description: 'New total number of digits (DEC, CURR, QUAN).' },
+                scale: { type: 'number', description: 'New number of decimal places (DEC, CURR, QUAN).' },
+                conversion_routine: { type: 'string', description: 'Conversion routine; an empty string removes it.' },
+                unit_field: { type: 'string', description: 'Unit or currency field of a CURR or QUAN field; an empty string removes the reference.' },
+                infoobject_name: { type: 'string', description: 'An InfoObject name binds the field to that InfoObject (pass it alone); an empty string turns an InfoObject field into a plain field.' },
+              },
+              required: ['name'],
             },
           },
           remove_fields: {
             type: 'array',
             items: { type: 'string' },
             description: 'Field names to remove from the InfoSource (e.g. FIELD_NAME). Other existing fields are preserved.',
+          },
+          key_fields: {
+            type: 'array',
+            items: { type: 'string' },
+            description: 'The complete key in key order; an empty list removes the key.',
+          },
+          field_order: {
+            type: 'array',
+            items: { type: 'string' },
+            description: 'Field names in the order they are to come first; fields not named follow in their present order.',
           },
           transport: {
             type: 'string',
@@ -7806,24 +7845,44 @@ async function handleToolCall(
         break;
 
       case 'bw_update_infosource': {
+        const str = (v: unknown): string | undefined => (v === undefined || v === null ? undefined : String(v));
+        const num = (v: unknown): number | undefined => (v === undefined || v === null ? undefined : Number(v));
         const rawFields = args?.fields as Array<Record<string, unknown>> | undefined;
         const fieldDefs: InfosourceField[] | undefined = rawFields?.map((f) => ({
-          name: f['name'] as string,
-          infoObjectName: f['infoobject_name'] as string | undefined,
-          type: f['type'] as string,
-          length: f['length'] as number,
-          label: f['label'] as string,
+          name: str(f['name']),
+          infoObjectName: str(f['infoobject_name']),
+          type: str(f['type']),
+          length: num(f['length']),
+          precision: num(f['precision']),
+          scale: num(f['scale']),
+          label: str(f['label']),
           isKey: f['is_key'] as boolean | undefined,
-          aggregationBehavior: f['aggregation_behavior'] as string | undefined,
+          conversionRoutine: str(f['conversion_routine']),
+          unitField: str(f['unit_field']),
         }));
-        text = await bwUpdateInfosource(
-          client,
-          args?.name as string,
-          args?.description as string | undefined,
-          fieldDefs,
-          args?.transport as string | undefined,
-          args?.remove_fields as string[] | undefined
-        );
+        const rawChanges = args?.change_fields as Array<Record<string, unknown>> | undefined;
+        text = await bwUpdateInfosource(client, args?.name as string, {
+          description: args?.description as string | undefined,
+          aggregation: args?.aggregation as boolean | undefined,
+          datastoreLike: args?.datastore_like as boolean | undefined,
+          fields: fieldDefs,
+          changeFields: rawChanges?.map((f) => ({
+            name: String(f['name']),
+            newName: str(f['new_name']),
+            label: str(f['label']),
+            type: str(f['type']),
+            length: num(f['length']),
+            precision: num(f['precision']),
+            scale: num(f['scale']),
+            conversionRoutine: str(f['conversion_routine']),
+            unitField: str(f['unit_field']),
+            infoObjectName: str(f['infoobject_name']),
+          })),
+          removeFields: args?.remove_fields as string[] | undefined,
+          keyFields: args?.key_fields as string[] | undefined,
+          fieldOrder: args?.field_order as string[] | undefined,
+          transport: args?.transport as string | undefined,
+        });
         break;
       }
 

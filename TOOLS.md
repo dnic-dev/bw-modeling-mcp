@@ -241,13 +241,24 @@ List transport requests and their tasks via the BW transport state (`cto/check`)
 ## InfoSource
 
 ### `bw_get_infosource`
-Read an InfoSource (TRCS) structure — fields, key fields, label, InfoArea, version status.
+Read an InfoSource (TRCS) structure — label, InfoArea, version status, the aggregation and DataStore-like switches, the owning object of a generated InfoSource, and the fields in their order. Each field comes with data type, length, precision and scale, key flag, InfoObject and its type, conversion routine and unit or currency field.
 
 ### `bw_create_infosource`
-Create a new InfoSource with full field definitions.
+Create a new InfoSource, empty or with the fields of a template: an aDSO, a CompositeProvider, a DataSource, an InfoObject (attributes, texts or hierarchy) or another InfoSource.
 
 ### `bw_update_infosource`
-Update an existing InfoSource — fields and description.
+Change an InfoSource; everything not named stays as it is.
+
+- `description`, `aggregation`, `datastore_like` — the description and the two switches. Turning `datastore_like` on adds the record mode field if it is missing; that field cannot be removed while the switch is on.
+- `fields` — add fields at the end. An InfoObject field needs `infoobject_name` only: type, length, text and conversion routine come from the InfoObject, its compounding parents and the unit InfoObject of a key figure are added with it, and a non-cumulative key figure is refused. A plain field takes `name`, `type`, `length` or `precision`/`scale`, `label`, `conversion_routine` and, for an amount or quantity, `unit_field`. A field that exists already is refused.
+- `change_fields` — change existing fields. A plain field can be renamed (`new_name`; key and unit references follow) and given another text, type, length, precision, scale, conversion routine or unit field. `infoobject_name` binds a field to an InfoObject; an empty `infoobject_name` turns an InfoObject field into a plain field of the same type and text.
+- `remove_fields` — delete fields. A field that is the unit field of another one, or the compounding parent of a characteristic that stays, is refused.
+- `key_fields` — the complete key in key order; the key fields move to the front of the field list. Key figures and fields of type CURR, QUAN, FLTP, STRG, SSTR, RSTR or RAW cannot be key fields.
+- `field_order` — the fields that come first, in this order; the others follow in their present order.
+
+Field names of plain fields start with a letter and contain no two underscores in a row. The text, type and length of an InfoObject field cannot be changed, they belong to the InfoObject.
+
+An InfoSource stores neither an aggregation nor a fixed unit or currency for a plain field. The server does not return the conversion routine of a plain field and drops it with the next change of the InfoSource; pass `conversion_routine` again for every plain field that has one.
 
 ---
 
