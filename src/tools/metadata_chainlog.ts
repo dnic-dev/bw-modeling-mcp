@@ -7,6 +7,7 @@ import {
   inListBatches,
   type Row,
 } from './metadata_sql.js';
+import { chainRunLoadErrors } from './metadata_reqmess.js';
 
 /**
  * Read process chain *runs* from their log tables.
@@ -221,6 +222,12 @@ export async function readChainRuns(client: BwClient, chainName: string): Promis
   out.push('');
   out.push(`── Steps of the newest run (${newest.logId}) ──`);
   out.push(...formatSteps(steps, texts));
+  // A red newest run shows the errors of its red InfoPackage requests here too.
+  if (steps.some((s) => isRed(s.ACTUAL_STATE || s.STATE))) {
+    out.push('');
+    out.push('── Errors of the red InfoPackage requests (RSMONMESS) ──');
+    out.push(...(await chainRunLoadErrors(client, newest.logId)));
+  }
   out.push('');
   out.push('For an older run, pass its log id as object_name instead of the chain name.');
 
@@ -258,8 +265,9 @@ export async function readChainRunDetail(client: BwClient, logId: string, header
   if (failed.length > 0) {
     out.push('');
     out.push(`${failed.length} step(s) did not end green: ${failed.map((s) => s.TYPE).join(', ')}.`);
-    out.push('The message log of a step is an application log (BAL) and is not readable through');
-    out.push('table access — open it in RSPC, or read the load history of the target instead.');
+    out.push('');
+    out.push('── Errors of the red InfoPackage requests (RSMONMESS) ──');
+    out.push(...(await chainRunLoadErrors(client, logId)));
   }
 
   return out.join('\n');

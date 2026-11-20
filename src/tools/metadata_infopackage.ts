@@ -1,5 +1,6 @@
 import type { BwClient } from '../bw-client.js';
 import { queryTable, sqlLiteral, formatStamp, inListBatches, type Row } from './metadata_sql.js';
+import { RED_REQUEST, requestErrors, formatRequestErrors } from './metadata_reqmess.js';
 
 /**
  * Read an InfoPackage (TLOGO ISIP) from its metadata tables.
@@ -459,6 +460,10 @@ async function loadHistory(client: BwClient, id: string, limit = 10): Promise<st
     }
   }
 
+  // The errors and the file of each red request.
+  const red = requests.filter((r) => r.TSTATUS === RED_REQUEST || r.QMSTATUS === RED_REQUEST);
+  const errors = await requestErrors(client, red.map((r) => r.RNR));
+
   for (const r of requests) {
     const tech = REQUEST_STATUS[r.TSTATUS] ?? `unknown (${r.TSTATUS || 'none'})`;
     const d = details.get(r.RNR);
@@ -477,6 +482,12 @@ async function loadHistory(client: BwClient, id: string, limit = 10): Promise<st
     );
     out.push(`      Records:  ${(r.RECORDS ?? '').trim() || '?'}`);
     if (r.CHAIN_LOG_ID?.trim()) out.push(`      Chain run: ${r.CHAIN_LOG_ID.trim()}`);
+    const failed = errors.byRequest.get(r.RNR);
+    if (failed) out.push(...formatRequestErrors(failed, '      '));
+  }
+  if (errors.error) {
+    out.push('');
+    out.push(`  ${errors.error}`);
   }
   return out;
 }

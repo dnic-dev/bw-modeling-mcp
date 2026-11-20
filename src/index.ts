@@ -4007,7 +4007,8 @@ const TOOL_DEFINITIONS = [
               'among themselves, so read the "After" line of each step. ' +
               'RSPCLOG: process chain runs — a chain name gives the run history plus the steps of the ' +
               'newest run, a 25-character log id the steps of that run, a pattern with * the last status ' +
-              'of every matching chain; the message log of a failed step is not readable here. ' +
+              'of every matching chain; a red InfoPackage request shows its E and A messages from ' +
+              'RSMONMESS and its file path, a red DTP step does not. ' +
               'PLSE: planning function type, aggregation level, characteristic usage, conditions, ' +
               'parameters, FOX formula as source code. PLSQ: planning sequence steps in execution order. ' +
               'PLCR: planning properties and characteristic relationships. PLDS: data slices (no REST ' +
@@ -4017,7 +4018,8 @@ const TOOL_DEFINITIONS = [
               'constants), filters, formulas and routine code; a pattern with * lists the analysis ' +
               'processes, which bw_search cannot find. ' +
               'ISIP: InfoPackage (classic only) — DataSource, file settings, selections with routines, ' +
-              'deletion settings, the process chains using it, load history.',
+              'deletion settings, the process chains using it, load history with the errors and the ' +
+              'file path of each red request.',
           },
           object_name: {
             type: 'string',
