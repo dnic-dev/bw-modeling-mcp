@@ -21,7 +21,7 @@ applications:
     env:
       NODE_ENV: production
       # BTP destination pointing at the BW system.
-      BW_BTP_DESTINATION: "BW4_NLB"
+      BW_BTP_DESTINATION: "BW4_PROD"
       BW_CLIENT: "001"
       BW_LANGUAGE: "DE"
       # Platform of the destination system, which decides which tools are offered:
