@@ -49,15 +49,20 @@ Principal propagation additionally needs a certificate rule and ICM trust on the
 
 ---
 
-## 📖 Featured Blog Posts
+## 📖 Further Reading
 
-A two-part blog series about this project (both available in German and English):
+Overview page: **[Agentic AI for SAP BW](https://www.nextlytics.com/en/agentic-ai-for-sap-bw)** — what the server does, use cases and the hosting options.
+
+Three blog posts about this project (all available in German and English):
 
 1. **Agentic AI meets SAP BW** — the full story behind this project: why I built it, what's inside, what happens when Claude walks through a complete BW data lineage on its own.
    https://www.nextlytics.com/blog/agentic-ai-meets-sap-bw
 
 2. **Agentic AI in practice: MCP server for SAP BW/4HANA** — how the server is operated company-wide on SAP BTP Cloud Foundry with role-based access and per-user identity, plus two real customer projects.
    https://www.nextlytics.com/blog/agentic-ai-in-practice-mcp-server-for-sap-bw/4hana
+
+3. **Agentic Planning with Analysis for Office** — a planning model built by an agent in SAP BW, from the aDSO to the planning function, and the workbook that plans on it.
+   https://www.nextlytics.com/blog/agentic-planning-analysis-for-office
 
 ---
 
