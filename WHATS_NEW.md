@@ -8,6 +8,106 @@ For the complete, structured change history see [CHANGELOG.md](CHANGELOG.md).
 
 ---
 
+## What's New — v2.0.0 · 21 Tools Instead of 134
+
+The largest release so far, in two directions at once: the model now works with a tool
+surface a third the size, and the write paths have been checked operation by operation
+against what BW actually accepts — so a change the server reports as saved also activates.
+
+### 🎯 Focused tool surface, now the default
+
+- **21 tools instead of 134.** Each focused tool stands for a group of operations and selects
+  one through its `type` or `operation` parameter: `bw_read` reads any object type,
+  `bw_write_adso` creates and changes aDSOs, `bw_activate` checks, activates and unlocks.
+  Nothing was removed — every operation is still there, with the same parameters and behaviour
+- **A third of the context.** The tool definitions take about a third of the space they
+  took before, which leaves the model more room for the actual work. In our tool-selection benchmark it
+  picked the right operation as often on the focused surface as on the full one
+- **`bw_describe` on demand.** The focused tools carry short parameter notes;
+  `bw_describe(tool, operation)` returns the complete definition of one operation when the
+  model needs it, and a wrong or missing `operation` is refused with the allowed values
+  before anything reaches BW
+- Roles and platform still apply per operation: a Reader sees only the reading operations,
+  and a BW 7.5 system only what it can answer
+
+### Upgrading to 2.0
+
+The one breaking change: **clients now see the focused tool names.**
+
+- **Allowlists and permission settings** that name full tools (`bw_get_adso`,
+  `bw_update_transformation`, …) need the focused names (`bw_read`, `bw_write_transformation`, …)
+  — or set `BW_TOOL_MODE=full` to keep the full surface exactly as it was
+- **Scripts and automations** that call the server directly with full tool names keep working
+  without a change: a full tool name sent to the server is answered in either mode
+- **Skills and prompts** that name full tools in their text are best moved to the focused
+  names — an agent can only pick from the tools it is shown — or run with `BW_TOOL_MODE=full`
+- **Hosted on SAP BTP:** role collections and scopes are unchanged
+- The mapping from every full tool to its focused tool and operation is in
+  [Tool modes](TOOLS.md#tool-modes)
+
+### On every release (BW/4HANA and BW 7.5)
+
+**✅ Check before you activate**
+
+- New `bw_check` (operation `check` of `bw_activate`) — runs the activation checks on the
+  saved version of an object, as "Check" in the modeling tools does, without activating
+  anything and without a lock. The answer says whether the object would activate and why
+  not. It is a read operation, so read-only users can use it too
+
+**🧱 Writes that activate the first time**
+
+- **aDSO** — a type change now writes the type as a whole and drops what the new type cannot
+  carry; removing a field removes its key, partition and index entries with it; an
+  InfoObject brings its compounding parents along; key fields are checked before they are
+  saved, and every one of these is reported in the answer
+- **CompositeProvider** — `update_join` gives both sides of a join key the common target
+  field BW requires, a compounded field brings its compounding parent, and mapping an input
+  again no longer leaves duplicate fields behind
+- **InfoObject** — attributes can be key figures, units and time characteristics, display
+  attributes can be time-dependent, and a navigation attribute BW would refuse is refused
+  before anything is written
+
+**🆕 New capabilities**
+
+- **Open Hub Destinations** can be created from an aDSO or CompositeProvider and changed
+  — table and file destinations, write mode, key, fields and file properties
+  (`bw_create_open_hub`, `bw_update_open_hub`)
+- **Partitions and data tiering of an aDSO** — static range partitions or dynamic
+  partitioning (`manage_partitions`), hot and warm storage per object or per partition
+- **Master data, text and hierarchy properties of a characteristic** — text lengths,
+  language- and time-dependent texts, hierarchies with version and time dependency
+
+### BW/4HANA
+
+**🔀 Transformations and DTPs**
+
+- The rule of a field can be changed from any type to any other — direct, time conversion,
+  constant, formula, routine with several source fields, lookup — and a lookup binds every
+  key field of the object it reads from
+- `bw_update_dtp` takes the execution settings: package size and parallel extraction,
+  request selection, error handling, SAP HANA execution and the batch manager. Each value is
+  checked against what the server admits for that DTP, so an inadmissible setting is refused
+  with the admissible ones instead of an HTTP 500 without a message
+
+**📤 Open Hub from a query**
+
+- A query can be released as an InfoProvider and used as the template and source of an Open
+  Hub Destination, so the result of a query lands in a table or file through a DTP
+
+### Also in this release
+
+- Query structures: where a hierarchy holds a text node and a characteristic value of the same
+  name, `node_type` says which one a restriction means, and `switch_hierarchy` keeps the kind
+  of each node (#52)
+- Fixed: `bw_update_infoobject` reported a refused activation as success — the answer now
+  carries the server's messages and says that the change is saved but not active; a
+  characteristic with a compounded attribute can be changed again; `bw_run_dtp` says when a
+  delta found nothing to load instead of reporting a started request; `bw_get_request`
+  refuses a malformed request id instead of returning the whole process history; texts with
+  `&` or quotes no longer break a save
+
+---
+
 ## What's New — v1.10.0 · Repeat a Failed Chain Step
 
 ### BW/4HANA

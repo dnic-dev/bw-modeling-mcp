@@ -239,6 +239,8 @@ src/
     ├── adso.ts           # bw_get_adso, bw_create_adso, bw_update_adso
     ├── adso_data.ts      # bw_set_adso_planning_mode, bw_delete_adso_data_selective — BW/4HANA
     │                     # manage API for the runtime state and the data of an aDSO
+    ├── adso_structure.ts # update_structure of bw_update_adso — indexes, hash key, field groups,
+    │                     # plain-field changes and the rules that carry existing data; no I/O
     ├── afo_workbook_save.ts # bw_save_afo_workbook — RSAO_BICS_SAVE with the where-used list read from
     │                        # the AfO definition in the file, RSOBJS_ALTER_NODE_REFS for the role menu,
     │                        # RSAO_BICS_CLOSE to release the edit lock; all over SOAP RFC
@@ -249,6 +251,10 @@ src/
     ├── composite_provider.ts # bw_get_composite_provider, bw_create_composite_provider,
     │                     # bw_update_composite_provider — inputs, mappings, joins, field
     │                     # groups, name usage, settings
+    ├── composite_provider_nodes.ts # view nodes of a CompositeProvider — insert_node, remove_node and
+    │                     # the node every other action works on
+    ├── composite_provider_temporal.ts # update_temporal_join — the temporal join section, written
+    │                     # anew from the choices per input
     ├── composite_provider_update.ts # bw_update_composite_provider — add_field, remove_field
     ├── cp_components.ts  # bw_get_ckf, bw_get_rkf, bw_get_structure, bw_get_variable
     ├── cto.ts            # bw_change_package — package reassignment via /sap/bw/modeling/cto/write;
@@ -268,6 +274,8 @@ src/
     │                     # each write in a logon of its own
     ├── infoarea.ts       # bw_get_infoarea, bw_create_infoarea, bw_move_object
     ├── infoobject.ts     # bw_get_infoobject, bw_create_infoobject, bw_update_infoobject
+    ├── infoobject_properties.ts # general and query settings of bw_update_infoobject — plain
+    │                     # edits of the document with the rules of the modeling tools; no I/O
     ├── infosource.ts     # bw_get_infosource, bw_create_infosource, bw_update_infosource
     ├── metadata_apd.ts   # the ANPR reader behind bw_read_metadata_tables: the analysis
     │                     # process XML in RSANT_PROCESS, parsed into nodes and edges and

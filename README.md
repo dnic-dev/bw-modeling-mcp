@@ -61,113 +61,117 @@ A two-part blog series about this project (both available in German and English)
 
 ---
 
-## 🆕 What's New — v2.0.0 · 21 Tools Instead of 134
+## 🆕 What's New — v2.1.0 · Security Hardening and Deeper Modeling
 
-The largest release so far, in two directions at once: the model now works with a tool
-surface a third the size, and the write paths have been checked operation by operation
-against what BW actually accepts — so a change the server reports as saved also activates.
+Two directions again: the server checks more before it acts — the certificate of the BW
+system, every tool call, every request it sends — and the modeling tools reach further
+into CompositeProviders and transformations.
 
-### 🎯 Focused tool surface, now the default
+### Before you update
 
-- **21 tools instead of 134.** Each focused tool stands for a group of operations and selects
-  one through its `type` or `operation` parameter: `bw_read` reads any object type,
-  `bw_write_adso` creates and changes aDSOs, `bw_activate` checks, activates and unlocks.
-  Nothing was removed — every operation is still there, with the same parameters and behaviour
-- **A third of the context.** The tool definitions take about a third of the space they
-  took before, which leaves the model more room for the actual work. In our tool-selection benchmark it
-  picked the right operation as often on the focused surface as on the full one
-- **`bw_describe` on demand.** The focused tools carry short parameter notes;
-  `bw_describe(tool, operation)` returns the complete definition of one operation when the
-  model needs it, and a wrong or missing `operation` is refused with the allowed values
-  before anything reaches BW
-- Roles and platform still apply per operation: a Reader sees only the reading operations,
-  and a BW 7.5 system only what it can answer
+Most installations need no change. Two points can stop a setup that worked before:
 
-### Upgrading to 2.0
+- **The certificate of the BW system is verified.** A system whose certificate comes from an
+  in-house certificate authority needs `NODE_EXTRA_CA_CERTS` pointing at a PEM file with that
+  authority; a system with a self-signed certificate needs `BW_TLS_VERIFY=off`. Without it
+  the connection is refused, and the error names the reason
+- **On the hosted server every user signs in again once.** A refresh token issued before the
+  update is refused
 
-The one breaking change: **clients now see the focused tool names.**
+### 🔒 Security
 
-- **Allowlists and permission settings** that name full tools (`bw_get_adso`,
-  `bw_update_transformation`, …) need the focused names (`bw_read`, `bw_write_transformation`, …)
-  — or set `BW_TOOL_MODE=full` to keep the full surface exactly as it was
-- **Scripts and automations** that call the server directly with full tool names keep working
-  without a change: a full tool name sent to the server is answered in either mode
-- **Skills and prompts** that name full tools in their text are best moved to the focused
-  names — an agent can only pick from the tools it is shown — or run with `BW_TOOL_MODE=full`
-- **Hosted on SAP BTP:** role collections and scopes are unchanged
-- The mapping from every full tool to its focused tool and operation is in
-  [Tool modes](TOOLS.md#tool-modes)
+- **Verified connection to BW** — HTTPS connections check the server certificate, and every
+  request is checked before it is sent: it stays on the BW system and on the path it was
+  built for, whatever an object name contains
+- **Tool calls are validated** — every call is checked against the published schema before
+  its handler runs. A call that does not match is answered with the parameters at fault,
+  and nothing reaches BW
+- **Hardened hosted server** — the endpoint answers only under its own addresses and checks
+  where a browser request comes from, refresh tokens belong to the client they were issued
+  to, requests are limited per user, and errors leave out the backend address
+- **Registration limited to known clients, if you want it** — with
+  `BW_OAUTH_REDIRECT_STRICT=on` only the callbacks of known MCP clients and the ones you
+  name are accepted. Without it an MCP client of any vendor registers as before, and the
+  approval page shows the user where the sign-in returns to
+- **Works behind an MCP gateway** — a confidential client may authenticate with
+  `client_secret_basic`, and the limits of the OAuth endpoints are configurable, since a
+  gateway puts every user behind one address
 
-### On every release (BW/4HANA and BW 7.5)
-
-**✅ Check before you activate**
-
-- New `bw_check` (operation `check` of `bw_activate`) — runs the activation checks on the
-  saved version of an object, as "Check" in the modeling tools does, without activating
-  anything and without a lock. The answer says whether the object would activate and why
-  not. It is a read operation, so read-only users can use it too
-
-**🧱 Writes that activate the first time**
-
-- **aDSO** — a type change now writes the type as a whole and drops what the new type cannot
-  carry; removing a field removes its key, partition and index entries with it; an
-  InfoObject brings its compounding parents along; key fields are checked before they are
-  saved, and every one of these is reported in the answer
-- **CompositeProvider** — `update_join` gives both sides of a join key the common target
-  field BW requires, a compounded field brings its compounding parent, and mapping an input
-  again no longer leaves duplicate fields behind
-- **InfoObject** — attributes can be key figures, units and time characteristics, display
-  attributes can be time-dependent, and a navigation attribute BW would refuse is refused
-  before anything is written
-
-**🆕 New capabilities**
-
-- **Open Hub Destinations** can be created from an aDSO or CompositeProvider and changed
-  — table and file destinations, write mode, key, fields and file properties
-  (`bw_create_open_hub`, `bw_update_open_hub`)
-- **Partitions and data tiering of an aDSO** — static range partitions or dynamic
-  partitioning (`manage_partitions`), hot and warm storage per object or per partition
-- **Master data, text and hierarchy properties of a characteristic** — text lengths,
-  language- and time-dependent texts, hierarchies with version and time dependency
+Details and every setting: [CHANGELOG.md](CHANGELOG.md) and
+[docs/CLOUD-FOUNDRY.md](docs/CLOUD-FOUNDRY.md).
 
 ### BW/4HANA
 
-**🔀 Transformations and DTPs**
+**🧩 CompositeProviders, beyond one union or join**
 
-- The rule of a field can be changed from any type to any other — direct, time conversion,
-  constant, formula, routine with several source fields, lookup — and a lookup binds every
-  key field of the object it reads from
-- `bw_update_dtp` takes the execution settings: package size and parallel extraction,
-  request selection, error handling, SAP HANA execution and the batch manager. Each value is
-  checked against what the server admits for that DTP, so an inadmissible setting is refused
-  with the admissible ones instead of an HTTP 500 without a message
+- **Several view nodes** — a CompositeProvider can be built as a tree: a join inside a
+  union, a projection or an aggregation above an input or on top (`insert_node`,
+  `remove_node`). Every other action works on the node named in `node`
+- **Temporal joins** — inputs are joined for the time their records are valid, with the
+  validity of a time-dependent characteristic or a validity interval of an aDSO
+  (`update_temporal_join`)
+- **SAP HANA views as inputs** — a calculation, analytic or attribute view is added as
+  `<package>::<view>`, and its mandatory input parameters become parameters of the
+  CompositeProvider
+- **Replace an input** — another provider takes the place of one input, and mappings,
+  constants and join keys follow where the new provider has the fields (`replace_input`)
+- **Join operators and node filters** — a join key pair can be compared with an operator
+  other than equality, and a view node takes an SQL filter (`update_filter`)
+- Fields can be renamed and described, and the currency or unit of a key figure comes
+  along when it is mapped
 
-**📤 Open Hub from a query**
+**🔀 Transformations, the settings around the rules**
 
-- A query can be released as an InfoProvider and used as the template and source of an Open
-  Hub Destination, so the result of a query lands in a table or file through a DTP
+- **Rule groups** — new `bw_update_transformation_rule_group` adds, renames and removes
+  rule groups, and `bw_update_transformation` changes the rule of a field in one group
+- **Settings** — new `bw_update_transformation_settings` sets the switches of a
+  transformation, per target field the conversion exit and the master data check, the
+  grouping of the extraction, and the currency and unit handling
+- **Lookups with a key date** — a lookup into time-dependent attributes reads by the date
+  of the load, a fixed date or a date from a source field, and a lookup into a DataStore
+  object says what happens when nothing is found
+- **Conversion behind a formula or a routine** — a currency or unit conversion no longer
+  needs a direct assignment
+- The record mode rule of an ODP delta can be read and written, and the START routine takes
+  its field list
+
+**⛓️ DTPs and process chains**
+
+- **A DTP through any number of transformations** — `bw_create_dtp` takes `trfn_names`, the
+  whole path from source to target, and names the object where a path breaks before
+  anything is created (#53)
+- **A decision inserted into an existing chain** — new `bw_add_process_chain_decision` adds
+  the step in place and leaves every other step as it is
+
+### On every release (BW/4HANA and BW 7.5)
+
+- **aDSO structure** — `update_structure` takes secondary indexes, hash partitioning,
+  criteria, field groups and changes to plain fields. A renamed field keeps its data on
+  BW/4HANA, where the tool writes the rule that carries it over
+- **InfoSources** — `bw_update_infosource` changes fields, the key, the field order and the
+  two switches of an InfoSource instead of only adding and removing fields
 
 ### Also in this release
 
-- Query structures: where a hierarchy holds a text node and a characteristic value of the same
-  name, `node_type` says which one a restriction means, and `switch_hierarchy` keeps the kind
-  of each node (#52)
-- Fixed: `bw_update_infoobject` reported a refused activation as success — the answer now
-  carries the server's messages and says that the change is saved but not active; a
-  characteristic with a compounded attribute can be changed again; `bw_run_dtp` says when a
-  delta found nothing to load instead of reporting a started request; `bw_get_request`
-  refuses a malformed request id instead of returning the whole process history; texts with
-  `&` or quotes no longer break a save
+- **InfoObjects** — the settings of a key figure (aggregation, exception aggregation, data
+  type, decimals) and the general settings of a characteristic (data type, length,
+  compounding, conversion routine, display) can be changed, a characteristic can be made
+  usable as an InfoProvider, and unit and XXL InfoObjects can be created
+- Fixed: a process chain and a decision variant are created in the package that was asked
+  for instead of as local objects; replacing the tree of a hierarchy no longer ends in a
+  server error, and numeric node names are stored in their internal form; a conversion the
+  server does not keep is no longer reported as set; `bw_get_infosource` reports the real
+  object status; a DTP from a DataSource with a 30-character name passes the path check
 
 ---
 
-**Earlier releases** — the "What's New" notes for v1.10.0 and older are archived in [WHATS_NEW.md](WHATS_NEW.md); the full structured history is in [CHANGELOG.md](CHANGELOG.md).
+**Earlier releases** — the "What's New" notes for v2.0.0 and older are archived in [WHATS_NEW.md](WHATS_NEW.md); the full structured history is in [CHANGELOG.md](CHANGELOG.md).
 
 ---
 
 ## What it can do
 
-An overview by area. Every tool in detail — parameters, behaviour, and the sequences it belongs in — is in the **[Tools Reference](TOOLS.md)** (134 operations behind 21 focused tools).
+An overview by area. Every tool in detail — parameters, behaviour, and the sequences it belongs in — is in the **[Tools Reference](TOOLS.md)** (137 operations behind 21 focused tools).
 
 <p align="center">
   <picture>
@@ -228,7 +232,7 @@ For **local (stdio)** use, the server is configured via environment variables. F
 | `BW_COOKIE_FILE` | Path to a browser-exported cookie file for SAML-/OAuth-fronted systems (e.g. BW Bridge). Netscape or `name=value` format. When set, `BW_USER` / `BW_PASSWORD` are optional. | no |
 | `BW_MCP_SERVER_NAME` | Server name advertised in the MCP `initialize` handshake. Default: `bw-modeling-mcp`. Give each instance a unique name when running several against different BW systems. | no |
 | `BW_MCP_SYSTEM_LABEL` | Free-text label of the connected BW system (e.g. `AP4 (BW production, read-only)`), put at the top of the MCP server instructions. Lets a model tell look-alike instances apart even in clients that show an opaque connector id instead of the server name. | no |
-| `BW_TOOL_MODE` | `focused` (default) or `full`. The default offers 21 tools: each stands for a group of operations and selects one through its `type` or `operation` parameter, and `bw_describe` gives the complete parameter definition of any operation. `full` offers every operation as a tool of its own (134 on BW/4HANA, three times the tool payload in the model's context) for clients that hold allowlists or scripts on the full tool names. See [Tool modes](TOOLS.md#tool-modes). | no |
+| `BW_TOOL_MODE` | `focused` (default) or `full`. The default offers 21 tools: each stands for a group of operations and selects one through its `type` or `operation` parameter, and `bw_describe` gives the complete parameter definition of any operation. `full` offers every operation as a tool of its own (137 on BW/4HANA, three times the tool payload in the model's context) for clients that hold allowlists or scripts on the full tool names. See [Tool modes](TOOLS.md#tool-modes). | no |
 | `BW_PLATFORM` | `auto` (default), `classic` or `bw4`. The server detects whether it is talking to BW/4HANA or a classic release and offers only the tools that release can answer. `classic` forces that verdict when detection cannot run, `bw4` switches the filter off. See [bw75/BW75-SUPPORT.md](bw75/BW75-SUPPORT.md). | no |
 | `BW_SESSION_CLOSE` | `on` (default) or `off`. The server ends the SAP sessions of a tool call once it is answered, and all remaining ones when it stops. Set `off` only behind a proxy that holds the SAP session itself. | no |
 | `BW_TLS_VERIFY` | `on` (default) or `off`. The certificate of the BW system is verified on every HTTPS connection. For a system whose certificate comes from an in-house certificate authority, set the Node.js variable `NODE_EXTRA_CA_CERTS` to a PEM file with that authority and leave this on. `off` switches the check off for a system with a self-signed certificate; the server says so on start. | no |
