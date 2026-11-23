@@ -808,9 +808,18 @@ export function resolveDtpTransformations(
   return single;
 }
 
-// Object names are compared by their first token: a DataSource carries its source system
-// after padding, and the DTP arguments name the object without it.
-const chainKey = (name: string) => name.trim().split(/\s+/)[0]?.toUpperCase() ?? '';
+const isDataSourceType = (type: string) => /^(RSDS|DTASRC)$/i.test(type.trim());
+
+// A DataSource end is the name in a fixed 30-character field followed by the source system;
+// a name that fills the field leaves no blank to split at, so it is split by position.
+function splitEnd(name: string, type: string): { key: string; system: string } {
+  if (isDataSourceType(type)) {
+    return { key: name.slice(0, 30).trim().toUpperCase(), system: name.slice(30).trim().toUpperCase() };
+  }
+  return { key: name.trim().split(/\s+/)[0]?.toUpperCase() ?? '', system: '' };
+}
+
+const chainKey = (name: string, type = '') => splitEnd(name, type).key;
 
 /**
  * Put the transformations of a DTP into path order, source first, and verify that they lead
@@ -821,9 +830,19 @@ export function orderTransformationChain(
   ends: TransformationEnds[],
   sourceName: string,
   targetName: string,
+  sourceSystem?: string,
 ): string[] {
+  const label = (name: string, type: string) => {
+    const { key, system } = splitEnd(name, type);
+    return system ? `${key} (source system ${system})` : key;
+  };
   const show = (e: TransformationEnds) =>
-    `${e.name}: ${e.sourceType} ${chainKey(e.sourceName)} -> ${e.targetType} ${chainKey(e.targetName)}`;
+    `${e.name}: ${e.sourceType} ${label(e.sourceName, e.sourceType)} -> ${e.targetType} ${label(e.targetName, e.targetType)}`;
+  const wantedSystem = sourceSystem?.trim().toUpperCase() ?? '';
+  const startsAtSource = (e: TransformationEnds) => {
+    const { key, system } = splitEnd(e.sourceName, e.sourceType);
+    return key === chainKey(sourceName) && (!wantedSystem || !system || system === wantedSystem);
+  };
   const listing = ends.map((e) => `  ${show(e)}`).join('\n');
   const hint =
     'Pass every transformation on the path as trfn_names; trace the path with bw_xref on the target or ' +
@@ -832,9 +851,11 @@ export function orderTransformationChain(
   const remaining = [...ends];
   const ordered: TransformationEnds[] = [];
   let at = chainKey(sourceName);
-  let atLabel = `the DTP source ${at}`;
+  let atLabel = `the DTP source ${at}${wantedSystem ? ` (source system ${wantedSystem})` : ''}`;
   while (remaining.length > 0) {
-    const next = remaining.filter((e) => chainKey(e.sourceName) === at);
+    const next = remaining.filter((e) =>
+      ordered.length === 0 ? startsAtSource(e) : chainKey(e.sourceName, e.sourceType) === at,
+    );
     if (next.length !== 1) {
       throw new Error(
         `The transformations do not form a path from ${chainKey(sourceName)} to ${chainKey(targetName)}: ` +
@@ -847,7 +868,7 @@ export function orderTransformationChain(
     const step = next[0];
     ordered.push(step);
     remaining.splice(remaining.indexOf(step), 1);
-    at = chainKey(step.targetName);
+    at = chainKey(step.targetName, step.targetType);
     atLabel = `${step.targetType} ${at}`;
   }
   if (at !== chainKey(targetName)) {
@@ -965,7 +986,9 @@ export async function bwCreateDtp(
     } catch {
       // A transformation that cannot be read is left to the server to judge.
     }
-    if (ends) trfnNames = orderTransformationChain(ends, srcName, tgtName);
+    if (ends) {
+      trfnNames = orderTransformationChain(ends, srcName, tgtName, srcType === 'RSDS' ? args.source_system : undefined);
+    }
   }
   const overviewObjects = trfnNames
     .map((t) => `    <object xsi:type="Dtpa:DTPObject" name="${t}" tlogo="TRFN"/>`)

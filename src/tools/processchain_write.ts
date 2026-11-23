@@ -181,6 +181,11 @@ export interface CreateProcessChainParams {
   activate?: boolean;
   // Optional event start-condition for the trigger. Omit for the default immediate start.
   triggerEvent?: TriggerEventConfig;
+  // Target package; $TMP when omitted.
+  package?: string;
+  // Transport request for a transportable package (required unless exactly one
+  // changeable request is available).
+  transportRequest?: string;
 }
 
 export interface UpdateProcessChainParams {
@@ -1203,8 +1208,9 @@ export async function bwCreateProcessChain(
   client: BwClient,
   params: CreateProcessChainParams
 ): Promise<string> {
-  const { name, infoarea, description, steps, edges, activate = false, triggerEvent } = params;
+  const { name, infoarea, description, steps, edges, activate = false, triggerEvent, transportRequest } = params;
   const nameLc = name.toLowerCase();
+  const pkg = (params.package?.trim() || '$TMP').toUpperCase();
 
   const { stepNodes, aEdge, stepInlineVariants } = buildModelParts(steps, edges);
 
@@ -1226,21 +1232,30 @@ export async function bwCreateProcessChain(
   // did not match (known intermittent SAP behaviour). Transport rules are still
   // enforced by the actual POST in Step 2, so we warn and continue rather than abort.
   let transportWarning: string | undefined;
+  let transportHeader: Record<string, string> = {};
   const csrf1 = await client.getCsrfToken();
-  await client
-    .rawPost(
-      '/sap/bc/http/sap/bw4/v1/modeling/transports/validateobject',
-      JSON.stringify({ uri: `${BASE}/${nameLc}`, package: '$TMP' }),
-      writeHeaders(csrf1)
-    )
-    .catch((err: Error) => {
-      if (/HTTP 404/.test(err.message)) {
-        transportWarning = 'Transport pre-check returned 404 (validateobject); transport rules still apply on save.';
-      } else {
+  if (pkg === '$TMP') {
+    await client
+      .rawPost(VALIDATEOBJECT_PATH, JSON.stringify({ uri: `${BASE}/${nameLc}`, package: '$TMP' }), writeHeaders(csrf1))
+      .catch((err: Error) => {
+        if (/HTTP 404/.test(err.message)) {
+          transportWarning = 'Transport pre-check returned 404 (validateobject); transport rules still apply on save.';
+        } else {
+          throw new Error(`Transport check (create): ${err.message}`);
+        }
+      });
+  } else {
+    const resolved = await resolveTransportHeader(client, `${BASE}/${nameLc}`, csrf1, transportRequest, pkg).catch(
+      (err: Error) => {
         throw new Error(`Transport check (create): ${err.message}`);
-      }
-    });
+      },
+    );
+    transportHeader = resolved.header;
+    transportWarning = resolved.warning;
+  }
   refreshCsrf(client);
+  // The create takes its package from this header and files the chain under $TMP without it.
+  const createHeaders = { ...transportHeader, ...(pkg !== '$TMP' ? { 'sap-bw4-developmentclass': pkg } : {}) };
 
   // ── Step 2: Create chain with trigger-only skeleton ────────────────────────
   const csrf2 = await client.getCsrfToken();
@@ -1256,7 +1271,7 @@ export async function bwCreateProcessChain(
           oHeader: oHeaderCreate,
         },
       }),
-      writeHeaders(csrf2)
+      { ...writeHeaders(csrf2), ...createHeaders }
     )
     .catch((err: Error) => {
       throw new Error(`Create chain: ${err.message}`);
@@ -1266,8 +1281,11 @@ export async function bwCreateProcessChain(
   // ── Step 3: GET chain for ETag and server-assigned trigger variant key ─────
   let etag: string;
   let triggerVariantKey: string;
+  let actualPackage: string | null = null;
   try {
     const got = await client.rawGet(`${BASE}/${nameLc}`, { Accept: JSON_CT });
+    const reported = got.headers['sap-bw4-developmentclass'];
+    if (typeof reported === 'string' && reported) actualPackage = reported.toUpperCase();
     etag = got.headers['etag'] as string;
     if (!etag) throw new Error('No ETag returned by GET after create');
     const getBody = JSON.parse(got.body);
@@ -1308,6 +1326,7 @@ export async function bwCreateProcessChain(
       'x-csrf-token': csrf4,
       'If-Match': etag,
       'X-Requested-With': 'XMLHttpRequest',
+      ...transportHeader,
     })
     .catch((err: Error) => {
       throw new Error(`PUT full model: ${err.message}`);
@@ -1317,11 +1336,19 @@ export async function bwCreateProcessChain(
   // ── Step 6: Optional activation ───────────────────────────────────────────
   const result: Record<string, unknown> = {
     chain: name,
+    package: actualPackage ?? pkg,
+    packageVerified: actualPackage !== null,
     nodes: 1 + stepNodes.length,
     edges: aEdge.length,
     activated: activate,
   };
+  if (transportHeader['sap-bw4-transportRequest']) result.transportRequest = transportHeader['sap-bw4-transportRequest'];
   if (transportWarning) result.transportWarning = transportWarning;
+  if (actualPackage !== null && actualPackage !== pkg) {
+    result.packageWarning =
+      `Package '${pkg}' was requested but the chain is in '${actualPackage}'. ` +
+      `Reassign it with bw_change_package (object_type "RSPC").`;
+  }
   if (activate) {
     attachActivation(result, await activateChain(client, nameLc));
   }

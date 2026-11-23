@@ -6517,6 +6517,14 @@ const TOOL_DEFINITIONS = [
             type: 'boolean',
             description: 'If true, activate the chain immediately after creation. Default false.',
           },
+          package: {
+            type: 'string',
+            description: 'Development package (default "$TMP").',
+          },
+          transport_request: {
+            type: 'string',
+            description: 'Transport request for a transportable package. Required unless exactly one changeable request is available.',
+          },
         },
         required: ['name', 'infoarea', 'description', 'steps', 'edges'],
       },
@@ -8898,6 +8906,8 @@ async function handleToolCall(
           edges,
           activate: (args?.activate as boolean) ?? false,
           triggerEvent: mapTriggerEvent(args?.trigger_event),
+          package: args?.package as string | undefined,
+          transportRequest: args?.transport_request as string | undefined,
         });
         break;
       }
