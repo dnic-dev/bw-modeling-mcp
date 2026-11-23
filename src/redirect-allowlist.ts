@@ -2,16 +2,18 @@
  * Where an authorization code may be sent.
  *
  * Dynamic client registration is open to anyone who can reach the server, so the redirect URI
- * a client registers is the only thing that decides who receives the code of a user who
- * approves the sign-in. Without a list, any https address is accepted, and a registration
- * under a trustworthy client name turns the consent page into a way to collect other people's
- * tokens. The list is therefore explicit, and the same one applies to the pre-registered
- * client and to dynamically registered ones.
+ * a client registers decides who receives the code of a user who approves the sign-in. Two
+ * things stand between a registration under a trustworthy name and other people's tokens:
+ * the approval page, which shows the user the address the code goes to, and this list.
+ *
+ * The list always applies to the pre-registered client. For dynamically registered clients
+ * it applies in strict mode only: by default any https callback is accepted, so that an MCP
+ * client of any vendor can sign in without the operator knowing its callback in advance.
  */
 import { validateRedirectUri } from '@arc-mcp/xsuaa-auth';
 
 /**
- * Callbacks of the MCP clients this server is used with, allowed without configuration.
+ * Callbacks of the MCP clients this server is used with, known without configuration.
  *
  * Loopback is allowed by pattern (RFC 8252 section 7.3): a code sent there never leaves the
  * user's machine, and native clients pick a free port at runtime. Every other entry is one
@@ -32,6 +34,17 @@ export const DEFAULT_REDIRECT_URIS: readonly string[] = [
   'https://global.consent.azure-apim.net/redirect/**',
   'https://callback.mistral.ai/v1/integrations_auth/oauth2_callback',
 ];
+
+/**
+ * Whether dynamic registration is limited to the list (BW_OAUTH_REDIRECT_STRICT=on).
+ * Anything but on or off stops the start, since a typo must not leave the mode undecided.
+ */
+export function redirectStrictFromEnv(env: NodeJS.ProcessEnv): boolean {
+  const raw = (env.BW_OAUTH_REDIRECT_STRICT ?? '').trim().toLowerCase();
+  if (raw === '' || raw === 'off') return false;
+  if (raw === 'on') return true;
+  throw new Error(`BW_OAUTH_REDIRECT_STRICT must be "on" or "off", not "${env.BW_OAUTH_REDIRECT_STRICT}".`);
+}
 
 const HOST_WILDCARD = /^[a-z][a-z0-9+.-]*:\/\/[^/]*\*/i;
 

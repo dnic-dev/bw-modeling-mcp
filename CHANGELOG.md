@@ -2,11 +2,18 @@
 
 ## [Unreleased]
 
+### Before you update
+
+Most installations need no change. Two points can stop a setup that worked before:
+
+- **The certificate of the BW system is verified** — a system whose certificate comes from an in-house certificate authority needs `NODE_EXTRA_CA_CERTS` pointing at a PEM file with that authority; a system with a self-signed certificate needs `BW_TLS_VERIFY=off`. Without it the connection is refused, and the error names the reason.
+- **On the hosted server every user signs in again once** — a refresh token issued before the update is refused.
+
 ### Security
 
 - **The certificate of the BW system is verified** — HTTPS connections to BW check the server certificate. A system whose certificate comes from an in-house certificate authority needs the Node.js variable `NODE_EXTRA_CA_CERTS` pointing at a PEM file with that authority; a system with a self-signed certificate needs `BW_TLS_VERIFY=off`, which the server reports on start. A refused certificate is answered with the reason and both ways out. **Check your configuration when updating:** a connection that relied on the check being off fails until one of the two is set.
 
-- **Only known redirect targets can be registered on the hosted server** — the OAuth endpoints accept the callbacks of Claude, VS Code, Cursor, Copilot Studio, Mistral and clients on the user's own machine. Any other MCP client or gateway is named in `BW_OAUTH_REDIRECT_URIS`. A client registered earlier with another callback has to be added there before it can sign in again.
+- **Registration on the hosted server can be limited to known redirect targets** — with `BW_OAUTH_REDIRECT_STRICT=on` the OAuth endpoints accept only the callbacks of Claude, VS Code, Cursor, Copilot Studio, Mistral and clients on the user's own machine, plus the ones named in `BW_OAUTH_REDIRECT_URIS`. Without it an MCP client of any vendor registers as before, and the approval page shows the user the address the sign-in returns to.
 
 - **Diagnostic output no longer contains session cookies** — with `BW_DEBUG_SESSION` on, cookie values are written as a length and a short fingerprint, enough to compare two sessions.
 

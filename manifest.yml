@@ -35,6 +35,9 @@ applications:
       # BW_CC_LOCATION_ID: "bw-prod"
       # Public route, if behind a reverse proxy that rewrites Host.
       # BW_PUBLIC_URL: "https://bw-modeling-mcp.example.com"
+      # Limit client registration to the known MCP clients and BW_OAUTH_REDIRECT_URIS.
+      # Off by default, so that a client of any vendor can sign in.
+      # BW_OAUTH_REDIRECT_STRICT: "on"
       # CORS, only for browser-based MCP clients. Native clients do not need it.
       # BW_ALLOWED_ORIGINS: "https://claude.ai"
     services:

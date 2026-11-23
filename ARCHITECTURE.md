@@ -217,7 +217,7 @@ src/
 ├── auth.ts               # OAuth endpoints in front of /mcp: redirect allowlist, client credentials in the header,
 │                         # refresh tokens bound to their client, rate limits that fit shared addresses
 ├── refresh-binding.ts    # sealing a refresh token to the client it was issued to
-├── redirect-allowlist.ts # the redirect URIs an MCP client may register
+├── redirect-allowlist.ts # the known redirect URIs and the strict mode that limits registration to them
 ├── transport-guard.ts    # Host and Origin check and the per-user rate limit of /mcp
 ├── redact.ts             # errors sent to a remote caller: backend address taken out, response documents reduced to their message
 ├── request-path.ts       # every request to BW checked for relative segments and foreign addresses before it is sent

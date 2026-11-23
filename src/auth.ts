@@ -25,7 +25,7 @@ import { InvalidGrantError } from '@modelcontextprotocol/sdk/server/auth/errors.
 import { requireBearerAuth } from '@modelcontextprotocol/sdk/server/auth/middleware/bearerAuth.js';
 import { mcpAuthRouter } from '@modelcontextprotocol/sdk/server/auth/router.js';
 import type { OAuthClientInformationFull, OAuthTokens } from '@modelcontextprotocol/sdk/shared/auth.js';
-import { redirectAllowlistFromEnv } from './redirect-allowlist.js';
+import { redirectAllowlistFromEnv, redirectStrictFromEnv } from './redirect-allowlist.js';
 import { RefreshTokenBinding, SEALED_PREFIX } from './refresh-binding.js';
 
 type XsuaaCredentials = Parameters<typeof createXsuaaOAuthProvider>[0];
@@ -44,8 +44,10 @@ const ONE_HOUR = 60 * 60 * 1000;
 const CLIENT_AUTH_METHODS = ['client_secret_basic', 'client_secret_post', 'none'];
 
 export interface OAuthSettings {
-  /** Allowed redirect URIs and patterns. */
+  /** Redirect URIs and patterns of the known clients. */
   redirectUris: string[];
+  /** Whether dynamic registration is limited to redirectUris. */
+  redirectStrict: boolean;
   /** Requests per address per 15 minutes on /authorize, /token and /revoke. */
   rateLimit: number;
   /** Registrations per address per hour on /register. */
@@ -74,6 +76,7 @@ function whole(env: NodeJS.ProcessEnv, name: string, fallback: number): number {
 export function oauthSettingsFromEnv(env: NodeJS.ProcessEnv): OAuthSettings {
   return {
     redirectUris: redirectAllowlistFromEnv(env),
+    redirectStrict: redirectStrictFromEnv(env),
     rateLimit: whole(env, 'BW_OAUTH_RATE_LIMIT', 300),
     registerRateLimit: whole(env, 'BW_OAUTH_REGISTER_RATE_LIMIT', 60),
     gatewayIps: list(env.BW_OAUTH_GATEWAY_IPS),
@@ -213,11 +216,13 @@ export function setupOAuth(app: Express, options: OAuthOptions, log: Logger): Re
     // locked it out until the connection was recreated by hand. Narrowing the redirect list or
     // rotating the signing secret still withdraws registrations.
     dcrTtlSeconds: 0,
-    // Without these the library admits any https redirect URI at registration. The same list
-    // gates the pre-registered client and is re-applied to every signed client_id when it is
-    // loaded, so narrowing it also withdraws earlier registrations.
+    // The list always gates the pre-registered client. A dynamically registered client may
+    // name any https callback unless the operator switched the strict mode on: the approval
+    // page shows the user where the code goes, and a list of known vendors would lock out
+    // every MCP client that is not on it. In strict mode the list is re-applied to every
+    // signed client_id when it is loaded, so switching it on withdraws earlier registrations.
     redirectUriPatterns: settings.redirectUris,
-    dcrRedirectUriPatterns: settings.redirectUris,
+    dcrRedirectUriPatterns: settings.redirectStrict ? settings.redirectUris : undefined,
     logger: log,
   });
 
