@@ -1,5 +1,5 @@
 import { BwClient } from '../bw-client.js';
-import { withQueryDocument, escapeXml, escapeRegex, locateMainComponentRegion } from './query_update.js';
+import { withQueryDocument, escapeXml, escapeRegex, locateMainComponentRegion, type SaveContext } from './query_update.js';
 
 /**
  * bw_update_query_characteristic — the display and access properties a BW Query
@@ -93,15 +93,18 @@ function valuePresentationEl(displayAs: DisplayAs, textType: TextType | undefine
 
 /**
  * Written in the form of the BWMT save: shortValue keeps the InfoObject short text,
- * languageToText carries the override in the logon language.
+ * languageToText carries the override in the language of the save. The value attribute is
+ * what BW stores in that language; without a known language, languageToText is left out
+ * rather than guessed.
  */
-function descriptionEl(current: string | undefined, text: string): string {
+function descriptionEl(current: string | undefined, text: string, language?: string): string {
   if (text === 'default') return '<Qry:description default="true"/>';
   if (text.length > 60) throw new Error(`description "${text}" is longer than 60 characters.`);
   const shortValue = current?.match(/\bshortValue="([^"]*)"/)?.[1];
-  const lang = current?.match(/<Qry:languageToText\b[^>]*\bkey="([^"]*)"/)?.[1] ?? 'DE';
+  const lang = language ?? current?.match(/<Qry:languageToText\b[^>]*\bkey="([^"]*)"/)?.[1];
   const shortAttr = shortValue !== undefined ? ` shortValue="${shortValue}"` : '';
   const v = escapeXml(text);
+  if (!lang) return `<Qry:description default="false"${shortAttr} value="${v}"/>`;
   return `<Qry:description default="false"${shortAttr} value="${v}"><Qry:languageToText key="${lang}" value="${v}"/></Qry:description>`;
 }
 
@@ -334,18 +337,18 @@ function applyHierarchy(element: string, spec: HierarchySpec, applied: string[])
   return element.slice(0, range.start) + hier + element.slice(range.end);
 }
 
-function applyToDimension(block: DimensionBlock, spec: CharacteristicSpec, applied: string[]): string {
+function applyToDimension(block: DimensionBlock, spec: CharacteristicSpec, applied: string[], language?: string): string {
   let element = block.element;
   const what = `characteristic ${block.infoobject}`;
 
   if (spec.description !== undefined) {
     const current = findDirectChild(element, 'description');
     if (current) {
-      element = replaceDirectChild(element, 'description', descriptionEl(current, spec.description), what);
+      element = replaceDirectChild(element, 'description', descriptionEl(current, spec.description, language), what);
     } else {
       // Insert right after the opening tag of the Dimension block.
       const openEnd = element.indexOf('>') + 1;
-      element = element.slice(0, openEnd) + descriptionEl(undefined, spec.description) + element.slice(openEnd);
+      element = element.slice(0, openEnd) + descriptionEl(undefined, spec.description, language) + element.slice(openEnd);
     }
     applied.push('description');
   }
@@ -398,7 +401,8 @@ export interface AppliedReport {
 export function applyCharacteristicSpecs(
   xml: string,
   specs: CharacteristicSpec[],
-  report: AppliedReport[] = []
+  report: AppliedReport[] = [],
+  language?: string
 ): string {
   let doc = xml;
   for (const spec of specs) {
@@ -422,7 +426,7 @@ export function applyCharacteristicSpecs(
     // Apply back to front so earlier offsets stay valid while the document grows.
     for (const block of [...blocks].reverse()) {
       const applied: string[] = [];
-      const mutated = applyToDimension(block, spec, applied);
+      const mutated = applyToDimension(block, spec, applied, language);
       doc = doc.slice(0, block.start) + mutated + doc.slice(block.end);
       report.push({ characteristic: block.infoobject, axis: block.container, applied });
     }
@@ -446,13 +450,20 @@ export async function bwUpdateQueryCharacteristic(
   }
 
   const report: AppliedReport[] = [];
-  const mutate = (xml: string): string => applyCharacteristicSpecs(xml, args.characteristics, report);
+  let textLanguage: string | undefined;
+  const mutate = (xml: string, ctx: SaveContext): string => {
+    textLanguage = ctx.language;
+    return applyCharacteristicSpecs(xml, args.characteristics, report, ctx.language);
+  };
 
   const { messages } = await withQueryDocument(client, args.query_name, mutate, args.transport);
   return JSON.stringify({
     success: true,
     query_name: args.query_name.toUpperCase(),
     characteristics: report.sort((a, b) => a.characteristic.localeCompare(b.characteristic)),
+    ...(args.characteristics.some((c) => c.description !== undefined && c.description !== 'default')
+      ? { description_language: textLanguage ?? 'logon language' }
+      : {}),
     check_messages: messages,
   });
 }

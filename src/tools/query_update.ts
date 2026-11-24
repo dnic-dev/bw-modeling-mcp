@@ -550,20 +550,96 @@ export async function bindTextVariables(client: BwClient, doc: string): Promise<
   return uids.size ? bindDescriptionVariables(out, uids) : out;
 }
 
+/** The `adtCore:masterLanguage` (ISO) of the entity named `objectName` in a document. */
+export function masterLanguageOf(doc: string, objectName: string): string | undefined {
+  const want = objectName.toUpperCase();
+  for (const m of doc.matchAll(/<Qry:entityProperties\b[^>]*>/g)) {
+    if (m[0].match(/\badtCore:name="([^"]*)"/i)?.[1]?.toUpperCase() !== want) continue;
+    return m[0].match(/\badtCore:masterLanguage="([^"]+)"/i)?.[1]?.toUpperCase();
+  }
+  return undefined;
+}
+
+/**
+ * The elements a document gives an explicit empty text (`default="false" value=""`), named by
+ * their technical name or id. A save stores each of them as "empty text"
+ * (RSZELTDIR-DEFAULTTEXT = 'E'), and front ends then show the element's technical id.
+ */
+export function emptyTextElements(doc: string): string[] {
+  const owners = [...doc.matchAll(/<Qry:\w+\b[^<>]*\bid="([^"]+)"[^<>]*>/g)];
+  const names: string[] = [];
+  let next = 0;
+  for (const m of doc.matchAll(/<Qry:description\s+default="false"(?:\s+shortValue="")?\s+value=""\s*\/>/g)) {
+    while (next < owners.length && owners[next].index! < m.index!) next++;
+    const owner = owners[next - 1];
+    if (!owner) continue;
+    names.push(owner[0].match(/\btechnicalName="([^"]+)"/)?.[1] ?? owner[1]);
+  }
+  return names;
+}
+
+export interface SaveRead {
+  body: string;
+  timestamp: string;
+  /** The logon language of the read (ISO), which the save must use too. */
+  language?: string;
+}
+
+/**
+ * Read an object for a read-modify-write save: through a new session with forceCacheUpdate, in
+ * the object's master language.
+ *
+ * A new session with forceCacheUpdate, like freshRead: a read from a used session or from the
+ * backend's buffer can miss changes made since (another save, a translation), and the save then
+ * writes the old state back.
+ *
+ * The master language, because without multi-language query editing (the default) the document
+ * carries the texts of the logon language only, and the save (RSZ_P_DB_ELT_SET_IMMEDIATELY)
+ * deletes every element text of that language and inserts the ones the document carries. In
+ * another language, an element without a text there comes back as `default="false" value=""` and
+ * is saved as "empty text" (RSZELTDIR-DEFAULTTEXT = 'E'). The texts of the other languages stay.
+ */
+export async function readForSave(path: string, accept: string, objectName: string): Promise<SaveRead> {
+  const url = `${path}${path.includes('?') ? '&' : '?'}forceCacheUpdate=true`;
+  const reader = createClientFromEnv();
+  let result = await reader.get(url, accept);
+  let language = reader.language?.toUpperCase();
+  const master = masterLanguageOf(result.body, objectName);
+  if (master && master !== language) {
+    result = await createClientFromEnv(master).get(url, accept);
+    language = master;
+  }
+  const timestamp = result.headers['timestamp'];
+  if (!timestamp) {
+    throw new Error(`No timestamp header on GET ${path} — cannot do optimistic locking.`);
+  }
+  return { body: result.body, timestamp, language };
+}
+
+/** A save message naming the elements the saved document gives an empty text, if any. */
+export function emptyTextNote(doc: string, language: string | undefined): string[] {
+  const empty = emptyTextElements(doc);
+  if (empty.length === 0) return [];
+  return [`Saved in ${language ?? 'the logon language'}: ${empty.length} element(s) have no text in this ` +
+    `language and are stored as empty text (RSZELTDIR-DEFAULTTEXT = 'E'): ${empty.join(', ')}`];
+}
+
+/** What a save cycle tells the mutation about the document it changes. */
+export interface SaveContext {
+  /** The logon language (ISO) the document was read in and is saved in. */
+  language?: string;
+}
+
 export async function withQueryDocument(
   client: BwClient,
   queryName: string,
-  mutate: (xml: string) => string,
+  mutate: (xml: string, ctx: SaveContext) => string,
   corrNr?: string,
 ): Promise<{ messages: string[] }> {
   const nameLower = queryName.toLowerCase();
   const path = `/sap/bw/modeling/query/${bwSeg(nameLower)}/a`;
 
-  const getResult = await client.get(path, queryAccept());
-  const timestamp = getResult.headers['timestamp'];
-  if (!timestamp) {
-    throw new Error(`No timestamp header on GET ${path} — cannot do optimistic locking.`);
-  }
+  const { body, timestamp, language } = await readForSave(path, queryAccept(), queryName);
 
   const csrf = await client.getCsrfToken();
   const lockResponse = await client.rawPost(`${path}?action=lock`, '', {
@@ -579,8 +655,9 @@ export async function withQueryDocument(
   const lockHandle = lockMatch[1];
 
   try {
-    const client2 = createClientFromEnv();
-    const mutated = await bindTextVariables(client2, mutate(stripCheckMarkers(getResult.body)));
+    // The save runs in the language of the read: it rewrites the texts of that language only.
+    const client2 = createClientFromEnv(language);
+    const mutated = await bindTextVariables(client2, mutate(stripCheckMarkers(body), { language }));
 
     const csrf2 = await client2.getCsrfToken();
     const corrNrPrefix = corrNr ? `corrNr=${corrNr}&` : '';
@@ -596,6 +673,7 @@ export async function withQueryDocument(
       });
 
     const messages = parseCheckResult(putResponse.body);
+    messages.push(...emptyTextNote(mutated, language));
     await client.get(`${path}?forceCacheUpdate=true`, queryAccept());
     return { messages };
   } finally {
