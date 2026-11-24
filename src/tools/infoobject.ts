@@ -234,7 +234,7 @@ export function referenceFromXml(name: string, xml: string, args: CreateInfoObje
   if (args.length !== undefined && Number(args.length) !== ref.length) {
     clash.push(`length ${args.length} (reference: ${ref.length})`);
   }
-  if (args.conversion_routine !== undefined && args.conversion_routine !== ref.conversionRoutine) {
+  if (args.conversion_routine !== undefined && args.conversion_routine.toUpperCase() !== ref.conversionRoutine.toUpperCase()) {
     clash.push(`conversion_routine ${args.conversion_routine || '""'} (reference: ${ref.conversionRoutine || '""'})`);
   }
   if (clash.length) {
