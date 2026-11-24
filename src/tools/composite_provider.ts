@@ -232,8 +232,15 @@ export async function bwGetCompositeProvider(
       dimName.includes('__KEYFIGURES');
     const globalName = attr(compositeInlineType(elemBody), 'globalElementName');
     const navigationAttributes = elementNavigationAttributes(elemBody);
+    const label = decodeXmlEntities(
+      elemBody.match(/<localProperties\b[^>]*>([\s\S]*?)<\/localProperties>/)?.[1]
+        .match(/<descriptions\b[^>]*\blabel="([^"]*)"/)?.[1] ??
+        elemBody.match(/<endUserTexts\b[^>]*\blabel="([^"]*)"/)?.[1] ??
+        ''
+    );
     fields.push({
       name,
+      ...(label ? { description: label } : {}),
       ...(infoObjectName ? { info_object_name: infoObjectName } : {}),
       ...(infoObjectName ? { name_usage: globalName ? 'direct' : 'unique_name' } : {}),
       dimension: dimName,
@@ -1871,24 +1878,26 @@ export async function bwUpdateCompositeProviderFields(
           .replace(inlineType, withGlobalElementName(inlineType, infoObjectName))
           .replace(/\s*<authorizationRelevant>[^<]*<\/authorizationRelevant>/, '');
       } else {
-        newElement = newElement.replace(inlineType, withGlobalElementName(inlineType, undefined));
+        newElement = withLocalNavigationAttributeNames(
+          newElement.replace(inlineType, withGlobalElementName(inlineType, undefined)),
+          usedFieldNames(xml)
+        );
       }
       result['name_usage'] = nameUsage;
     }
 
     if (description !== undefined) {
       const label = description.trim().replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
-      if (attr(openTag, 'infoObjectName')) {
-        // A field bound to an InfoObject shows the text of the InfoObject; a text of its own is a
-        // local property of the field, and the server puts the InfoObject text back anywhere else.
-        const local = newElement.match(/<localProperties\b([^>]*?)(?:\/>|>([\s\S]*?)<\/localProperties>)/);
-        if (!local) {
-          skipped.push({ field, reason: 'the element carries no local properties to hold a description of its own' });
-          continue;
-        }
+      // The text of a field is a local property: the server puts the InfoObject text back into
+      // <endUserTexts> and drops a text there on a field without one.
+      const local = newElement.match(/<localProperties\b([^>]*?)(?:\/>|>([\s\S]*?)<\/localProperties>)/);
+      if (local) {
         const inner = (local[2] ?? '').replace(/<descriptions\b[^>]*\/>/, '');
         const own = label ? `<descriptions label="${label}"/>` : '';
         newElement = newElement.replace(local[0], () => `<localProperties${local[1]}>${own}${inner}</localProperties>`);
+      } else if (attr(openTag, 'infoObjectName')) {
+        skipped.push({ field, reason: 'the element carries no local properties to hold a description of its own' });
+        continue;
       } else {
         const texts = newElement.match(/<endUserTexts\b[^>]*\/>/)?.[0];
         newElement = texts
@@ -2313,6 +2322,50 @@ export function withNavigationAttributes(
   return xml;
 }
 
+/** Field names and local navigation attribute names a view node already uses. */
+export function usedFieldNames(xml: string): Set<string> {
+  const names = new Set<string>();
+  for (const m of xml.matchAll(/<element\b[^>]*\bname="([^"]+)"/g)) names.add(m[1]);
+  for (const m of xml.matchAll(/<navigationAttribute\b[^>]*>[\s\S]*?<alias>([^<]*)<\/alias>/g)) names.add(m[1]);
+  return names;
+}
+
+/**
+ * The local name the modeling tools propose for a navigation attribute: the attribute name
+ * cut to the 12 characters of a field name, numbered when another field already has it.
+ */
+export function localNavigationAttributeName(navigationAttribute: string, used: Set<string>): string {
+  let base = navigationAttribute.toUpperCase();
+  while (/\W/.test(base) || /^[^0-9A-Z]/.test(base) || base.includes('__')) base = base.slice(1);
+  if (base.length < 2) base = `F_${base}`;
+  base = base.slice(0, 12).replace(/_+$/, '');
+  let name = base;
+  for (let i = 0; used.has(name); i++) {
+    const keep = i >= 100 ? 8 : i >= 10 ? 9 : 10;
+    name = `${base.slice(0, keep).replace(/_+$/, '')}${i}`;
+  }
+  return name;
+}
+
+/**
+ * Give every navigation attribute of an element without a local name one. A field that is
+ * not exposed under its InfoObject name needs them, otherwise activation asks for one.
+ */
+export function withLocalNavigationAttributeNames(elementXml: string, used: Set<string>): string {
+  return elementXml.replace(
+    /<navigationAttribute\b([^>]*?)(?:\/>|>([\s\S]*?)<\/navigationAttribute>)/g,
+    (whole, attrs: string, body: string | undefined) => {
+      if (body?.includes('<alias>')) return whole;
+      const name = localNavigationAttributeName(attr(attrs, 'infoObjectName'), used);
+      used.add(name);
+      const inner = body ?? '';
+      const at = inner.search(/<localProperties\b/);
+      const withAlias = at < 0 ? `${inner}<alias>${name}</alias>` : `${inner.slice(0, at)}<alias>${name}</alias>${inner.slice(at)}`;
+      return `<navigationAttribute${attrs}>${withAlias}</navigationAttribute>`;
+    }
+  );
+}
+
 /**
  * Whether a part provider can deliver a navigation attribute. An InfoObject-based provider
  * such as an aDSO derives every navigation attribute from its characteristics and says so
@@ -2393,16 +2446,20 @@ export async function bwUpdateCompositeProviderNavigationAttributes(
     for (const im of viewNode.matchAll(/<input\b([^>]*)>([\s\S]*?)<\/input>/g)) {
       const mapsField = new RegExp(`<mapping\\b[^>]*\\btargetName="${escapeRegex(field)}"`).test(im[2]);
       const provider = extractProviderNameFromInput(im[2]);
-      if (!mapsField || !provider) continue;
+      // A SAP HANA view has no BW provider view; BW resolves the attribute through the InfoObject.
+      if (!mapsField || !provider || parseHanaViewName(provider)) continue;
       const sourceXml = (await freshRead(`/sap/bw/modeling/infoprov/${bwSegUpper(provider)}/a?view=dt`, IPROV_ACCEPT)).body;
       const missing = changed.filter((n) => !sourceSupportsNavigationAttribute(sourceXml, n));
       if (missing.length) unsupported.push({ input_alias: attr(im[1], 'alias'), provider, navigation_attributes: missing });
     }
   }
 
-  const newElement = enabled
+  let newElement = enabled
     ? withNavigationAttributes(element, requested.filter((a) => changed.includes(a.name)), [])
     : withNavigationAttributes(element, [], changed);
+  if (enabled && !attr(compositeInlineType(element), 'globalElementName')) {
+    newElement = withLocalNavigationAttributeNames(newElement, usedFieldNames(xml));
+  }
   xml = xml.replace(element, () => newElement);
   const lockHandle = await putModel(client, compositeProviderName, xml, timestamp, opts.transport);
 
