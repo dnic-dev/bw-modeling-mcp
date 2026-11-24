@@ -754,6 +754,41 @@ export interface FieldMapping {
   dimension?: string;
 }
 
+const MAPPING_KEYS = ['target', 'source', 'constant_value', 'info_object_name', 'name_usage', 'dimension'];
+
+/**
+ * The `mappings` argument of the tool as field mappings. A key the tool does not know is
+ * refused: dropping it would build the CompositeProvider without what the caller asked for.
+ */
+export function parseFieldMappings(raw: unknown): FieldMapping[] {
+  if (raw === undefined || raw === null) return [];
+  if (!Array.isArray(raw)) throw new Error('mappings must be a list of objects.');
+  return raw.map((m, i) => {
+    if (!m || typeof m !== 'object' || Array.isArray(m)) throw new Error(`mappings[${i}] must be an object.`);
+    const entry = m as Record<string, unknown>;
+    const unknown = Object.keys(entry).filter((k) => !MAPPING_KEYS.includes(k));
+    if (unknown.length) {
+      throw new Error(
+        `mappings[${i}] has unknown key(s) ${unknown.join(', ')}; allowed: ${MAPPING_KEYS.join(', ')}. Nothing was changed.`
+      );
+    }
+    if (typeof entry.target !== 'string' || !entry.target.trim()) throw new Error(`mappings[${i}] requires target.`);
+    const text = (k: string) => (entry[k] === undefined || entry[k] === null ? undefined : String(entry[k]));
+    const nameUsage = text('name_usage');
+    if (nameUsage !== undefined && nameUsage !== 'direct' && nameUsage !== 'unique_name') {
+      throw new Error(`mappings[${i}].name_usage must be "direct" or "unique_name".`);
+    }
+    return {
+      target: entry.target,
+      source: text('source'),
+      constantValue: text('constant_value'),
+      infoObjectName: text('info_object_name'),
+      nameUsage: nameUsage as NameUsage | undefined,
+      dimension: text('dimension'),
+    };
+  });
+}
+
 /** Defaults for every target element one call creates; a mapping's own setting wins. */
 export interface NewElementDefaults {
   nameUsage?: NameUsage;

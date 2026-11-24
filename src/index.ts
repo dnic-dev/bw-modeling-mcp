@@ -64,7 +64,7 @@ import {
   bwUpdateCompositeProviderFields,
   bwUpdateCompositeProviderGroup,
   bwUpdateCompositeProviderNavigationAttributes,
-  NameUsage, bwUpdateCompositeProviderFilter, bwReplaceCompositeProviderInput, bwInsertCompositeProviderNode, bwRemoveCompositeProviderNode, bwUpdateCompositeProviderTemporalJoin } from './tools/composite_provider.js';
+  NameUsage, parseFieldMappings, bwUpdateCompositeProviderFilter, bwReplaceCompositeProviderInput, bwInsertCompositeProviderNode, bwRemoveCompositeProviderNode, bwUpdateCompositeProviderTemporalJoin } from './tools/composite_provider.js';
 import { bwUpdateCompositeProvider, CompositeProviderFieldAction } from './tools/composite_provider_update.js';
 import { selectNode, scopeNotes } from './tools/composite_provider_nodes.js';
 import { bwGetCkf, bwGetRkf, bwGetStructure, bwGetVariable } from './tools/cp_components.js';
@@ -8330,14 +8330,7 @@ async function handleToolCall(
         const cpAction = (args?.action as string | undefined) ?? 'add_field';
         selectNode(args?.node as string | undefined);
         const cpTransport = args?.transport as string | undefined;
-        const cpMappings = ((args?.mappings as Array<Record<string, string>> | undefined) ?? []).map((m) => ({
-          target: m.target,
-          source: m.source,
-          constantValue: m.constant_value,
-          infoObjectName: m.info_object_name,
-          nameUsage: m.name_usage as NameUsage | undefined,
-          dimension: m.dimension,
-        }));
+        const cpMappings = parseFieldMappings(args?.mappings);
         const cpDefaults = {
           nameUsage: args?.name_usage as NameUsage | undefined,
           dimension: args?.dimension as string | undefined,
