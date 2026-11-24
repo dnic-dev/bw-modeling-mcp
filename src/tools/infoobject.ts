@@ -25,6 +25,7 @@ function characteristicCreateXml(o: {
   withTexts: boolean;
   language: string;
   responsible: string;
+  referencedXml?: string;
 }): string {
   const conv = o.conversionRoutine ? ` conversionRoutine="${o.conversionRoutine}"` : '';
   return `<?xml version="1.0" encoding="UTF-8"?>
@@ -37,7 +38,7 @@ function characteristicCreateXml(o: {
   <tlogoProperties adtcore:language="${o.language}" adtcore:name="${o.name}" adtcore:type="IOBJ" adtcore:masterLanguage="${o.language}" adtcore:responsible="${o.responsible}">
     <infoArea>${o.infoArea}</infoArea>
   </tlogoProperties>
-  <referencedInfoObject/>
+  ${o.referencedXml ?? '<referencedInfoObject/>'}
   <length>${o.length}</length>
   <displayProperties><display>2</display><selection>0</selection></displayProperties>
   <queryFilterValue forQueryDefinition="D"/>
@@ -170,6 +171,78 @@ export function setUnitCurrencyReference(xml: string, infoObject: string): strin
  * 5. PUT /iobj/{name}/m             → GET response with desired values substituted
  * 6. Return lockHandle for caller to use with bw_activate
  */
+function xmlAttr(value: string | undefined): string {
+  return String(value ?? '').replace(/&/g, '&amp;').replace(/"/g, '&quot;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+}
+
+/** The characteristic that a new characteristic references, as read from BW. */
+export interface CharacteristicReference {
+  name: string;
+  description: string;
+  shortDescription: string;
+  dataType: string;
+  length: number;
+  conversionRoutine: string;
+  withMasterData: boolean;
+  /** The referenced characteristic's own <textProperties> open tag, copied into the PUT. */
+  textTag?: string;
+  withTexts: boolean;
+}
+
+/**
+ * The <referencedInfoObject> element of a reference characteristic, in the form the server
+ * returns it (GET of 0SOLD_TO, which references 0CUSTOMER, on 7.5). Without it the create
+ * posts and PUTs an empty element, and BW makes a stand-alone characteristic with the
+ * default type CHAR 10.
+ */
+export function referencedInfoObjectXml(ref: CharacteristicReference): string {
+  return `<referencedInfoObject ref="iobj:Characteristic ${ref.name}.iobj#//" name="${ref.name}"` +
+    ` infoObjectType="CHA" description="${xmlAttr(ref.description)}" shortDescription="${xmlAttr(ref.shortDescription)}"/>`;
+}
+
+/**
+ * Read what a reference takes from the referenced characteristic, and check that the
+ * reference can be made. The data type, length and conversion routine come from it; an
+ * argument that says otherwise is refused rather than overwritten.
+ */
+export function referenceFromXml(name: string, xml: string, args: CreateInfoObjectArgs): CharacteristicReference {
+  const facts = parseInfoObjectFacts(name, xml);
+  if (facts.objectType !== 'CHA') {
+    throw new Error(`referenced_infoobject '${facts.name}' is a ${facts.objectType}; a reference needs a characteristic (CHA).`);
+  }
+  if (facts.referencedInfoObject) {
+    throw new Error(`referenced_infoobject '${facts.name}' is itself a reference to ${facts.referencedInfoObject}. Reference ${facts.referencedInfoObject} instead.`);
+  }
+  const props = parseInfoObjectProps(xml);
+  const masterDataTag = xml.match(/<masterDataProperties(\s[^>]*)?>/)?.[0] ?? '';
+  const textTag = xml.match(/<textProperties(\s[^>]*)?>/)?.[0];
+  const ref: CharacteristicReference = {
+    name: facts.name,
+    description: xml.match(/<longDescription>([^<]*)<\/longDescription>/)?.[1] ?? props.label,
+    shortDescription: props.label,
+    dataType: props.dataType,
+    length: Number(props.length),
+    conversionRoutine: props.conversionRoutine,
+    withMasterData: /\bwithMasterData="true"/.test(masterDataTag),
+    textTag,
+    withTexts: /\bwithTexts="true"/.test(textTag ?? ''),
+  };
+  const clash: string[] = [];
+  if (args.data_type && args.data_type.toUpperCase() !== ref.dataType) {
+    clash.push(`data_type ${args.data_type.toUpperCase()} (reference: ${ref.dataType})`);
+  }
+  if (args.length !== undefined && Number(args.length) !== ref.length) {
+    clash.push(`length ${args.length} (reference: ${ref.length})`);
+  }
+  if (args.conversion_routine !== undefined && args.conversion_routine !== ref.conversionRoutine) {
+    clash.push(`conversion_routine ${args.conversion_routine || '""'} (reference: ${ref.conversionRoutine || '""'})`);
+  }
+  if (clash.length) {
+    throw new Error(`A reference characteristic takes its type from ${ref.name}. Leave these out or match them: ${clash.join(', ')}.`);
+  }
+  return ref;
+}
+
 export async function bwCreateInfoObject(
   client: BwClient,
   args: CreateInfoObjectArgs
@@ -185,6 +258,14 @@ export async function bwCreateInfoObject(
     throw new Error('lower_case applies to Characteristics (CHA) only — remove it for a Key Figure.');
   }
   validateUnitCurrencyArgs(args, isobjType === 'KYF');
+
+  // Read the referenced characteristic before the CREA lock, through its own session.
+  let reference: CharacteristicReference | undefined;
+  if (isobjType === 'CHA' && args.referenced_infoobject) {
+    const refName = args.referenced_infoobject.toUpperCase();
+    const refGet = await createClientFromEnv().get(`/sap/bw/modeling/iobj/${bwSeg(refName.toLowerCase())}/a`, MEDIA_TYPES['iobj']);
+    reference = referenceFromXml(refName, refGet.body, args);
+  }
   const responsible = await resolveLogonUser(client);
 
   // Step 1: Lock with CREA headers (stateful_enqueue session)
@@ -345,14 +426,15 @@ export async function bwCreateInfoObject(
           name: nameUpper,
           infoArea,
           description: desc,
-          dataType: (args.data_type ?? 'CHAR').toUpperCase(),
-          length: args.length ?? 10,
-          conversionRoutine: args.conversion_routine
+          dataType: reference?.dataType ?? (args.data_type ?? 'CHAR').toUpperCase(),
+          length: reference?.length ?? args.length ?? 10,
+          conversionRoutine: reference ? reference.conversionRoutine : args.conversion_routine
             ?? (((args.data_type ?? 'CHAR').toUpperCase() === 'CHAR' || (args.data_type ?? 'CHAR').toUpperCase() === 'NUMC') ? 'ALPHA' : ''),
-          withMasterData: args.with_master_data ?? false,
-          withTexts: args.with_texts ?? false,
+          withMasterData: reference ? reference.withMasterData : (args.with_master_data ?? false),
+          withTexts: reference ? reference.withTexts : (args.with_texts ?? false),
           language: process.env.BW_LANGUAGE ?? 'DE',
           responsible,
+          referencedXml: reference ? referencedInfoObjectXml(reference) : undefined,
         })
       : minimalXml;
     await client.create('iobj', nameLower, lockHandle, createXml, { 'Development-Class': pkg });
@@ -373,12 +455,13 @@ export async function bwCreateInfoObject(
     // Normalise masterDataAccess — GET returns type="GEN" but PUT expects explicit empty attrs
     putXml = putXml.replace(/<masterDataAccess[^/]*\/>/, '<masterDataAccess readClass="" sapHanaPackage="" sapHanaView=""/>');
 
-    const chaDataType = (args.data_type ?? 'CHAR').toUpperCase();
-    const chaLength = args.length ?? 10;
+    const chaDataType = reference?.dataType ?? (args.data_type ?? 'CHAR').toUpperCase();
+    const chaLength = reference?.length ?? args.length ?? 10;
     const defaultConv = (chaDataType === 'CHAR' || chaDataType === 'NUMC') ? 'ALPHA' : '';
-    const chaConv = args.conversion_routine ?? defaultConv;
-    const withMasterData = args.with_master_data ?? false;
-    const withTexts = args.with_texts ?? false;
+    const chaConv = reference ? reference.conversionRoutine : (args.conversion_routine ?? defaultConv);
+    // A reference characteristic shares the master data and texts of the referenced one.
+    const withMasterData = reference ? reference.withMasterData : (args.with_master_data ?? false);
+    const withTexts = reference ? reference.withTexts : (args.with_texts ?? false);
     const lowerCase = args.lower_case ?? false;
 
     // Root element attributes
@@ -402,7 +485,18 @@ export async function bwCreateInfoObject(
     );
 
     // textProperties — set withTexts / shortTextAvailable / languageDependentTextAvailable
-    if (withTexts) {
+    if (reference) {
+      if (reference.textTag) {
+        putXml = putXml.replace(/<textProperties(\s[^>]*)?>/, reference.textTag);
+      }
+      if (/<referencedInfoObject\b[^>]*\/>/.test(putXml)) {
+        putXml = putXml.replace(/<referencedInfoObject\b[^>]*\/>/, referencedInfoObjectXml(reference));
+      } else if (/<length>/.test(putXml)) {
+        putXml = putXml.replace(/<length>/, `${referencedInfoObjectXml(reference)}<length>`);
+      } else {
+        throw new Error('Cannot place the reference: the characteristic XML has no <referencedInfoObject> or <length> element.');
+      }
+    } else if (withTexts) {
       putXml = putXml.replace(
         /<textProperties(\s[^>]*)?>/,
         `<textProperties shortTextAvailable="true" withTexts="true">`
@@ -482,6 +576,16 @@ export async function bwCreateInfoObject(
 
     // Step 7: PUT — applies the correct values
     await client.put('iobj', nameLower, lockHandle, putXml, timestamp, args.transport);
+
+    // Read the reference back: the reply names only what BW kept.
+    if (reference) {
+      const back = await createClientFromEnv().get(`/sap/bw/modeling/iobj/${bwSeg(nameLower)}/m`, MEDIA_TYPES['iobj']);
+      const kept = parseInfoObjectFacts(nameUpper, back.body).referencedInfoObject;
+      if (kept !== reference.name) {
+        throw new Error(`BW did not keep the reference: '${nameUpper}' references ${kept ?? 'nothing'} after the save, not ${reference.name}. ` +
+          'The inactive object is left as it is; check it in RSD1 and delete it there.');
+      }
+    }
 
     const resultExtra: Record<string, unknown> = {
       dataType: chaDataType,
