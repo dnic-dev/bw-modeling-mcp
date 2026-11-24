@@ -1,5 +1,21 @@
 # Changelog
 
+## [Unreleased]
+
+### Fixed
+
+- **Descriptions of fields without an InfoObject are kept** — `update_fields` with `field_description` on a plain field, for example one fed by a SAP HANA view, stores the text where the server keeps it. Before, the call reported success and the text was dropped on save.
+
+- **Navigation attributes on CompositeProviders with SAP HANA view inputs** — `update_navigation_attributes` no longer stops with HTTP 404 when one of the inputs that supply the field is a SAP HANA view; BW resolves the attribute through the InfoObject.
+
+- **Navigation attributes on fields with a unique name activate** — a field that is not exposed under its InfoObject name needs a local name for each navigation attribute. `update_navigation_attributes` now assigns one the way the modeling tools propose it, and so does switching such a field to `name_usage: "unique_name"`. Before, activation asked for the local name.
+
+- **Unknown keys in `mappings` are refused** — `add_input` and `update_mapping` answer a mapping with a key the tool does not know, or with an invalid `name_usage`, with the allowed keys, and nothing is written. Before, the key was dropped and the CompositeProvider was built without the requested binding.
+
+### Improved
+
+- **`bw_read` lists field descriptions of a CompositeProvider** — every field in the result carries its `description`.
+
 ## [2.1.0] — 2026-11-23
 
 ### Before you update
