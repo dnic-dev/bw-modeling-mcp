@@ -20,6 +20,8 @@
 
 ### Improved
 
+- **Red InfoPackage requests show why they failed** — on a classic release, `bw_read_metadata_tables` with `ISIP` lists under each red request of the load history its error messages from the monitor log, with the message text in the logon language and the file the request read. With `RSPCLOG`, a red chain run lists the red load requests that belong to it in the same way, so the cause of a failed load step shows without the monitor transaction (#54). A message the monitor repeats per data package is listed once. A red DTP request is named, and its log stays with the request. Verified on SAP BW 7.5 against red InfoPackage requests. Thanks to @army113 for the proposal in #54 and #55.
+
 - **`bw_read` lists field descriptions of a CompositeProvider** — every field in the result carries its `description`.
 
 ## [2.1.0] — 2026-11-23
