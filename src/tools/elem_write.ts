@@ -21,6 +21,8 @@ import {
   stripCheckMarkers,
   walkMembers,
   bindTextVariables,
+  readForSave,
+  emptyTextNote,
   assertFormulaVariable,
   type ExceptionAggregation,
   type FormulaNode,
@@ -123,8 +125,9 @@ function acceptFor(resource: ElemResource): string {
  *
  * Save cycle, identical in shape to withQueryDocument: GET (+ timestamp header) →
  * lock → PUT the mutated document with lockHandle and timestamp → forceCacheUpdate
- * GET → unlock. The PUT runs on a fresh session because the session that issued the
- * GET serves the document from a pinned model buffer.
+ * GET → unlock. The GET runs on a fresh session and, where the texts require it, in the
+ * component's master language (readForSave); the PUT runs on a fresh session in the same
+ * language.
  */
 async function withElementDocument(
   client: BwClient,
@@ -137,17 +140,14 @@ async function withElementDocument(
   const path = `/sap/bw/modeling/${resource}/${bwSeg(nameLower)}/a`;
   const accept = acceptFor(resource);
 
-  const getResult = await client.get(path, accept);
-  const timestamp = header(getResult.headers, 'timestamp');
-  if (!timestamp) {
-    throw new Error(`No timestamp header on GET ${path} — cannot do optimistic locking.`);
-  }
+  const read = await readForSave(path, accept, componentName);
+  const timestamp = read.timestamp;
 
   // A save of an unchanged document is not free: it records the whole component,
   // with every element it contains, in the transport request.
-  const current = stripCheckMarkers(getResult.body);
+  const current = stripCheckMarkers(read.body);
   const changed = mutate(current);
-  const mutated = resource === 'variable' ? changed : await bindTextVariables(createClientFromEnv(), changed);
+  const mutated = resource === 'variable' ? changed : await bindTextVariables(createClientFromEnv(read.saveLanguage), changed);
   if (mutated === current) return { messages: [], document: mutated, unchanged: true };
 
   const lockResponse = await client.rawPost(`${path}?action=lock`, '', {
@@ -162,7 +162,7 @@ async function withElementDocument(
   }
 
   try {
-    const client2 = createClientFromEnv();
+    const client2 = createClientFromEnv(read.saveLanguage);
     const corrNrPrefix = corrNr ? `corrNr=${corrNr}&` : '';
     const putResponse = await client2.rawPut(`${path}?${corrNrPrefix}lockHandle=${lockHandle}`, mutated, {
       timestamp,
@@ -172,6 +172,8 @@ async function withElementDocument(
       'x-csrf-token': await client2.getCsrfToken(),
     });
     const messages = parseCheckResult(putResponse.body, `${resource.toUpperCase()} update`);
+    if (read.note) messages.push(read.note);
+    messages.push(...emptyTextNote(mutated, read.language));
     await client.get(`${path}?forceCacheUpdate=true`, accept);
     return { messages, document: mutated };
   } finally {

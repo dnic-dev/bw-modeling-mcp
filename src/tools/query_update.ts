@@ -550,20 +550,165 @@ export async function bindTextVariables(client: BwClient, doc: string): Promise<
   return uids.size ? bindDescriptionVariables(out, uids) : out;
 }
 
+/** The master language (ISO code) a document names for the object `objectName`. */
+export function masterLanguageOf(doc: string, objectName: string): string | undefined {
+  const want = objectName.toUpperCase();
+  for (const m of doc.matchAll(/<Qry:entityProperties\b[^>]*>/g)) {
+    if (m[0].match(/\badtCore:name="([^"]*)"/i)?.[1]?.toUpperCase() !== want) continue;
+    return m[0].match(/\badtCore:masterLanguage="([^"]+)"/i)?.[1]?.toUpperCase();
+  }
+  return undefined;
+}
+
+export interface DescriptionSlot {
+  /** Technical name or id of the element the description belongs to. */
+  owner: string;
+  /** The element carries a text of its own (`default="false"`), not a derived one. */
+  own: boolean;
+  empty: boolean;
+  /**
+   * The description of a component itself (the query, a reusable structure or key figure).
+   * BW never marks a component as having no text, so a missing one costs nothing on save.
+   */
+  component: boolean;
+}
+
+/** Every description of a document in document order. */
+export function descriptionSlots(doc: string): DescriptionSlot[] {
+  const owners = [...doc.matchAll(/<Qry:\w+\b[^<>]*\bid="([^"]+)"[^<>]*>/g)];
+  const slots: DescriptionSlot[] = [];
+  let next = 0;
+  for (const m of doc.matchAll(DESCRIPTION_RE)) {
+    while (next < owners.length && owners[next].index! < m.index!) next++;
+    const owner = owners[next - 1];
+    slots.push({
+      owner: owner?.[0].match(/\btechnicalName="([^"]+)"/)?.[1] ?? owner?.[1] ?? '(document)',
+      own: /\bdefault="false"/.test(m[1]),
+      empty: (m[1].match(/\bvalue="([^"]*)"/)?.[1] ?? '') === '',
+      component: !owner || /^<Qry:(mainComponent|subComponents)\b/.test(owner[0]),
+    });
+  }
+  return slots;
+}
+
+/**
+ * Compare the same document read in two languages. `missing` are the elements with a text of
+ * their own in the second language and none in the first, `lost` the other way round.
+ * Undefined when the two reads do not line up element by element.
+ */
+export function compareOwnTexts(first: string, second: string): { missing: string[]; lost: string[] } | undefined {
+  const a = descriptionSlots(first);
+  const b = descriptionSlots(second);
+  if (a.length !== b.length) return undefined;
+  const missing: string[] = [];
+  const lost: string[] = [];
+  for (let i = 0; i < a.length; i++) {
+    if (a[i].component || b[i].component) continue;
+    if (a[i].own && a[i].empty && !b[i].empty) missing.push(b[i].owner);
+    if (b[i].own && b[i].empty && a[i].own && !a[i].empty) lost.push(a[i].owner);
+  }
+  return { missing, lost };
+}
+
+export interface SaveRead {
+  body: string;
+  timestamp: string;
+  /** Language (ISO code) the save has to run in when it differs from the logon language. */
+  saveLanguage?: string;
+  /** Language the document was read in, when known: `saveLanguage`, else the configured logon language. */
+  language?: string;
+  /** Message for the caller when the save runs in another language than the logon language. */
+  note?: string;
+}
+
+const listNames = (names: string[]): string =>
+  names.length > 8 ? `${names.slice(0, 8).join(', ')} and ${names.length - 8} more` : names.join(', ');
+
+/**
+ * Read a query component for a read-modify-write save.
+ *
+ * The read runs on a new session with forceCacheUpdate: a used session and the backend's buffer
+ * can miss texts written since, and the save would write the old state back.
+ *
+ * Unless multi-language editing is switched on in the backend, the document carries the texts
+ * of the logon language only, and the save rewrites exactly those. An element whose own text
+ * exists in another language only comes back as `default="false" value=""`, and saving that
+ * marks the element as having no text at all: every language then shows its technical id.
+ * So when the logon language lacks texts the master language has, the document is read and
+ * saved in the master language instead. When each of the two lacks texts the other has, no
+ * save keeps them all, and the edit is refused.
+ */
+export async function readForSave(path: string, accept: string, objectName: string): Promise<SaveRead> {
+  const url = `${path}${path.includes('?') ? '&' : '?'}forceCacheUpdate=true`;
+  const reader = createClientFromEnv();
+  let result = await reader.get(url, accept);
+  const logon = reader.language?.toUpperCase();
+  let saveLanguage: string | undefined;
+  let note: string | undefined;
+
+  const master = masterLanguageOf(result.body, objectName);
+  if (master && master !== logon && descriptionSlots(result.body).some((s) => s.own && s.empty && !s.component)) {
+    const inMaster = await createClientFromEnv(master).get(url, accept);
+    const diff = compareOwnTexts(result.body, inMaster.body);
+    if (diff && diff.missing.length > 0) {
+      const logonName = logon ? `the logon language ${logon}` : 'the logon language';
+      if (diff.lost.length > 0) {
+        throw new Error(
+          `${objectName.toUpperCase()} cannot be saved without losing texts. A save rewrites the texts of one ` +
+          `language and marks every element without a text in it as empty. ${diff.missing.length} element(s) have ` +
+          `a text in the master language ${master} and none in ${logonName} (${listNames(diff.missing)}); ` +
+          `${diff.lost.length} element(s) have a text in ${logonName} and none in ${master} (${listNames(diff.lost)}). ` +
+          `Connect in ${master} and give the second group a description, then repeat the edit.`
+        );
+      }
+      result = inMaster;
+      saveLanguage = master;
+      note =
+        `Saved in ${master}, the master language of ${objectName.toUpperCase()}: ${diff.missing.length} element(s) ` +
+        `have no text in ${logonName} (${listNames(diff.missing)}), and a save in that language would have stored ` +
+        `them as empty. Descriptions set by this call are ${master} texts.`;
+    }
+  }
+
+  const timestamp = result.headers['timestamp'];
+  if (!timestamp) {
+    throw new Error(`No timestamp header on GET ${path} — cannot do optimistic locking.`);
+  }
+  return { body: result.body, timestamp, saveLanguage, language: saveLanguage ?? logon, note };
+}
+
+/**
+ * A save message naming the elements the saved document leaves without a text of their own.
+ * BW stores each as "no text"; whether a text in a language other than the two compared by
+ * readForSave exists cannot be seen from the document.
+ */
+export function emptyTextNote(doc: string, language: string | undefined): string[] {
+  const empty = descriptionSlots(doc).filter((s) => s.own && s.empty && !s.component).map((s) => s.owner);
+  if (empty.length === 0) return [];
+  return [
+    `${empty.length} element(s) have no text${language ? ` in ${language}` : ' in the logon language'} and are saved ` +
+    `as empty (${listNames(empty)}). A text one of them carries in another language is no longer shown; ` +
+    `set a description to give it one.`,
+  ];
+}
+
+/** What a save cycle tells the mutation about the document it changes. */
+export interface SaveContext {
+  /** Language (ISO code) the document was read in and is saved in, when known. */
+  language?: string;
+}
+
 export async function withQueryDocument(
   client: BwClient,
   queryName: string,
-  mutate: (xml: string) => string,
+  mutate: (xml: string, ctx: SaveContext) => string,
   corrNr?: string,
 ): Promise<{ messages: string[] }> {
   const nameLower = queryName.toLowerCase();
   const path = `/sap/bw/modeling/query/${bwSeg(nameLower)}/a`;
 
-  const getResult = await client.get(path, queryAccept());
-  const timestamp = getResult.headers['timestamp'];
-  if (!timestamp) {
-    throw new Error(`No timestamp header on GET ${path} — cannot do optimistic locking.`);
-  }
+  const read = await readForSave(path, queryAccept(), queryName);
+  const timestamp = read.timestamp;
 
   const csrf = await client.getCsrfToken();
   const lockResponse = await client.rawPost(`${path}?action=lock`, '', {
@@ -579,8 +724,9 @@ export async function withQueryDocument(
   const lockHandle = lockMatch[1];
 
   try {
-    const client2 = createClientFromEnv();
-    const mutated = await bindTextVariables(client2, mutate(stripCheckMarkers(getResult.body)));
+    // The save runs in the language of the read: it rewrites the texts of that language.
+    const client2 = createClientFromEnv(read.saveLanguage);
+    const mutated = await bindTextVariables(client2, mutate(stripCheckMarkers(read.body), { language: read.language }));
 
     const csrf2 = await client2.getCsrfToken();
     const corrNrPrefix = corrNr ? `corrNr=${corrNr}&` : '';
@@ -596,6 +742,8 @@ export async function withQueryDocument(
       });
 
     const messages = parseCheckResult(putResponse.body);
+    if (read.note) messages.push(read.note);
+    messages.push(...emptyTextNote(mutated, read.language));
     await client.get(`${path}?forceCacheUpdate=true`, queryAccept());
     return { messages };
   } finally {

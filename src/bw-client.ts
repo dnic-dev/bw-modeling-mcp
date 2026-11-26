@@ -585,9 +585,11 @@ export class BwClient {
    * Cloning rather than rebuilding from the environment is what lets those call sites
    * work unchanged under principal propagation, where there is no ambient credential
    * to rebuild from.
+   *
+   * `language` (ISO code) replaces the logon language for the new session only.
    */
-  freshSession(): BwClient {
-    return new BwClient(this.opts);
+  freshSession(language?: string): BwClient {
+    return new BwClient(language ? { ...this.opts, language } : this.opts);
   }
 
   /**
@@ -1732,17 +1734,19 @@ export class BwClient {
  * Under stdio there is no request context and this reads the environment, unchanged.
  *
  * Keeping the signature means no tool file had to be touched for principal propagation.
+ *
+ * `language` (ISO code) replaces the configured logon language for this one session.
  */
-export function createClientFromEnv(): BwClient {
+export function createClientFromEnv(language?: string): BwClient {
   const active = currentClient();
-  if (active) return active.freshSession();
-  return clientFromEnvironment();
+  if (active) return active.freshSession(language);
+  return clientFromEnvironment(language);
 }
 
-function clientFromEnvironment(): BwClient {
+function clientFromEnvironment(languageOverride?: string): BwClient {
   const url = process.env.BW_URL;
   const client = process.env.BW_CLIENT ?? '001';
-  const language = process.env.BW_LANGUAGE;
+  const language = languageOverride ?? process.env.BW_LANGUAGE;
   const cookieFile = process.env.BW_COOKIE_FILE;
 
   if (!url) {
