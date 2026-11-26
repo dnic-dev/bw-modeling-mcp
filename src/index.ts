@@ -845,7 +845,10 @@ const TOOL_DEFINITIONS = [
           },
           referenced_infoobject: {
             type: 'string',
-            description: 'Characteristic: Reference to an existing InfoObject (e.g. "IOBJ_NAME"). Omit withMasterData/withTexts — they are inherited. Default "".',
+            description: 'Characteristic: create it as a reference to this active characteristic (e.g. "IOBJ_NAME"). ' +
+              'Data type, length, conversion routine, lowercase handling, master data and texts come from the referenced ' +
+              'characteristic: leave data_type, length, conversion_routine, lower_case, with_master_data and with_texts out ' +
+              '(a value that differs is refused). The referenced characteristic must not be a reference itself.',
           },
           compound_infoobjects: {
             type: 'array',

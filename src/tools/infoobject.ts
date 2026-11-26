@@ -25,6 +25,7 @@ function characteristicCreateXml(o: {
   withTexts: boolean;
   language: string;
   responsible: string;
+  referencedXml?: string;
 }): string {
   const conv = o.conversionRoutine ? ` conversionRoutine="${o.conversionRoutine}"` : '';
   return `<?xml version="1.0" encoding="UTF-8"?>
@@ -37,7 +38,7 @@ function characteristicCreateXml(o: {
   <tlogoProperties adtcore:language="${o.language}" adtcore:name="${o.name}" adtcore:type="IOBJ" adtcore:masterLanguage="${o.language}" adtcore:responsible="${o.responsible}">
     <infoArea>${o.infoArea}</infoArea>
   </tlogoProperties>
-  <referencedInfoObject/>
+  ${o.referencedXml ?? '<referencedInfoObject/>'}
   <length>${o.length}</length>
   <displayProperties><display>2</display><selection>0</selection></displayProperties>
   <queryFilterValue forQueryDefinition="D"/>
@@ -170,6 +171,71 @@ export function setUnitCurrencyReference(xml: string, infoObject: string): strin
  * 5. PUT /iobj/{name}/m             → GET response with desired values substituted
  * 6. Return lockHandle for caller to use with bw_activate
  */
+/** What a new characteristic takes from the characteristic it references. */
+export interface CharacteristicReference {
+  name: string;
+  dataType: string;
+  length: number;
+  conversionRoutine: string;
+  lowerCase: boolean;
+  withMasterData: boolean;
+  withTexts: boolean;
+  /** The `<textProperties>` open tag of the referenced characteristic. */
+  textTag?: string;
+}
+
+/**
+ * Read what a reference characteristic takes over, and check that the reference can be made.
+ * Type, length, conversion routine, lowercase handling, master data and texts belong to the
+ * referenced characteristic; an argument that says otherwise is refused, not overwritten.
+ */
+export function characteristicReference(name: string, xml: string, args: CreateInfoObjectArgs): CharacteristicReference {
+  const facts = parseInfoObjectFacts(name, xml);
+  if (facts.objectType !== 'CHA') {
+    throw new Error(`referenced_infoobject '${facts.name}' is of type ${facts.objectType}; a reference needs a characteristic (CHA).`);
+  }
+  if (facts.referencedInfoObject) {
+    throw new Error(
+      `referenced_infoobject '${facts.name}' is itself a reference to ${facts.referencedInfoObject}. ` +
+      `Reference ${facts.referencedInfoObject} instead.`
+    );
+  }
+  const props = parseInfoObjectProps(xml);
+  const root = xml.match(/<\w+:infoObject\b[^>]*>/)?.[0] ?? '';
+  const textTag = xml.match(/<textProperties(\s[^>]*)?>/)?.[0];
+  const ref: CharacteristicReference = {
+    name: facts.name,
+    dataType: props.dataType.toUpperCase(),
+    length: Number(props.length),
+    conversionRoutine: props.conversionRoutine,
+    lowerCase: /\blowerCase="true"/.test(root),
+    withMasterData: /\bwithMasterData="true"/.test(xml.match(/<masterDataProperties(\s[^>]*)?>/)?.[0] ?? ''),
+    withTexts: /\bwithTexts="true"/.test(textTag ?? ''),
+    textTag,
+  };
+  const clash: string[] = [];
+  const differs = (label: string, given: string | number | boolean | undefined, taken: string | number | boolean) => {
+    if (given === undefined) return;
+    if (String(given).toUpperCase() !== String(taken).toUpperCase()) clash.push(`${label} ${given === '' ? '""' : given} (${ref.name}: ${taken === '' ? '""' : taken})`);
+  };
+  differs('data_type', args.data_type, ref.dataType);
+  differs('length', args.length, ref.length);
+  differs('conversion_routine', args.conversion_routine, ref.conversionRoutine);
+  differs('lower_case', args.lower_case, ref.lowerCase);
+  differs('with_master_data', args.with_master_data, ref.withMasterData);
+  differs('with_texts', args.with_texts, ref.withTexts);
+  if (clash.length) {
+    throw new Error(
+      `A reference characteristic takes its type, master data and texts from ${ref.name}. ` +
+      `Leave these out or match them: ${clash.join(', ')}.`
+    );
+  }
+  return ref;
+}
+
+const referencedInfoObjectXml = (ref: CharacteristicReference): string =>
+  `<referencedInfoObject name="${ref.name}" infoObjectType="CHA"/>`;
+
 export async function bwCreateInfoObject(
   client: BwClient,
   args: CreateInfoObjectArgs
@@ -185,6 +251,24 @@ export async function bwCreateInfoObject(
     throw new Error('lower_case applies to Characteristics (CHA) only — remove it for a Key Figure.');
   }
   validateUnitCurrencyArgs(args, isobjType === 'KYF');
+  if (args.referenced_infoobject && isobjType !== 'CHA') {
+    throw new Error('referenced_infoobject applies to Characteristics (CHA) only.');
+  }
+  // Read the referenced characteristic through its own session, before anything is locked.
+  let reference: CharacteristicReference | undefined;
+  if (args.referenced_infoobject) {
+    const refName = args.referenced_infoobject.toUpperCase();
+    let refXml: string;
+    try {
+      refXml = (await createClientFromEnv().get(`/sap/bw/modeling/iobj/${bwSeg(refName.toLowerCase())}/a`, MEDIA_TYPES['iobj'])).body;
+    } catch (err) {
+      if (/HTTP 404/.test(String((err as Error).message))) {
+        throw new Error(`referenced_infoobject '${refName}' does not exist in an active version.`);
+      }
+      throw err;
+    }
+    reference = characteristicReference(refName, refXml, args);
+  }
   const responsible = await resolveLogonUser(client);
 
   // Step 1: Lock with CREA headers (stateful_enqueue session)
@@ -345,14 +429,15 @@ export async function bwCreateInfoObject(
           name: nameUpper,
           infoArea,
           description: desc,
-          dataType: (args.data_type ?? 'CHAR').toUpperCase(),
-          length: args.length ?? 10,
-          conversionRoutine: args.conversion_routine
+          dataType: reference?.dataType ?? (args.data_type ?? 'CHAR').toUpperCase(),
+          length: reference?.length ?? args.length ?? 10,
+          conversionRoutine: reference ? reference.conversionRoutine : args.conversion_routine
             ?? (((args.data_type ?? 'CHAR').toUpperCase() === 'CHAR' || (args.data_type ?? 'CHAR').toUpperCase() === 'NUMC') ? 'ALPHA' : ''),
-          withMasterData: args.with_master_data ?? false,
-          withTexts: args.with_texts ?? false,
+          withMasterData: reference ? reference.withMasterData : args.with_master_data ?? false,
+          withTexts: reference ? reference.withTexts : args.with_texts ?? false,
           language: process.env.BW_LANGUAGE ?? 'DE',
           responsible,
+          referencedXml: reference ? referencedInfoObjectXml(reference) : undefined,
         })
       : minimalXml;
     await client.create('iobj', nameLower, lockHandle, createXml, { 'Development-Class': pkg });
@@ -373,13 +458,13 @@ export async function bwCreateInfoObject(
     // Normalise masterDataAccess — GET returns type="GEN" but PUT expects explicit empty attrs
     putXml = putXml.replace(/<masterDataAccess[^/]*\/>/, '<masterDataAccess readClass="" sapHanaPackage="" sapHanaView=""/>');
 
-    const chaDataType = (args.data_type ?? 'CHAR').toUpperCase();
-    const chaLength = args.length ?? 10;
+    const chaDataType = reference?.dataType ?? (args.data_type ?? 'CHAR').toUpperCase();
+    const chaLength = reference?.length ?? args.length ?? 10;
     const defaultConv = (chaDataType === 'CHAR' || chaDataType === 'NUMC') ? 'ALPHA' : '';
-    const chaConv = args.conversion_routine ?? defaultConv;
-    const withMasterData = args.with_master_data ?? false;
-    const withTexts = args.with_texts ?? false;
-    const lowerCase = args.lower_case ?? false;
+    const chaConv = reference ? reference.conversionRoutine : args.conversion_routine ?? defaultConv;
+    const withMasterData = reference ? reference.withMasterData : args.with_master_data ?? false;
+    const withTexts = reference ? reference.withTexts : args.with_texts ?? false;
+    const lowerCase = reference ? reference.lowerCase : args.lower_case ?? false;
 
     // Root element attributes
     putXml = putXml.replace(/\bobjectSpecificDataType="[^"]*"/, `objectSpecificDataType="${chaDataType}"`);
@@ -401,8 +486,22 @@ export async function bwCreateInfoObject(
       `<masterDataProperties withMasterData="${withMasterData}">`
     );
 
+    if (reference) {
+      const element = referencedInfoObjectXml(reference);
+      const pattern = /<referencedInfoObject\b[^>]*?(?:\/>|>[\s\S]*?<\/referencedInfoObject>)/;
+      if (pattern.test(putXml)) {
+        putXml = putXml.replace(pattern, element);
+      } else if (putXml.includes('<length>')) {
+        putXml = putXml.replace('<length>', `${element}<length>`);
+      } else {
+        throw new Error('Cannot place the reference: the characteristic XML has no <referencedInfoObject> or <length> element.');
+      }
+    }
+
     // textProperties — set withTexts / shortTextAvailable / languageDependentTextAvailable
-    if (withTexts) {
+    if (reference?.textTag) {
+      putXml = putXml.replace(/<textProperties(\s[^>]*)?>/, reference.textTag);
+    } else if (withTexts) {
       putXml = putXml.replace(
         /<textProperties(\s[^>]*)?>/,
         `<textProperties shortTextAvailable="true" withTexts="true">`
@@ -483,6 +582,18 @@ export async function bwCreateInfoObject(
     // Step 7: PUT — applies the correct values
     await client.put('iobj', nameLower, lockHandle, putXml, timestamp, args.transport);
 
+    // BW accepts a reference it does not keep, so the result names only what a read confirms.
+    if (reference) {
+      const back = await createClientFromEnv().get(`/sap/bw/modeling/iobj/${bwSeg(nameLower)}/m?forceCacheUpdate=true`, MEDIA_TYPES['iobj']);
+      const kept = parseInfoObjectFacts(nameUpper, back.body).referencedInfoObject;
+      if (kept !== reference.name) {
+        throw new Error(
+          `BW did not keep the reference: after the save '${nameUpper}' references ${kept ?? 'nothing'}, not ${reference.name}. ` +
+          `'${nameUpper}' exists as an inactive stand-alone characteristic; delete it with bw_delete before trying again.`
+        );
+      }
+    }
+
     const resultExtra: Record<string, unknown> = {
       dataType: chaDataType,
       length: chaLength,
@@ -491,7 +602,7 @@ export async function bwCreateInfoObject(
       withTexts,
       lowerCase,
     };
-    if (args.referenced_infoobject) resultExtra['referencedInfoObject'] = args.referenced_infoobject.toUpperCase();
+    if (reference) resultExtra['referencedInfoObject'] = reference.name;
     if (args.compound_infoobjects?.length) resultExtra['compoundParents'] = args.compound_infoobjects.map(p => p.toUpperCase());
 
     return JSON.stringify({

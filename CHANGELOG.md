@@ -8,6 +8,8 @@
 
 - **`bw_update_query_characteristic` stores a description in the language of the save** — a query-specific description was also stored as a German text, whatever the logon language was. It is now stored in the language the query is saved in, which the result names as `description_language`.
 
+- **`bw_create_infoobject` creates a reference characteristic** — `referenced_infoobject` was accepted and reported back, but never sent, so the characteristic was created on its own with the default type (#58). The referenced characteristic is now read before anything is locked, and the new one takes its data type, length, conversion routine, lowercase handling, master data and texts from it. A value for one of these that differs from the referenced characteristic is refused, and so is a reference to an InfoObject that is not a characteristic or that is a reference itself. After the save the reference is read back, and the call fails when BW did not keep it. Verified on BW/4HANA and on SAP BW 7.5: a characteristic created as a reference and activated, with the referenced characteristic as its basic characteristic. Thanks to @army113 for the analysis in #58 and #59.
+
 - **Descriptions of fields without an InfoObject are kept** — `update_fields` with `field_description` on a plain field, for example one fed by a SAP HANA view, stores the text where the server keeps it. Before, the call reported success and the text was dropped on save.
 
 - **Navigation attributes on CompositeProviders with SAP HANA view inputs** — `update_navigation_attributes` no longer stops with HTTP 404 when one of the inputs that supply the field is a SAP HANA view; BW resolves the attribute through the InfoObject.
