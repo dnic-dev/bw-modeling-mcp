@@ -287,6 +287,9 @@ src/
     ├── metadata_chainlog.ts # the RSPCLOG reader behind bw_read_metadata_tables: run
     │                     # history (RSPCLOGCHAIN), the steps of one run (RSPCPROCESSLOG)
     │                     # and the last status per chain for a name pattern
+    ├── metadata_reqmess.ts # errors of red InfoPackage requests for the ISIP and RSPCLOG
+    │                     # readers: E and A messages (RSMONMESS) with their text (T100)
+    │                     # and the file a request read (RSSELDONE)
     ├── conversion_type.ts # bw_get_conversion_type, bw_create_conversion_type — currency
     │                     # translation (CTRT) and unit conversion types (UOMT): shell POST, then
     │                     # PUT on /a, saved active
